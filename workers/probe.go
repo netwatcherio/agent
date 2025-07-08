@@ -1,41 +1,71 @@
 package workers
 
 import (
-	_ "encoding/json"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/netwatcherio/netwatcher-agent/probes"
 	"github.com/showwin/speedtest-go/speedtest"
 	log "github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"golang.org/x/sync/syncmap"
-	"strconv"
-	_ "strconv"
-	"strings"
-	"sync"
-	"time"
-	_ "time"
 )
 
 type ProbeWorkerS struct {
-	Probe     probes.Probe
-	ToRemove  bool
-	StopChan  chan struct{}   // For stopping TrafficSim instances
-	StopOnce  *sync.Once      // Ensure StopChan is only closed once
-	WaitGroup *sync.WaitGroup // For waiting for cleanup
+	Probe      probes.Probe
+	ToRemove   bool
+	StopChan   chan struct{}
+	StopOnce   *sync.Once
+	WaitGroup  *sync.WaitGroup
+	Ctx        context.Context
+	CancelFunc context.CancelFunc
 }
 
-var checkWorkers syncmap.Map
+func makeProbeKey(probe probes.Probe) string {
+	// Serialize the config to JSON
+	configBytes, err := json.Marshal(probe.Config)
+	if err != nil {
+		// Handle error or fall back to empty hash
+		return fmt.Sprintf("%s_%s_error", probe.ID, probe.Type)
+	}
 
-// Track TrafficSim instances
-var trafficSimServer *probes.TrafficSim
-var trafficSimServerMutex sync.Mutex
-var trafficSimClients map[primitive.ObjectID]*probes.TrafficSim
-var trafficSimClientsMutex sync.Mutex
+	// Compute SHA-256 hash of the config
+	hash := sha256.Sum256(configBytes)
 
-func init() {
-	trafficSimClients = make(map[primitive.ObjectID]*probes.TrafficSim)
+	// Return key in format: <ID>_<Type>_<hash>
+	return fmt.Sprintf("%s_%s_%x", probe.ID, probe.Type, hash[:8]) // using first 8 bytes of hash
 }
+
+var (
+	checkWorkers syncmap.Map // Key: probeID_probeType composite key
+
+	// Track TrafficSim instances with better synchronization
+	// Note: TrafficSim tracking uses just probe ID (not composite key) since
+	// there can only be one TrafficSim instance per probe ID
+	trafficSimServer       *probes.TrafficSim
+	trafficSimServerMutex  sync.RWMutex
+	trafficSimClients      = make(map[primitive.ObjectID]*probes.TrafficSim)
+	trafficSimClientsMutex sync.RWMutex
+
+	// Speed test state
+	speedTestRunning    bool
+	speedTestMutex      sync.Mutex
+	speedTestRetryCount int
+)
+
+const (
+	speedTestRetryMax     = 3
+	trafficSimStopTimeout = 75 * time.Second // Slightly more than GracefulShutdownTimeout
+)
 
 func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 	var foundProbe probes.Probe
@@ -44,31 +74,26 @@ func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 	checkWorkers.Range(func(key, value interface{}) bool {
 		probeWorker, ok := value.(ProbeWorkerS)
 		if !ok {
-			// Handle the case where the type assertion fails
-			return true // continue iterating
+			return true
 		}
 
 		if probeWorker.Probe.Type == probes.ProbeType_MTR {
 			for _, target := range probeWorker.Probe.Config.Target {
 				for _, givenTarget := range probe.Config.Target {
-					if strings.Contains(givenTarget.Target, ":") {
-						tt := strings.Split(givenTarget.Target, ":")
-						if tt[0] == target.Target {
-							foundProbe = probeWorker.Probe
-							found = true
-							return false // stop iterating
-						}
+					targetAddr := givenTarget.Target
+					if strings.Contains(targetAddr, ":") {
+						targetAddr = strings.Split(targetAddr, ":")[0]
 					}
 
-					if target.Target == givenTarget.Target {
+					if target.Target == targetAddr || target.Target == givenTarget.Target {
 						foundProbe = probeWorker.Probe
 						found = true
-						return false // stop iterating
+						return false
 					}
 				}
 			}
 		}
-		return true // continue iterating
+		return true
 	})
 
 	if !found {
@@ -93,23 +118,47 @@ func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
 		return true
 	}
 
+	// Check if allowed agents changed for server
+	if oldProbe.Config.Server && len(oldProbe.Config.Target) != len(newProbe.Config.Target) {
+		return true
+	}
+
 	return false
 }
 
 func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
+	log.Infof("Stopping TrafficSim (server=%v) for probe %s", isServer, probeID.Hex())
+
 	if isServer {
 		trafficSimServerMutex.Lock()
 		defer trafficSimServerMutex.Unlock()
 
 		if trafficSimServer != nil {
-			log.Infof("Stopping TrafficSim server for probe %s", probeID.Hex())
-			// Use Stop() if available, otherwise manually stop
-			if trafficSimServer.Running {
-				trafficSimServer.Running = false
-				if trafficSimServer.Conn != nil {
-					trafficSimServer.Conn.Close()
+			// Use the graceful Stop method
+			trafficSimServer.Stop()
+
+			// Wait for stop with timeout
+			stopCtx, cancel := context.WithTimeout(context.Background(), trafficSimStopTimeout)
+			defer cancel()
+
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-stopCtx.Done():
+					log.Warnf("Timeout waiting for TrafficSim server to stop for probe %s", probeID.Hex())
+					goto cleanupA
+				case <-ticker.C:
+					// Use atomic read for Running field
+					if atomic.LoadInt32(&trafficSimServer.Running) == 0 {
+						log.Infof("TrafficSim server stopped successfully for probe %s", probeID.Hex())
+						goto cleanupA
+					}
 				}
 			}
+
+		cleanupA:
 			trafficSimServer = nil
 		}
 	} else {
@@ -117,14 +166,31 @@ func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
 		defer trafficSimClientsMutex.Unlock()
 
 		if client, exists := trafficSimClients[probeID]; exists {
-			log.Infof("Stopping TrafficSim client for probe %s", probeID.Hex())
-			// Use Stop() if available, otherwise manually stop
-			if client.Running {
-				client.Running = false
-				if client.Conn != nil {
-					client.Conn.Close()
+			// Use the graceful Stop method
+			client.Stop()
+
+			// Wait for stop with timeout
+			stopCtx, cancel := context.WithTimeout(context.Background(), trafficSimStopTimeout)
+			defer cancel()
+
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-stopCtx.Done():
+					log.Warnf("Timeout waiting for TrafficSim client to stop for probe %s", probeID.Hex())
+					goto cleanupB
+				case <-ticker.C:
+					// Use atomic read for Running field
+					if atomic.LoadInt32(&client.Running) == 0 {
+						log.Infof("TrafficSim client stopped successfully for probe %s", probeID.Hex())
+						goto cleanupB
+					}
 				}
 			}
+
+		cleanupB:
 			delete(trafficSimClients, probeID)
 		}
 	}
@@ -133,123 +199,167 @@ func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
 func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID) {
 	go func(aC chan []probes.Probe, dC chan probes.ProbeData) {
 		for {
-			a := <-aC
+			p := <-aC
 
-			var newIds []primitive.ObjectID
+			var newKeys []string
 
-			for _, ad := range a {
-				existingWorker, ok := checkWorkers.Load(ad.ID)
+			for _, probe := range p {
+				probeKey := makeProbeKey(probe)
+				existingWorker, exists := checkWorkers.Load(probeKey)
 
-				if !ok {
-					log.Infof("Starting NEW worker for probe %s (type: %s)", ad.ID.Hex(), ad.Type)
-					// Store the probe first with new StopChan
+				if !exists {
+					// New probe - create worker
+					log.Infof("Starting NEW worker for probe %s (type: %s)", probe.ID.Hex(), probe.Type)
+
+					ctx, cancel := context.WithCancel(context.Background())
 					stopChan := make(chan struct{})
 					stopOnce := &sync.Once{}
 					wg := &sync.WaitGroup{}
-					checkWorkers.Store(ad.ID, ProbeWorkerS{
-						Probe:     ad,
-						ToRemove:  false,
-						StopChan:  stopChan,
-						StopOnce:  stopOnce,
-						WaitGroup: wg,
-					})
-					startCheckWorker(ad.ID, dataChan, thisAgent)
+
+					worker := ProbeWorkerS{
+						Probe:      probe,
+						ToRemove:   false,
+						StopChan:   stopChan,
+						StopOnce:   stopOnce,
+						WaitGroup:  wg,
+						Ctx:        ctx,
+						CancelFunc: cancel,
+					}
+
+					checkWorkers.Store(probeKey, worker)
+					startCheckWorker(probe, dataChan, thisAgent)
 				} else {
-					oldProbeWorker := existingWorker.(ProbeWorkerS)
+					// Existing probe - check for updates
+					oldWorker := existingWorker.(ProbeWorkerS)
 
-					// Check if TrafficSim config changed
-					if ad.Type == probes.ProbeType_TRAFFICSIM && trafficSimConfigChanged(oldProbeWorker.Probe, ad) {
-						log.Infof("TrafficSim probe %s configuration changed, restarting", ad.ID.Hex())
+					if probe.Type == probes.ProbeType_TRAFFICSIM {
+						if trafficSimConfigChanged(oldWorker.Probe, probe) {
+							// Configuration changed - restart
+							log.Infof("TrafficSim probe %s (type: %s) configuration changed, restarting", probe.ID.Hex(), probe.Type)
 
-						// Stop the old instance
-						if oldProbeWorker.StopChan != nil && oldProbeWorker.StopOnce != nil {
-							oldProbeWorker.StopOnce.Do(func() {
-								close(oldProbeWorker.StopChan)
-							})
+							// Stop the old worker
+							stopProbeWorker(&oldWorker)
+
+							// Stop TrafficSim instance
+							stopTrafficSim(probe.ID, oldWorker.Probe.Config.Server)
+
+							// Brief pause for cleanup
+							time.Sleep(500 * time.Millisecond)
+
+							// Create new worker
+							ctx, cancel := context.WithCancel(context.Background())
+							stopChan := make(chan struct{})
+							stopOnce := &sync.Once{}
+							wg := &sync.WaitGroup{}
+
+							newWorker := ProbeWorkerS{
+								Probe:      probe,
+								ToRemove:   false,
+								StopChan:   stopChan,
+								StopOnce:   stopOnce,
+								WaitGroup:  wg,
+								Ctx:        ctx,
+								CancelFunc: cancel,
+							}
+
+							checkWorkers.Store(probeKey, newWorker)
+							log.Infof("Starting UPDATED worker for probe %s (type: %s)", probe.ID.Hex(), probe.Type)
+							startCheckWorker(probe, dataChan, thisAgent)
+						} else if probe.Config.Server {
+							// Just update allowed agents for server
+							updateServerAllowedAgents(probe)
+							oldWorker.Probe = probe
+							checkWorkers.Store(probeKey, oldWorker)
+						} else {
+							// Update probe data
+							oldWorker.Probe = probe
+							checkWorkers.Store(probeKey, oldWorker)
 						}
-
-						// Wait for worker to finish
-						if oldProbeWorker.WaitGroup != nil {
-							log.Debugf("Waiting for old TrafficSim worker %s to stop...", ad.ID.Hex())
-							oldProbeWorker.WaitGroup.Wait()
-							log.Debugf("Old TrafficSim worker %s stopped", ad.ID.Hex())
-						}
-
-						// Force stop TrafficSim instance
-						stopTrafficSim(ad.ID, oldProbeWorker.Probe.Config.Server)
-
-						// Wait a bit more for complete cleanup
-						time.Sleep(1 * time.Second)
-
-						// Store the updated probe with new StopChan
-						newStopChan := make(chan struct{})
-						newStopOnce := &sync.Once{}
-						newWg := &sync.WaitGroup{}
-						checkWorkers.Store(ad.ID, ProbeWorkerS{
-							Probe:     ad,
-							ToRemove:  false,
-							StopChan:  newStopChan,
-							StopOnce:  newStopOnce,
-							WaitGroup: newWg,
-						})
-
-						// Start new worker
-						log.Infof("Starting UPDATED worker for probe %s", ad.ID.Hex())
-						startCheckWorker(ad.ID, dataChan, thisAgent)
-					} else if ad.Type == probes.ProbeType_TRAFFICSIM && ad.Config.Server {
-						// Just update allowed agents for server
-						var allowedAgentsList []primitive.ObjectID
-						for _, agent := range ad.Config.Target[1:] {
-							allowedAgentsList = append(allowedAgentsList, agent.Agent)
-						}
-
-						trafficSimServerMutex.Lock()
-						if trafficSimServer != nil {
-							updateAllowedAgents(trafficSimServer, allowedAgentsList)
-						}
-						trafficSimServerMutex.Unlock()
-
-						// Update the probe data
-						oldProbeWorker.Probe = ad
-						checkWorkers.Store(ad.ID, oldProbeWorker)
 					} else {
-						// Update the probe data for non-TrafficSim types
-						oldProbeWorker.Probe = ad
-						checkWorkers.Store(ad.ID, oldProbeWorker)
+						// Non-TrafficSim probe - just update
+						oldWorker.Probe = probe
+						checkWorkers.Store(probeKey, oldWorker)
 					}
 				}
 
-				newIds = append(newIds, ad.ID)
+				newKeys = append(newKeys, probeKey)
 			}
 
-			// Mark probes for removal
+			// Remove p that are no longer in the configuration
 			checkWorkers.Range(func(key any, value any) bool {
-				probeWorker := value.(ProbeWorkerS)
-				if !contains(newIds, probeWorker.Probe.ID) {
-					probeWorker.ToRemove = true
-					checkWorkers.Store(key, probeWorker)
-					log.Warnf("Probe marked as to be removed %s", probeWorker.Probe.ID.Hex())
+				probeKey := key.(string)
+				if !containsKey(newKeys, probeKey) {
+					probeWorker := value.(ProbeWorkerS)
+					log.Warnf("Probe %s (type: %s) marked for removal", probeWorker.Probe.ID.Hex(), probeWorker.Probe.Type)
 
-					// Stop TrafficSim if it's running
+					// Stop the worker
+					stopProbeWorker(&probeWorker)
+
+					// Stop TrafficSim if applicable
 					if probeWorker.Probe.Type == probes.ProbeType_TRAFFICSIM {
-						if probeWorker.StopChan != nil && probeWorker.StopOnce != nil {
-							probeWorker.StopOnce.Do(func() {
-								close(probeWorker.StopChan)
-							})
-						}
-
-						// Wait for cleanup
-						if probeWorker.WaitGroup != nil {
-							probeWorker.WaitGroup.Wait()
-						}
-
 						stopTrafficSim(probeWorker.Probe.ID, probeWorker.Probe.Config.Server)
 					}
+
+					// Remove from map
+					checkWorkers.Delete(key)
 				}
 				return true
 			})
 		}
 	}(checkChan, dataChan)
+}
+
+func stopProbeWorker(worker *ProbeWorkerS) {
+	// Cancel context
+	if worker.CancelFunc != nil {
+		worker.CancelFunc()
+	}
+
+	// Close stop channel
+	if worker.StopChan != nil && worker.StopOnce != nil {
+		worker.StopOnce.Do(func() {
+			close(worker.StopChan)
+		})
+	}
+
+	// Wait for worker to finish
+	if worker.WaitGroup != nil {
+		done := make(chan struct{})
+		go func() {
+			worker.WaitGroup.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			log.Debugf("Worker for probe %s (type: %s) stopped gracefully", worker.Probe.ID.Hex(), worker.Probe.Type)
+		case <-time.After(5 * time.Second):
+			log.Warnf("Timeout waiting for worker %s (type: %s) to stop", worker.Probe.ID.Hex(), worker.Probe.Type)
+		}
+	}
+}
+
+func updateServerAllowedAgents(probe probes.Probe) {
+	var allowedAgentsList []primitive.ObjectID
+	for _, agent := range probe.Config.Target[1:] {
+		allowedAgentsList = append(allowedAgentsList, agent.Agent)
+	}
+
+	trafficSimServerMutex.RLock()
+	defer trafficSimServerMutex.RUnlock()
+
+	if trafficSimServer != nil {
+		updateAllowedAgents(trafficSimServer, allowedAgentsList)
+	}
+}
+
+func containsKey(keys []string, key string) bool {
+	for _, k := range keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(ids []primitive.ObjectID, id primitive.ObjectID) bool {
@@ -261,312 +371,348 @@ func contains(ids []primitive.ObjectID, id primitive.ObjectID) bool {
 	return false
 }
 
-var speedTestRunning = false
-var speedTestRetryCount = 0
+func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID) {
+	go func(probe probes.Probe, dC chan probes.ProbeData) {
+		probeKey := makeProbeKey(probe)
 
-const speedTestRetryMax = 3
-
-func startCheckWorker(id primitive.ObjectID, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID) {
-	go func(i primitive.ObjectID, dC chan probes.ProbeData) {
-		// Get the worker and increment its WaitGroup
-		var wg *sync.WaitGroup
-		var stopChan chan struct{}
-
-		if agentCheckW, exists := checkWorkers.Load(i); exists {
-			if pw, ok := agentCheckW.(ProbeWorkerS); ok {
-				if pw.WaitGroup != nil {
-					wg = pw.WaitGroup
-					wg.Add(1)
-					defer wg.Done()
-				}
-				stopChan = pw.StopChan
-			}
-		} else {
-			log.Warnf("Probe %s not found when starting worker", i.Hex())
+		// Get the worker
+		workerInterface, exists := checkWorkers.Load(probeKey)
+		if !exists {
+			log.Warnf("Probe %s (type: %s) not found when starting worker", probe.ID.Hex(), probe.Type)
 			return
 		}
 
+		worker := workerInterface.(ProbeWorkerS)
+
+		// Track this goroutine
+		if worker.WaitGroup != nil {
+			worker.WaitGroup.Add(1)
+			defer worker.WaitGroup.Done()
+		}
+
+		// Main worker loop
 		for {
-			agentCheckW, exists := checkWorkers.Load(i)
-			if !exists || agentCheckW == nil {
-				log.Warnf("Probe %s not found, exiting worker", i.Hex())
+			select {
+			case <-worker.Ctx.Done():
+				log.Infof("Worker for probe %s (type: %s) stopped by context", probe.ID.Hex(), probe.Type)
 				return
-			}
-
-			probeWorker := agentCheckW.(ProbeWorkerS)
-
-			if probeWorker.ToRemove {
-				checkWorkers.Delete(i)
-				log.Warn("Check with ID " + i.Hex() + " was marked for removal.")
-				break
-			}
-
-			agentCheck := probeWorker.Probe
-
-			switch agentCheck.Type {
-			case probes.ProbeType_TRAFFICSIM:
-				// Check for stop signal
-				if stopChan != nil {
-					select {
-					case <-stopChan:
-						log.Infof("TrafficSim worker %s received stop signal", i.Hex())
-						return
-					default:
-					}
-				}
-
-				checkCfg := agentCheck.Config
-				checkAddress := strings.Split(checkCfg.Target[0].Target, ":")
-
-				portNum, err := strconv.Atoi(checkAddress[1])
-				if err != nil {
-					log.Error(err)
-					break
-				}
-
-				probe, err := findMatchingMTRProbe(agentCheck)
-				if err != nil {
-					log.Error(err)
-				}
-
-				if agentCheck.Config.Server {
-					var allowedAgentsList []primitive.ObjectID
-
-					for _, agent := range agentCheck.Config.Target[1:] {
-						allowedAgentsList = append(allowedAgentsList, agent.Agent)
-					}
-
-					trafficSimServerMutex.Lock()
-					if trafficSimServer == nil || !trafficSimServer.Running || trafficSimServer.Errored {
-						trafficSimServer = &probes.TrafficSim{
-							Running:       false,
-							Errored:       false,
-							IsServer:      true,
-							ThisAgent:     thisAgent,
-							OtherAgent:    primitive.ObjectID{},
-							IPAddress:     checkAddress[0],
-							Port:          int64(portNum),
-							AllowedAgents: allowedAgentsList,
-							Probe:         agentCheck.ID,
-						}
-
-						log.Info("Running & starting traffic sim server...")
-						trafficSimServer.Running = true
-						trafficSimServerMutex.Unlock()
-
-						// Start server in a separate goroutine so we can monitor stop signal
-						go trafficSimServer.Start(nil)
-
-						// Monitor for stop signal
-						if stopChan != nil {
-							<-stopChan
-							log.Infof("Stopping TrafficSim server %s", i.Hex())
-							stopTrafficSim(agentCheck.ID, true)
-						}
-						return
-					} else {
-						// Update the allowed agents list dynamically
-						updateAllowedAgents(trafficSimServer, allowedAgentsList)
-						trafficSimServerMutex.Unlock()
-
-						// Continue monitoring for changes
-						time.Sleep(5 * time.Second)
-						continue
-					}
-				} else {
-					// Client logic
-					trafficSimClientsMutex.Lock()
-
-					// Check if this client already exists
-					if existingClient, exists := trafficSimClients[agentCheck.ID]; exists && existingClient.Running {
-						trafficSimClientsMutex.Unlock()
-						time.Sleep(5 * time.Second)
-						continue
-					}
-
-					simClient := &probes.TrafficSim{
-						Running:    false,
-						Errored:    false,
-						Conn:       nil,
-						ThisAgent:  thisAgent,
-						OtherAgent: agentCheck.Config.Target[0].Agent,
-						IPAddress:  checkAddress[0],
-						Port:       int64(portNum),
-						Probe:      agentCheck.ID,
-						DataChan:   dC,
-					}
-
-					trafficSimClients[agentCheck.ID] = simClient
-					simClient.Running = true
-					trafficSimClientsMutex.Unlock()
-
-					log.Infof("Starting TrafficSim client for probe %s to %s:%d",
-						agentCheck.ID.Hex(), checkAddress[0], portNum)
-
-					// Start client in a separate goroutine so we can monitor stop signal
-					go simClient.Start(&probe)
-
-					// Monitor for stop signal
-					if stopChan != nil {
-						<-stopChan
-						log.Infof("Stopping TrafficSim client %s", i.Hex())
-						stopTrafficSim(agentCheck.ID, false)
-						// Wait a moment to ensure cleanup completes
-						time.Sleep(200 * time.Millisecond)
-					}
+			case <-worker.StopChan:
+				log.Infof("Worker for probe %s (type: %s) stopped by StopChan", probe.ID.Hex(), probe.Type)
+				return
+			default:
+				// Get current probe data
+				workerInterface, exists := checkWorkers.Load(probeKey)
+				if !exists {
+					log.Warnf("Probe %s (type: %s) no longer exists", probe.ID.Hex(), probe.Type)
 					return
 				}
 
-			case probes.ProbeType_SYSTEMINFO:
-				log.Info("SystemInfo: Running system hardware usage test")
-				if agentCheck.Config.Interval <= 0 {
-					agentCheck.Config.Interval = 1
+				currentWorker := workerInterface.(ProbeWorkerS)
+				if currentWorker.ToRemove {
+					log.Infof("Probe %s (type: %s) marked for removal", probe.ID.Hex(), probe.Type)
+					return
 				}
 
-				mtr, err := probes.SystemInfo()
-				if err != nil {
-					log.Error(err)
+				probe := currentWorker.Probe
+
+				// Handle different probe types
+				switch probe.Type {
+				case probes.ProbeType_TRAFFICSIM:
+					handleTrafficSimProbe(probe, dC, thisAgent, worker.Ctx, worker.StopChan)
+					return // TrafficSim runs continuously
+
+				case probes.ProbeType_SYSTEMINFO:
+					handleSystemInfoProbe(probe, dC)
+
+				case probes.ProbeType_MTR:
+					handleMTRProbe(probe, dC)
+
+				case probes.ProbeType_SPEEDTEST:
+					handleSpeedTestProbe(probe, dC)
+
+				case probes.ProbeType_SPEEDTEST_SERVERS:
+					handleSpeedTestServersProbe(probe, dC)
+
+				case probes.ProbeType_PING:
+					handlePingProbe(probe, dC)
+
+				case probes.ProbeType_NETWORKINFO:
+					handleNetworkInfoProbe(probe, dC)
+
+				case "AGENT":
+					// Agent probe type - skip for now as it's likely metadata
+					log.Debugf("Skipping AGENT probe type for probe %s", probe.ID.Hex())
+					time.Sleep(30 * time.Second)
+
+				default:
+					log.Warnf("Unknown probe type: %s", probe.Type)
+					time.Sleep(10 * time.Second)
 				}
-
-				cD := probes.ProbeData{
-					ProbeID: agentCheck.ID,
-					Data:    mtr,
-				}
-
-				dC <- cD
-				time.Sleep(time.Duration(agentCheck.Config.Interval) * time.Minute)
-				continue
-
-			case probes.ProbeType_MTR:
-				log.Info("MTR: Running test for ", agentCheck.Config.Target[0].Target, "...")
-				mtr, err := probes.Mtr(&agentCheck, false)
-				if err != nil {
-					fmt.Println(err)
-				}
-
-				cD := probes.ProbeData{
-					ProbeID:   agentCheck.ID,
-					Triggered: false,
-					Data:      mtr,
-				}
-				dC <- cD
-				time.Sleep(time.Duration(agentCheck.Config.Interval) * time.Minute)
-				continue
-
-			case probes.ProbeType_SPEEDTEST:
-				// todo make this dynamic and on demand
-				if !speedTestRunning {
-					log.Info("Running speed test for ... ", agentCheck.Config.Target[0].Target)
-					if agentCheck.Config.Target[0].Target == "ok" {
-						log.Info("SpeedTest: Target is ok, skipping...")
-						time.Sleep(10 * time.Second)
-						continue
-					}
-					speedTestRunning = true
-					speedTestResult, err := probes.SpeedTest(&agentCheck)
-					if err != nil {
-						log.Error(err)
-						speedTestRunning = false
-						time.Sleep(30 * time.Second)
-						if speedTestRetryCount >= 3 {
-							agentCheck.Config.Target[0].Target = "ok"
-							log.Warn("SpeedTest: Failed to run test after 3 retries, setting target to 'ok'...")
-						}
-						speedTestRetryCount++
-						continue
-					}
-
-					speedTestRetryCount = 0
-					speedTestRunning = false
-
-					agentCheck.Config.Target[0].Target = "ok"
-
-					cD := probes.ProbeData{
-						ProbeID: agentCheck.ID,
-						Data:    speedTestResult,
-					}
-
-					dC <- cD
-				}
-				continue
-
-			case probes.ProbeType_SPEEDTEST_SERVERS:
-				// todo make this dynamic and on demand
-				var speedtestClient = speedtest.New()
-				serverList, _ := speedtestClient.FetchServers()
-				//targets, _ := serverList.FindServer([]int{})
-				// todo ship this off to the backend so we can display "speedtest" servers near the agent, and periodically refresh the options
-
-				cD := probes.ProbeData{
-					ProbeID: agentCheck.ID,
-					Data:    serverList,
-				}
-
-				dC <- cD
-				time.Sleep(time.Hour * 12)
-				break
-
-			case probes.ProbeType_PING:
-				log.Infof("Ping: Running test for %v...", agentCheck.Config.Target[0].Target)
-
-				// todo find target that matches ping host for target field, and run mtr against it
-				probe, err := findMatchingMTRProbe(agentCheck)
-				if err != nil {
-					log.Error(err)
-				}
-
-				err = probes.Ping(&agentCheck, dC, probe)
-				if err != nil {
-					log.Error(err)
-					//break
-				}
-
-				//todo make this onyl run once, because when it uploads to the server, it will disable it,
-				//todo preventing it from being in the configuration after
-				//time.Sleep(time.Minute * 5)
-				//}
-				continue
-
-			case probes.ProbeType_NETWORKINFO:
-				log.Info("NetInfo: Checking networking information...")
-				net, err := probes.NetworkInfo()
-				if err != nil {
-					fmt.Println(err)
-				}
-
-				/*m, err := json.Marshal(net)
-				if err != nil {
-					fmt.Print(err)
-				}*/
-
-				cD := probes.ProbeData{
-					ProbeID: agentCheck.ID,
-					Data:    net,
-				}
-
-				dC <- cD
-
-				// todo make configurable??
-				time.Sleep(time.Minute * 10)
-				continue
-
-			// todo other checks like port scans etc.
-
-			default:
-				fmt.Println("Unknown type of check...")
-				break
 			}
-			break
 		}
-	}(id, dataChan)
+	}(probe, dataChan)
+}
+
+func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID, ctx context.Context, stopChan chan struct{}) {
+	checkCfg := probe.Config
+	checkAddress := strings.Split(checkCfg.Target[0].Target, ":")
+
+	portNum, err := strconv.Atoi(checkAddress[1])
+	if err != nil {
+		log.Errorf("Invalid port number: %v", err)
+		return
+	}
+
+	mtrProbe, err := findMatchingMTRProbe(probe)
+	if err != nil {
+		log.Errorf("Failed to find matching MTR probe: %v", err)
+	}
+
+	if probe.Config.Server {
+		handleTrafficSimServer(probe, thisAgent, checkAddress[0], portNum, stopChan)
+	} else {
+		handleTrafficSimClient(probe, thisAgent, checkAddress[0], portNum, dataChan, &mtrProbe, stopChan)
+	}
+}
+
+func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int, stopChan chan struct{}) {
+	var allowedAgentsList []primitive.ObjectID
+	for _, agent := range probe.Config.Target[1:] {
+		allowedAgentsList = append(allowedAgentsList, agent.Agent)
+	}
+
+	trafficSimServerMutex.Lock()
+	// Check if server needs to be created using atomic operations
+	needNewServer := trafficSimServer == nil ||
+		atomic.LoadInt32(&trafficSimServer.Running) == 0 ||
+		trafficSimServer.Errored
+
+	if needNewServer {
+		trafficSimServer = &probes.TrafficSim{
+			Running:       0, // Start with 0, will be set to 1 by Start()
+			Errored:       false,
+			IsServer:      true,
+			ThisAgent:     thisAgent,
+			OtherAgent:    primitive.ObjectID{},
+			IPAddress:     ipAddress,
+			Port:          int64(port),
+			AllowedAgents: allowedAgentsList,
+			Probe:         &probe,
+		}
+
+		log.Infof("Starting TrafficSim server on %s:%d", ipAddress, port)
+		server := trafficSimServer
+		trafficSimServerMutex.Unlock()
+
+		// Start server in goroutine (Start() will set Running to 1)
+		go server.Start(nil)
+
+		// Wait for stop signal
+		<-stopChan
+		log.Infof("Stopping TrafficSim server for probe %s", probe.ID.Hex())
+		stopTrafficSim(probe.ID, true)
+	} else {
+		// Update allowed agents
+		updateAllowedAgents(trafficSimServer, allowedAgentsList)
+		trafficSimServerMutex.Unlock()
+
+		// Check periodically for updates
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopChan:
+				return
+			case <-ticker.C:
+				// Continue checking
+			}
+		}
+	}
+}
+
+func handleTrafficSimClient(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int,
+	dataChan chan probes.ProbeData, mtrProbe *probes.Probe, stopChan chan struct{}) {
+
+	trafficSimClientsMutex.Lock()
+
+	// Check if client already exists and is running using atomic operations
+	if existingClient, exists := trafficSimClients[probe.ID]; exists && atomic.LoadInt32(&existingClient.Running) == 1 {
+		trafficSimClientsMutex.Unlock()
+
+		// Wait for stop signal
+		<-stopChan
+		return
+	}
+
+	// Create new client
+	simClient := &probes.TrafficSim{
+		Running:    0, // Start with 0, will be set to 1 by Start()
+		Errored:    false,
+		Conn:       nil,
+		ThisAgent:  thisAgent,
+		OtherAgent: probe.Config.Target[0].Agent,
+		IPAddress:  ipAddress,
+		Port:       int64(port),
+		Probe:      &probe,
+		DataChan:   dataChan,
+	}
+
+	trafficSimClients[probe.ID] = simClient
+	client := simClient
+	trafficSimClientsMutex.Unlock()
+
+	log.Infof("Starting TrafficSim client for probe %s to %s:%d", probe.ID.Hex(), ipAddress, port)
+
+	// Start client in goroutine (Start() will set Running to 1)
+	go client.Start(mtrProbe)
+
+	// Wait for stop signal
+	<-stopChan
+	log.Infof("Stopping TrafficSim client for probe %s", probe.ID.Hex())
+	stopTrafficSim(probe.ID, false)
+}
+
+func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Info("SystemInfo: Running system hardware usage test")
+
+	interval := probe.Config.Interval
+	if interval <= 0 {
+		interval = 1
+	}
+
+	data, err := probes.SystemInfo()
+	if err != nil {
+		log.Errorf("SystemInfo error: %v", err)
+	} else {
+		dataChan <- probes.ProbeData{
+			ProbeID: probe.ID,
+			Data:    data,
+		}
+	}
+
+	time.Sleep(time.Duration(interval) * time.Minute)
+}
+
+func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Infof("MTR: Running test for %s", probe.Config.Target[0].Target)
+
+	data, err := probes.Mtr(&probe, false)
+	if err != nil {
+		log.Errorf("MTR error: %v", err)
+	} else {
+		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
+		if err != nil {
+			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
+			return
+		}
+
+		dataChan <- probes.ProbeData{
+			ProbeID:   probe.ID,
+			Triggered: false,
+			Data:      data,
+			Target: probes.ProbeTarget{
+				Target: string(probes.ProbeType_MTR) + "%%%" + probe.Config.Target[0].Target,
+				Agent:  probe.Config.Target[0].Agent,
+				Group:  reportingAgent,
+			},
+		}
+	}
+
+	time.Sleep(time.Duration(probe.Config.Interval) * time.Minute)
+}
+
+func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	speedTestMutex.Lock()
+	defer speedTestMutex.Unlock()
+
+	if speedTestRunning {
+		return
+	}
+
+	if probe.Config.Target[0].Target == "ok" {
+		log.Info("SpeedTest: Target is ok, skipping...")
+		time.Sleep(10 * time.Second)
+		return
+	}
+
+	log.Infof("Running speed test for %s", probe.Config.Target[0].Target)
+	speedTestRunning = true
+
+	data, err := probes.SpeedTest(&probe)
+	speedTestRunning = false
+
+	if err != nil {
+		log.Errorf("SpeedTest error: %v", err)
+		speedTestRetryCount++
+
+		if speedTestRetryCount >= speedTestRetryMax {
+			probe.Config.Target[0].Target = "ok"
+			log.Warn("SpeedTest: Failed after max retries, setting target to 'ok'")
+		}
+
+		time.Sleep(30 * time.Second)
+		return
+	}
+
+	speedTestRetryCount = 0
+	probe.Config.Target[0].Target = "ok"
+
+	dataChan <- probes.ProbeData{
+		ProbeID: probe.ID,
+		Data:    data,
+	}
+}
+
+func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	speedtestClient := speedtest.New()
+	serverList, err := speedtestClient.FetchServers()
+	if err != nil {
+		log.Errorf("SpeedTest servers error: %v", err)
+		return
+	}
+
+	dataChan <- probes.ProbeData{
+		ProbeID: probe.ID,
+		Data:    serverList,
+	}
+
+	time.Sleep(12 * time.Hour)
+}
+
+func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Infof("Ping: Running test for %s", probe.Config.Target[0].Target)
+
+	mtrProbe, err := findMatchingMTRProbe(probe)
+	if err != nil {
+		log.Errorf("Failed to find matching MTR probe: %v", err)
+	}
+
+	if err := probes.Ping(&probe, dataChan, mtrProbe); err != nil {
+		log.Errorf("Ping error: %v", err)
+	}
+}
+
+func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Info("NetInfo: Checking networking information...")
+
+	data, err := probes.NetworkInfo()
+	if err != nil {
+		log.Errorf("NetworkInfo error: %v", err)
+	} else {
+		dataChan <- probes.ProbeData{
+			ProbeID: probe.ID,
+			Data:    data,
+		}
+	}
+
+	time.Sleep(10 * time.Minute)
 }
 
 func updateAllowedAgents(server *probes.TrafficSim, newAllowedAgents []primitive.ObjectID) {
-	// Use a mutex to ensure thread-safe updates
 	server.Mutex.Lock()
 	defer server.Mutex.Unlock()
 
-	// Update the allowed agents list
 	server.AllowedAgents = newAllowedAgents
 	log.Infof("Updated allowed agents for TrafficSim server: %v", newAllowedAgents)
 }

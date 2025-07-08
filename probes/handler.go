@@ -100,4 +100,5 @@ type ProbeData struct {
 	CreatedAt time.Time          `bson:"createdAt"json:"createdAt"`
 	UpdatedAt time.Time          `bson:"updatedAt"json:"updatedAt"`
 	Data      interface{}        `json:"data,omitempty"bson:"data,omitempty"`
+	Target    ProbeTarget        `bson:"target" json:"target"`
 }

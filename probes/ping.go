@@ -6,6 +6,8 @@ import (
 	"fmt"
 	probing "github.com/prometheus-community/pro-bing"
 	log "github.com/sirupsen/logrus"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"os"
 	"runtime"
 	"time"
 )
@@ -100,9 +102,20 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 		log.Info(string(marshal))
 
+		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
+		if err != nil {
+			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
+			return
+		}
+
 		cD := ProbeData{
 			ProbeID: ac.ID,
 			Data:    pingR,
+			Target: ProbeTarget{
+				Target: string(ProbeType_PING) + "%%%" + mtrProbe.Config.Target[0].Target,
+				Agent:  mtrProbe.Config.Target[0].Agent,
+				Group:  reportingAgent,
+			},
 		}
 
 		pingChan <- cD
@@ -116,15 +129,15 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 					fmt.Println(err)
 				}
 
-				/*m, err := json.Marshal(mtr)
-				if err != nil {
-					fmt.Print(err)
-				}*/
-
 				dC := ProbeData{
 					ProbeID:   mtrProbe.ID,
 					Triggered: true,
 					Data:      mtr,
+					Target: ProbeTarget{
+						Target: string(ProbeType_MTR) + "%%%" + mtrProbe.Config.Target[0].Target,
+						Agent:  mtrProbe.Config.Target[0].Agent,
+						Group:  reportingAgent,
+					},
 				}
 
 				fmt.Println("Triggered MTR for ", mtrProbe.Config.Target[0].Target, "...")
