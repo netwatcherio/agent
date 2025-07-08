@@ -439,24 +439,22 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, packetsInTest int) {
 	}
 }
 
-func (ts *TrafficSim) reportStats(mtrProbe *Probe) {
+func (ts *TrafficSim) reportStats(probe *Probe) {
 	ts.ClientStats.mu.RLock()
-	stats := ts.calculateStats(mtrProbe)
+	stats := ts.calculateStats(probe)
 	ts.ClientStats.mu.RUnlock()
 
 	if ts.DataChan != nil && ts.isRunning() {
+		if ts.Probe.ID == primitive.NilObjectID {
+			log.Warn("TrafficSim: Skipping reportStats due to empty ProbeID")
+			return
+		}
+
 		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return
 		}
-
-		marshal, err := json.Marshal(ts.Probe)
-		if err != nil {
-			return
-		}
-
-		log.Warnf("someone made a fucky wucky? %s", marshal)
 
 		select {
 		case ts.DataChan <- ProbeData{
