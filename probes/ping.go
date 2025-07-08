@@ -112,8 +112,8 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 			ProbeID: ac.ID,
 			Data:    pingR,
 			Target: ProbeTarget{
-				Target: string(ProbeType_PING) + "%%%" + mtrProbe.Config.Target[0].Target,
-				Agent:  mtrProbe.Config.Target[0].Agent,
+				Target: string(ProbeType_PING) + "%%%" + ac.Config.Target[0].Target,
+				Agent:  ac.Config.Target[0].Agent,
 				Group:  reportingAgent,
 			},
 		}

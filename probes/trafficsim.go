@@ -451,10 +451,6 @@ func (ts *TrafficSim) reportStats(mtrProbe *Probe) {
 			return
 		}
 
-		marhs, err := json.Marshal(ts.Probe)
-		log.Printf("TrafficSim: Reporting agent ID %v", reportingAgent)
-		log.Printf("%s", marhs)
-
 		select {
 		case ts.DataChan <- ProbeData{
 			ProbeID:   ts.Probe.ID,

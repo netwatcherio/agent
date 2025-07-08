@@ -1,7 +1,6 @@
 package probes
 
 import (
-	"encoding/json"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"time"
 )
@@ -15,54 +14,6 @@ type Probe struct {
 	Notifications bool               `json:"notifications"bson:"notifications"` // notifications will be emailed to anyone who has permissions on their account / associated with the site
 	Config        ProbeConfig        `bson:"config"json:"config"`
 	ProbeProcess  int
-}
-
-func (pd *ProbeData) parse(probe *Probe) (interface{}, error) {
-
-	switch probe.Type { // todo
-	case ProbeType_RPERF:
-		var rperfData RPerfResults // Replace with the actual struct for RPERF data
-		err := json.Unmarshal(pd.Data.([]byte), &rperfData)
-		if err != nil {
-			// Handle error
-		}
-		return rperfData, err
-
-	case ProbeType_MTR:
-		var mtrData MtrResult // Replace with the actual struct for MTR data
-		err := json.Unmarshal(pd.Data.([]byte), &mtrData)
-		if err != nil {
-			// Handle error
-		}
-		return mtrData, err
-	case ProbeType_NETWORKINFO:
-		var mtrData NetworkInfoResult // Replace with the actual struct for MTR data
-		err := json.Unmarshal(pd.Data.([]byte), &mtrData)
-		if err != nil {
-			// Handle error
-		}
-		return mtrData, err
-	case ProbeType_PING:
-		var mtrData PingResult // Replace with the actual struct for MTR data
-		err := json.Unmarshal(pd.Data.([]byte), &mtrData)
-		if err != nil {
-			// Handle error
-		}
-		return mtrData, err
-	case ProbeType_SPEEDTEST:
-		var mtrData SpeedTestResult // Replace with the actual struct for MTR data
-		err := json.Unmarshal(pd.Data.([]byte), &mtrData)
-		if err != nil {
-			// Handle error
-		}
-		return mtrData, err
-	// Add cases for other probe types
-
-	default:
-		// Handle unsupported probe types or return an error
-	}
-
-	return nil, nil
 }
 
 type ProbeType string
