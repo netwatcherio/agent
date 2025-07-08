@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	log "github.com/sirupsen/logrus"
 	"math"
 	"net"
 	"os"
@@ -450,6 +450,13 @@ func (ts *TrafficSim) reportStats(mtrProbe *Probe) {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return
 		}
+
+		marshal, err := json.Marshal(ts.Probe)
+		if err != nil {
+			return
+		}
+
+		log.Warnf("someone made a fucky wucky? %s", marshal)
 
 		select {
 		case ts.DataChan <- ProbeData{
