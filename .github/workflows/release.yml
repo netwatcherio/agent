@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for git commit info
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -24,47 +26,54 @@ jobs:
       - name: Install zip
         run: sudo apt-get install zip -y
 
-      - name: Get version metadata (date + commit hash)
+      - name: Get version metadata
         id: version
         run: |
           DATE=$(date +%Y%m%d)
           HASH=$(git rev-parse --short HEAD)
           VERSION="v${DATE}-${HASH}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
 
-      - name: Run build script
+      - name: Run build script with version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           chmod +x ./build.sh
           ./build.sh
 
-      - name: Create Git Tag
-        run: |
-          # Check if tag already exists
-          if ! git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            git config user.name "github-actions"
-            git config user.email "github-actions@github.com"
-            git tag -a "${{ steps.version.outputs.version }}" -m "Automated release for ${{ steps.version.outputs.version }}"
-            git push origin "${{ steps.version.outputs.version }}"
-          else
-            echo "Tag already exists, skipping tag creation"
-          fi
-
-      - name: Create Release and Upload Assets
+      - name: Create Release and Upload Files
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: bin/*.zip
           tag: ${{ steps.version.outputs.version }}
-          overwrite: true  # This will overwrite existing assets
-          file_glob: true  # Enable glob pattern for files
+          overwrite: true
+          file_glob: true
           release_name: "Release ${{ steps.version.outputs.version }}"
           body: |
-            ## Automated Release
+            ## NetWatcher Release ${{ steps.version.outputs.version }}
             
-            **Version:** ${{ steps.version.outputs.version }}
-            **Commit:** ${{ github.sha }}
+            **Build Date:** ${{ steps.version.outputs.date }}
+            **Commit:** ${{ github.sha }} (${{ steps.version.outputs.hash }})
             **Branch:** master
-            **Build:** ${{ github.run_number }}
             
-            ### Release Notes
-            This is an automated release from the master branch.
+            ### Installation
+            
+            1. Download the appropriate binary for your platform
+            2. Extract the zip file
+            3. Run `./netwatcher --version` to verify the installation
+            
+            ### Checksums
+            
+            See `netwatcher-${{ steps.version.outputs.version }}-checksums.txt` for file checksums.
+
+      # Also upload the checksums file
+      - name: Upload checksums
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: bin/netwatcher-${{ steps.version.outputs.version }}-checksums.txt
+          tag: ${{ steps.version.outputs.version }}
+          overwrite: true
