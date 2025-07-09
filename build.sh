@@ -1,46 +1,51 @@
 #!/bin/bash
 
-# Set the name of your application
+set -e
+
 APP_NAME="netwatcher-agent"
-
-# Set the path of your main.go file
 MAIN_PATH="./"
-
-# Create a bin directory
-mkdir -p bin
-
+BIN_DIR="bin"
 DATE=$(date +%Y%m%d-%H%M%S)
 
-# Build for macOS (amd64 and arm64)
-echo "Building for macOS..."
-GOOS=darwin GOARCH=amd64 go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-darwin-amd64 ${MAIN_PATH}
-GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-darwin-arm64 ${MAIN_PATH}
+mkdir -p "$BIN_DIR"
 
-# Build for Linux (amd64 and arm64)
-echo "Building for Linux..."
-GOOS=linux GOARCH=amd64 go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-linux-amd64 ${MAIN_PATH}
-GOOS=linux GOARCH=arm64 go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-linux-arm64 ${MAIN_PATH}
+PLATFORMS=(
+  "darwin amd64"
+  "darwin arm64"
+  "linux amd64"
+  "linux arm64"
+  "windows amd64"
+  "windows 386"
+  "linux mips"
+  "linux mipsle"
+  "linux mips64"
+  "linux mips64le"
+)
 
-# Build for Windows (amd64 and 386)
-echo "Building for Windows..."
-GOOS=windows GOARCH=amd64 go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-windows-amd64.exe ${MAIN_PATH}
-GOOS=windows GOARCH=386 go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-windows-386.exe ${MAIN_PATH}
+echo "Starting build: ${DATE}"
 
-# Build for MIPS (32-bit and 64-bit, big endian and little endian)
-echo "Building for MIPS..."
-GOOS=linux GOARCH=mips go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-linux-mips ${MAIN_PATH}
-GOOS=linux GOARCH=mipsle go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-linux-mipsle ${MAIN_PATH}
-GOOS=linux GOARCH=mips64 go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-linux-mips64 ${MAIN_PATH}
-GOOS=linux GOARCH=mips64le go build -ldflags="-X main.buildDate=${DATE}" -o bin/${APP_NAME}-linux-mips64le ${MAIN_PATH}
+for platform in "${PLATFORMS[@]}"; do
+  set -- $platform
+  GOOS=$1
+  GOARCH=$2
+  OUTPUT="${BIN_DIR}/${APP_NAME}-${GOOS}-${GOARCH}"
+  [ "$GOOS" == "windows" ] && OUTPUT+=".exe"
 
-# Create ZIP archives for each release
-cd bin
+  echo "Building for $GOOS/$GOARCH..."
+  GOOS=$GOOS GOARCH=$GOARCH go build \
+    -ldflags="-X main.buildDate=${DATE}" \
+    -o "$OUTPUT" "$MAIN_PATH"
+done
+
+# Archive
+echo "Zipping binaries..."
+cd "$BIN_DIR"
 for file in *; do
-    if [ -f "$file" ]; then
-        zip "${file}.zip" "$file"
-        rm "$file"
-    fi
+  if [[ -f "$file" ]]; then
+    zip "${file}.zip" "$file"
+    rm "$file"
+  fi
 done
 cd ..
 
-echo "Build complete. Release files are in the 'bin' directory."
+echo "Build complete. Zipped binaries in '$BIN_DIR'."

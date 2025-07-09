@@ -1,0 +1,58 @@
+name: Auto Release on master
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install zip
+        run: sudo apt-get install zip -y
+
+      - name: Get short commit hash
+        id: get_hash
+        run: echo "hash=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Run build script
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
+      - name: Create Git Tag
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -a "v${{ steps.get_hash.outputs.hash }}" -m "Automated release for commit ${{ steps.get_hash.outputs.hash }}"
+          git push origin "v${{ steps.get_hash.outputs.hash }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_hash.outputs.hash }}
+          name: "Release v${{ steps.get_hash.outputs.hash }}"
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_hash.outputs.hash }}
+          files: bin/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
