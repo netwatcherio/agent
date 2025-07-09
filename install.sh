@@ -1,0 +1,498 @@
+#!/bin/bash
+
+# NetWatcher Agent Installation Script
+# This script downloads, installs, and configures the NetWatcher Agent as a systemd service
+
+set -e  # Exit on any error
+
+# Configuration
+GITHUB_REPO="netwatcherio/netwatcher-agent"
+INSTALL_DIR="/opt/netwatcher/netwatcher-agent"
+SERVICE_NAME="netwatcher-agent"
+CONFIG_FILE="config.conf"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+BINARY_NAME="netwatcher-agent"
+
+# Default values
+DEFAULT_HOST="http://localhost:8080"
+DEFAULT_HOST_WS="ws://localhost:8080/agent_ws"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Show usage information
+show_usage() {
+    cat << EOF
+NetWatcher Agent Installation Script
+
+Usage: $0 --id <AGENT_ID> --pin <AGENT_PIN> [OPTIONS]
+
+Required Arguments:
+    --id, -i <AGENT_ID>     Agent ID (MongoDB ObjectID format)
+    --pin, -p <AGENT_PIN>   Agent PIN
+
+Optional Arguments:
+    --host <HOST>           API host (default: $DEFAULT_HOST)
+    --host-ws <HOST_WS>     WebSocket host (default: $DEFAULT_HOST_WS)
+    --install-dir <DIR>     Installation directory (default: $INSTALL_DIR)
+    --force                 Force reinstallation even if already installed
+    --no-service            Skip systemd service creation
+    --no-start              Don't start the service after installation
+    --version <VERSION>     Install specific version (default: latest)
+    --help, -h              Show this help message
+
+Examples:
+    # Basic installation
+    $0 --id 686c6d4298d36e8a13fb7ee6 --pin 036977322
+
+    # Custom host configuration
+    $0 --id 686c6d4298d36e8a13fb7ee6 --pin 036977322 \\
+       --host https://api.netwatcher.io --host-ws wss://api.netwatcher.io/agent_ws
+
+    # Install to custom directory
+    $0 --id 686c6d4298d36e8a13fb7ee6 --pin 036977322 --install-dir /usr/local/netwatcher
+
+EOF
+}
+
+# Parse command line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --id|-i)
+                AGENT_ID="$2"
+                shift 2
+                ;;
+            --pin|-p)
+                AGENT_PIN="$2"
+                shift 2
+                ;;
+            --host)
+                HOST="$2"
+                shift 2
+                ;;
+            --host-ws)
+                HOST_WS="$2"
+                shift 2
+                ;;
+            --install-dir)
+                INSTALL_DIR="$2"
+                shift 2
+                ;;
+            --version)
+                VERSION="$2"
+                shift 2
+                ;;
+            --force)
+                FORCE_INSTALL=true
+                shift
+                ;;
+            --no-service)
+                NO_SERVICE=true
+                shift
+                ;;
+            --no-start)
+                NO_START=true
+                shift
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Set defaults if not provided
+    HOST=${HOST:-$DEFAULT_HOST}
+    HOST_WS=${HOST_WS:-$DEFAULT_HOST_WS}
+    FORCE_INSTALL=${FORCE_INSTALL:-false}
+    NO_SERVICE=${NO_SERVICE:-false}
+    NO_START=${NO_START:-false}
+}
+
+# Validate required arguments
+validate_arguments() {
+    if [[ -z "$AGENT_ID" ]]; then
+        log_error "Agent ID is required. Use --id or -i to specify it."
+        show_usage
+        exit 1
+    fi
+
+    if [[ -z "$AGENT_PIN" ]]; then
+        log_error "Agent PIN is required. Use --pin or -p to specify it."
+        show_usage
+        exit 1
+    fi
+
+    # Validate Agent ID format (MongoDB ObjectID - 24 hex characters)
+    if [[ ! "$AGENT_ID" =~ ^[0-9a-fA-F]{24}$ ]]; then
+        log_error "Invalid Agent ID format. Expected 24 hexadecimal characters."
+        exit 1
+    fi
+
+    # Validate PIN format (should be numeric)
+    if [[ ! "$AGENT_PIN" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid PIN format. Expected numeric value."
+        exit 1
+    fi
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root (use sudo)"
+        exit 1
+    fi
+}
+
+# Detect system architecture
+detect_architecture() {
+    local arch=$(uname -m)
+    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+    case $arch in
+        x86_64|amd64)
+            ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            ;;
+        armv7l)
+            ARCH="arm"
+            ;;
+        *)
+            log_error "Unsupported architecture: $arch"
+            exit 1
+            ;;
+    esac
+
+    case $os in
+        linux)
+            OS="linux"
+            ;;
+        darwin)
+            OS="darwin"
+            ;;
+        *)
+            log_error "Unsupported operating system: $os"
+            exit 1
+            ;;
+    esac
+
+    log_info "Detected platform: ${OS}-${ARCH}"
+}
+
+# Get latest release version from GitHub
+get_latest_version() {
+    if [[ -n "$VERSION" ]]; then
+        log_info "Using specified version: $VERSION"
+        return
+    fi
+
+    log_info "Fetching latest release information..."
+
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local response=$(curl -s "$api_url")
+
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to fetch release information from GitHub"
+        exit 1
+    fi
+
+    VERSION=$(echo "$response" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+
+    if [[ -z "$VERSION" ]]; then
+        log_error "Could not determine latest version"
+        exit 1
+    fi
+
+    log_info "Latest version: $VERSION"
+}
+
+# Download and extract the binary
+download_and_install() {
+    local download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${BINARY_NAME}-${VERSION}-${OS}-${ARCH}"
+
+    # Try different common archive formats
+    local formats=("tar.gz" "zip" "")
+    local downloaded_file=""
+
+    for format in "${formats[@]}"; do
+        local url="${download_url}"
+        if [[ -n "$format" ]]; then
+            url="${url}.${format}"
+        fi
+
+        log_info "Trying to download: $url"
+
+        if curl -L -f -s -I "$url" > /dev/null 2>&1; then
+            log_info "Found release asset: $url"
+            download_url="$url"
+            break
+        fi
+    done
+
+    # Create installation directory
+    log_info "Creating installation directory: $INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR"
+
+    # Download the release
+    local temp_file=$(mktemp)
+    log_info "Downloading NetWatcher Agent..."
+
+    if ! curl -L -f -o "$temp_file" "$download_url"; then
+        log_error "Failed to download release from: $download_url"
+        rm -f "$temp_file"
+        exit 1
+    fi
+
+    # Extract or copy based on file type
+    local binary_path="${INSTALL_DIR}/${BINARY_NAME}"
+
+    if [[ "$download_url" == *.tar.gz ]]; then
+        log_info "Extracting tar.gz archive..."
+        tar -xzf "$temp_file" -C "$INSTALL_DIR" --strip-components=1
+    elif [[ "$download_url" == *.zip ]]; then
+        log_info "Extracting zip archive..."
+        unzip -q "$temp_file" -d "$INSTALL_DIR"
+        # Find the binary in the extracted files
+        find "$INSTALL_DIR" -name "$BINARY_NAME" -type f -exec mv {} "$binary_path" \;
+    else
+        log_info "Installing direct binary..."
+        cp "$temp_file" "$binary_path"
+    fi
+
+    # Make binary executable
+    chmod +x "$binary_path"
+
+    # Clean up
+    rm -f "$temp_file"
+
+    # Verify installation
+    if [[ ! -f "$binary_path" ]]; then
+        log_error "Binary not found after installation: $binary_path"
+        exit 1
+    fi
+
+    log_success "NetWatcher Agent installed to: $binary_path"
+}
+
+# Create configuration file
+create_config() {
+    local config_path="${INSTALL_DIR}/${CONFIG_FILE}"
+
+    log_info "Creating configuration file: $config_path"
+
+    cat > "$config_path" << EOF
+# NetWatcher Agent Configuration
+HOST=$HOST
+HOST_WS=$HOST_WS
+ID=$AGENT_ID
+PIN=$AGENT_PIN
+EOF
+
+    # Set appropriate permissions
+    chmod 600 "$config_path"
+
+    log_success "Configuration file created"
+}
+
+# Create systemd service file
+create_service() {
+    if [[ "$NO_SERVICE" == true ]]; then
+        log_info "Skipping systemd service creation"
+        return
+    fi
+
+    log_info "Creating systemd service file: $SERVICE_FILE"
+
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=NetWatcher Agent Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/${BINARY_NAME} --config ${INSTALL_DIR}/${CONFIG_FILE}
+WorkingDirectory=${INSTALL_DIR}
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${INSTALL_DIR}
+
+# Environment
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Reload systemd and enable service
+    log_info "Reloading systemd daemon..."
+    systemctl daemon-reload
+
+    log_info "Enabling NetWatcher Agent service..."
+    systemctl enable "$SERVICE_NAME"
+
+    log_success "Systemd service created and enabled"
+}
+
+# Start the service
+start_service() {
+    if [[ "$NO_SERVICE" == true ]] || [[ "$NO_START" == true ]]; then
+        log_info "Skipping service startup"
+        return
+    fi
+
+    log_info "Starting NetWatcher Agent service..."
+
+    if systemctl start "$SERVICE_NAME"; then
+        log_success "NetWatcher Agent service started successfully"
+
+        # Wait a moment and check status
+        sleep 2
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            log_success "Service is running"
+        else
+            log_warning "Service may have failed to start. Check logs with: journalctl -u $SERVICE_NAME"
+        fi
+    else
+        log_error "Failed to start NetWatcher Agent service"
+        log_info "Check logs with: journalctl -u $SERVICE_NAME"
+        exit 1
+    fi
+}
+
+# Check if already installed
+check_existing_installation() {
+    if [[ -f "${INSTALL_DIR}/${BINARY_NAME}" ]] && [[ "$FORCE_INSTALL" != true ]]; then
+        log_warning "NetWatcher Agent is already installed at $INSTALL_DIR"
+        log_info "Use --force to reinstall"
+
+        # Check if service is running
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            log_info "Service is currently running"
+            log_info "To restart: sudo systemctl restart $SERVICE_NAME"
+        fi
+
+        exit 0
+    fi
+}
+
+# Stop existing service if running
+stop_existing_service() {
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        log_info "Stopping existing NetWatcher Agent service..."
+        systemctl stop "$SERVICE_NAME"
+    fi
+}
+
+# Install required dependencies
+install_dependencies() {
+    log_info "Checking dependencies..."
+
+    local deps=("curl" "tar" "unzip")
+    local missing_deps=()
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" > /dev/null 2>&1; then
+            missing_deps+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_info "Installing missing dependencies: ${missing_deps[*]}"
+
+        if command -v apt-get > /dev/null 2>&1; then
+            apt-get update && apt-get install -y "${missing_deps[@]}"
+        elif command -v yum > /dev/null 2>&1; then
+            yum install -y "${missing_deps[@]}"
+        elif command -v dnf > /dev/null 2>&1; then
+            dnf install -y "${missing_deps[@]}"
+        elif command -v pacman > /dev/null 2>&1; then
+            pacman -S --noconfirm "${missing_deps[@]}"
+        else
+            log_error "Could not install dependencies. Please install manually: ${missing_deps[*]}"
+            exit 1
+        fi
+    fi
+}
+
+# Show installation summary
+show_summary() {
+    log_success "NetWatcher Agent installation completed!"
+    echo
+    log_info "Installation Details:"
+    echo "  - Binary: ${INSTALL_DIR}/${BINARY_NAME}"
+    echo "  - Config: ${INSTALL_DIR}/${CONFIG_FILE}"
+    echo "  - Service: $SERVICE_NAME"
+    echo "  - Version: $VERSION"
+    echo
+    log_info "Useful Commands:"
+    echo "  - Check status: sudo systemctl status $SERVICE_NAME"
+    echo "  - View logs: sudo journalctl -u $SERVICE_NAME -f"
+    echo "  - Restart: sudo systemctl restart $SERVICE_NAME"
+    echo "  - Stop: sudo systemctl stop $SERVICE_NAME"
+    echo "  - Disable: sudo systemctl disable $SERVICE_NAME"
+    echo
+    if [[ "$NO_SERVICE" != true ]]; then
+        log_info "The NetWatcher Agent is now running and will start automatically on boot."
+    fi
+}
+
+# Main execution
+main() {
+    echo "NetWatcher Agent Installation Script"
+    echo "===================================="
+    echo
+
+    parse_arguments "$@"
+    validate_arguments
+    check_root
+    detect_architecture
+    install_dependencies
+    check_existing_installation
+    stop_existing_service
+    get_latest_version
+    download_and_install
+    create_config
+    create_service
+    start_service
+    show_summary
+}
+
+# Run main function with all arguments
+main "$@"
