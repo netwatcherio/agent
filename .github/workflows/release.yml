@@ -15,8 +15,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Fetch all history for tags
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -26,20 +24,12 @@ jobs:
       - name: Install zip
         run: sudo apt-get install zip -y
 
-      - name: Get version metadata (timestamp + commit hash)
+      - name: Get version metadata (date + commit hash)
         id: version
         run: |
-          # Option 1: Date + Time + Short Hash (always unique)
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          DATE=$(date +%Y%m%d)
           HASH=$(git rev-parse --short HEAD)
-          VERSION="v${TIMESTAMP}-${HASH}"
-          
-          # Option 2: Date + Hash + Build Number (if re-runs needed)
-          # DATE=$(date +%Y%m%d)
-          # HASH=$(git rev-parse --short HEAD)
-          # BUILD_NUM=${{ github.run_number }}
-          # VERSION="v${DATE}-${HASH}-build${BUILD_NUM}"
-          
+          VERSION="v${DATE}-${HASH}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Run build script
@@ -49,33 +39,32 @@ jobs:
 
       - name: Create Git Tag
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git tag -a "${{ steps.version.outputs.version }}" -m "Automated release for ${{ steps.version.outputs.version }}"
-          git push origin "${{ steps.version.outputs.version }}"
+          # Check if tag already exists
+          if ! git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git tag -a "${{ steps.version.outputs.version }}" -m "Automated release for ${{ steps.version.outputs.version }}"
+            git push origin "${{ steps.version.outputs.version }}"
+          else
+            echo "Tag already exists, skipping tag creation"
+          fi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Create Release and Upload Assets
+        uses: svenstaro/upload-release-action@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: "Release ${{ steps.version.outputs.version }}"
-          generate_release_notes: true
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: bin/*.zip
+          tag: ${{ steps.version.outputs.version }}
+          overwrite: true  # This will overwrite existing assets
+          file_glob: true  # Enable glob pattern for files
+          release_name: "Release ${{ steps.version.outputs.version }}"
           body: |
             ## Automated Release
             
+            **Version:** ${{ steps.version.outputs.version }}
             **Commit:** ${{ github.sha }}
             **Branch:** master
             **Build:** ${{ github.run_number }}
             
-            ### Changes
-            See generated release notes below.
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          files: bin/*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            ### Release Notes
+            This is an automated release from the master branch.
