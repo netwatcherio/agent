@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export CGO_ENABLED=0
+
 # Get version information
 VERSION="${VERSION:-dev}"
 BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
