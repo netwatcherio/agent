@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	fmt.Printf("Starting NetWatcher Agent v%s...\n", VERSION)
+	fmt.Printf("Starting NetWatcher Agent - Version: %s...\n", VERSION)
 
 	var configPath string
 	var disableUpdater bool
