@@ -15,7 +15,7 @@ BINARY_NAME="netwatcher-agent"
 
 # Default values
 DEFAULT_HOST="https://api.netwatcher.io"
-DEFAULT_HOST_WS="ws://api.netwatcher.io/agent_ws"
+DEFAULT_HOST_WS="wss://api.netwatcher.io/agent_ws"
 
 # Colors for output
 RED='\033[0;31m'
