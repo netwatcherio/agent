@@ -32,6 +32,7 @@ type DependencyConfig struct {
 	BaseURL      string
 	Patterns     map[string]PlatformPattern // Key: "os-arch" or "os"
 	DestDir      string
+	TempDir      string // Directory for temporary files (defaults to "./temp")
 	Executable   string // Name of the executable file
 	MaxRetries   int
 	Timeout      time.Duration
@@ -61,6 +62,9 @@ func NewDependencyDownloader(config *DependencyConfig) *DependencyDownloader {
 	if config.Timeout == 0 {
 		config.Timeout = 30 * time.Second
 	}
+	if config.TempDir == "" {
+		config.TempDir = "./temp"
+	}
 
 	return &DependencyDownloader{
 		config: config,
@@ -79,6 +83,11 @@ func (d *DependencyDownloader) Download() error {
 	// Create destination directory
 	if err := os.MkdirAll(d.config.DestDir, 0755); err != nil {
 		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	// Create temp directory
+	if err := os.MkdirAll(d.config.TempDir, 0755); err != nil {
+		return fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
 	executablePath := filepath.Join(d.config.DestDir, d.config.Executable)
@@ -128,6 +137,9 @@ func (d *DependencyDownloader) Download() error {
 	if err := d.storeHash(executablePath, hash); err != nil {
 		log.WithError(err).Warn("Failed to store hash file")
 	}
+
+	// Clean up temp directory (optional - remove old temp files)
+	d.cleanupTempDir()
 
 	log.WithFields(log.Fields{
 		"dependency": d.config.Name,
@@ -249,7 +261,7 @@ func (d *DependencyDownloader) downloadWithRetry(url string) (string, error) {
 	return "", fmt.Errorf("failed after %d attempts: %w", d.config.MaxRetries, lastErr)
 }
 
-// downloadFile downloads a file to a temporary location
+// downloadFile downloads a file to a temporary location within the working directory
 func (d *DependencyDownloader) downloadFile(url string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d.config.Timeout)
 	defer cancel()
@@ -269,10 +281,13 @@ func (d *DependencyDownloader) downloadFile(url string) (string, error) {
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	// Create temporary file
-	tempFile, err := os.CreateTemp("", fmt.Sprintf("%s-download-*", d.config.Name))
+	// Create temporary file in our temp directory
+	tempFileName := fmt.Sprintf("%s-download-%d-%d", d.config.Name, time.Now().Unix(), os.Getpid())
+	tempFilePath := filepath.Join(d.config.TempDir, tempFileName)
+
+	tempFile, err := os.Create(tempFilePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer tempFile.Close()
 
@@ -280,15 +295,48 @@ func (d *DependencyDownloader) downloadFile(url string) (string, error) {
 	written, err := io.Copy(tempFile, resp.Body)
 	if err != nil {
 		os.Remove(tempFile.Name())
-		return "", err
+		return "", fmt.Errorf("failed to write temp file: %w", err)
 	}
 
 	log.WithFields(log.Fields{
 		"dependency": d.config.Name,
 		"size":       formatBytes(written),
+		"tempFile":   tempFilePath,
 	}).Debug("Download completed")
 
 	return tempFile.Name(), nil
+}
+
+// cleanupTempDir removes old temporary files from the temp directory
+func (d *DependencyDownloader) cleanupTempDir() {
+	// Clean up files older than 1 hour
+	cutoffTime := time.Now().Add(-1 * time.Hour)
+
+	entries, err := os.ReadDir(d.config.TempDir)
+	if err != nil {
+		log.WithError(err).Debug("Failed to read temp directory for cleanup")
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		if info.ModTime().Before(cutoffTime) && strings.Contains(entry.Name(), "-download-") {
+			filePath := filepath.Join(d.config.TempDir, entry.Name())
+			if err := os.Remove(filePath); err != nil {
+				log.WithError(err).WithField("file", filePath).Debug("Failed to remove old temp file")
+			} else {
+				log.WithField("file", filePath).Debug("Removed old temp file")
+			}
+		}
+	}
 }
 
 // extractAndInstall extracts the downloaded file and installs the executable
@@ -504,11 +552,18 @@ func formatBytes(bytes int64) string {
 
 // DownloadTrippy downloads the Trippy dependency using the new flexible system
 func DownloadTrippy(version string) error {
+	// Get working directory
+	workDir, err := os.Getwd()
+	if err != nil {
+		workDir = "."
+	}
+
 	config := &DependencyConfig{
 		Name:        "trippy",
 		Version:     version,
 		BaseURL:     "https://github.com/fujiapple852/trippy/releases/download/" + version + "/",
-		DestDir:     "./lib",
+		DestDir:     filepath.Join(workDir, "lib"),
+		TempDir:     filepath.Join(workDir, "temp"), // Use temp folder in working directory
 		Executable:  getTrippyExecutableName(),
 		MaxRetries:  3,
 		Timeout:     60 * time.Second,
@@ -557,11 +612,18 @@ func getTrippyExecutableName() string {
 
 // DownloadCustomTool shows how to download a different tool
 func DownloadCustomTool() error {
+	// Get working directory
+	workDir, err := os.Getwd()
+	if err != nil {
+		workDir = "."
+	}
+
 	config := &DependencyConfig{
 		Name:       "mytool",
 		Version:    "v1.0.0",
 		BaseURL:    "https://github.com/myorg/mytool/releases/download/v1.0.0/",
-		DestDir:    "./bin",
+		DestDir:    filepath.Join(workDir, "bin"),
+		TempDir:    filepath.Join(workDir, "temp"), // Use temp folder in working directory
 		Executable: "mytool" + getExecutableExt(),
 		Patterns: map[string]PlatformPattern{
 			"linux-amd64": {
