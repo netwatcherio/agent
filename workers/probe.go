@@ -38,6 +38,9 @@ func makeProbeKey(probe probes.Probe) string {
 		return fmt.Sprintf("%s_%s_error", probe.ID, probe.Type)
 	}
 
+	/*probe.CreatedAt = time.Time{}
+	probe.UpdatedAt = time.Time{}*/
+
 	// Compute SHA-256 hash of the config
 	hash := sha256.Sum256(configBytes)
 
@@ -119,13 +122,45 @@ func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
 	}
 
 	// Check if allowed agents changed for server
-	if oldProbe.Config.Server && len(oldProbe.Config.Target) != len(newProbe.Config.Target) {
-		return true
+	if oldProbe.Config.Server {
+		// For servers, check if the number of targets changed
+		if len(oldProbe.Config.Target) != len(newProbe.Config.Target) {
+			return true
+		}
+
+		// Check if any allowed agents changed
+		if len(oldProbe.Config.Target) > 1 && len(newProbe.Config.Target) > 1 {
+			// Create maps of allowed agents
+			oldAgents := make(map[primitive.ObjectID]bool)
+			newAgents := make(map[primitive.ObjectID]bool)
+
+			for i := 1; i < len(oldProbe.Config.Target); i++ {
+				if oldProbe.Config.Target[i].Agent != primitive.NilObjectID {
+					oldAgents[oldProbe.Config.Target[i].Agent] = true
+				}
+			}
+
+			for i := 1; i < len(newProbe.Config.Target); i++ {
+				if newProbe.Config.Target[i].Agent != primitive.NilObjectID {
+					newAgents[newProbe.Config.Target[i].Agent] = true
+				}
+			}
+
+			// Compare the maps
+			if len(oldAgents) != len(newAgents) {
+				return true
+			}
+
+			for agent := range oldAgents {
+				if !newAgents[agent] {
+					return true
+				}
+			}
+		}
 	}
 
 	return false
 }
-
 func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
 	log.Infof("Stopping TrafficSim (server=%v) for probe %s", isServer, probeID.Hex())
 
@@ -265,15 +300,15 @@ func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeDa
 							checkWorkers.Store(probeKey, newWorker)
 							log.Infof("Starting UPDATED worker for probe %s (type: %s)", probe.ID.Hex(), probe.Type)
 							startCheckWorker(probe, dataChan, thisAgent)
-						} else if probe.Config.Server {
-							// Just update allowed agents for server
-							updateServerAllowedAgents(probe)
-							oldWorker.Probe = probe
-							checkWorkers.Store(probeKey, oldWorker)
 						} else {
-							// Update probe data
+							// Update probe data without restart
 							oldWorker.Probe = probe
 							checkWorkers.Store(probeKey, oldWorker)
+
+							// If it's a server, update allowed agents
+							if probe.Config.Server {
+								updateServerAllowedAgents(probe)
+							}
 						}
 					} else {
 						// Non-TrafficSim probe - just update
@@ -341,15 +376,34 @@ func stopProbeWorker(worker *ProbeWorkerS) {
 
 func updateServerAllowedAgents(probe probes.Probe) {
 	var allowedAgentsList []primitive.ObjectID
-	for _, agent := range probe.Config.Target[1:] {
-		allowedAgentsList = append(allowedAgentsList, agent.Agent)
+
+	// The issue is here - we need to handle the target list properly
+	// The first target (index 0) contains the server address/port
+	// Subsequent targets contain allowed agent IDs
+
+	// Check if we have allowed agents in the config
+	if len(probe.Config.Target) > 1 {
+		// Skip the first target (server address) and collect agent IDs
+		for i := 1; i < len(probe.Config.Target); i++ {
+			target := probe.Config.Target[i]
+			// Only add valid agent IDs
+			if target.Agent != primitive.NilObjectID {
+				allowedAgentsList = append(allowedAgentsList, target.Agent)
+			}
+		}
 	}
 
-	trafficSimServerMutex.RLock()
-	defer trafficSimServerMutex.RUnlock()
+	// If no specific agents are listed, this might mean "allow all"
+	// You may want to handle this case differently based on your requirements
+
+	trafficSimServerMutex.Lock()
+	defer trafficSimServerMutex.Unlock()
 
 	if trafficSimServer != nil {
 		updateAllowedAgents(trafficSimServer, allowedAgentsList)
+		log.Infof("Updated allowed agents for server probe %s: %v", probe.ID.Hex(), allowedAgentsList)
+	} else {
+		log.Warnf("Attempted to update allowed agents but server is nil for probe %s", probe.ID.Hex())
 	}
 }
 
@@ -477,8 +531,15 @@ func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, t
 
 func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int, stopChan chan struct{}) {
 	var allowedAgentsList []primitive.ObjectID
-	for _, agent := range probe.Config.Target[1:] {
-		allowedAgentsList = append(allowedAgentsList, agent.Agent)
+
+	// Same fix as above - properly handle the target list
+	if len(probe.Config.Target) > 1 {
+		for i := 1; i < len(probe.Config.Target); i++ {
+			target := probe.Config.Target[i]
+			if target.Agent != primitive.NilObjectID {
+				allowedAgentsList = append(allowedAgentsList, target.Agent)
+			}
+		}
 	}
 
 	trafficSimServerMutex.Lock()
@@ -500,7 +561,7 @@ func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ip
 			Probe:         &probe,
 		}
 
-		log.Infof("Starting TrafficSim server on %s:%d", ipAddress, port)
+		log.Infof("Starting TrafficSim server on %s:%d with allowed agents: %v", ipAddress, port, allowedAgentsList)
 		server := trafficSimServer
 		trafficSimServerMutex.Unlock()
 
@@ -512,11 +573,11 @@ func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ip
 		log.Infof("Stopping TrafficSim server for probe %s", probe.ID.Hex())
 		stopTrafficSim(probe.ID, true)
 	} else {
-		// Update allowed agents
+		// Update allowed agents for existing server
 		updateAllowedAgents(trafficSimServer, allowedAgentsList)
 		trafficSimServerMutex.Unlock()
 
-		// Check periodically for updates
+		// Monitor for updates
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
@@ -525,10 +586,58 @@ func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ip
 			case <-stopChan:
 				return
 			case <-ticker.C:
-				// Continue checking
+				// Re-check for updates periodically
+				// Get the latest probe configuration
+				probeKey := makeProbeKey(probe)
+				if workerInterface, exists := checkWorkers.Load(probeKey); exists {
+					currentWorker := workerInterface.(ProbeWorkerS)
+					currentProbe := currentWorker.Probe
+
+					// Check if allowed agents have changed
+					var currentAllowedAgents []primitive.ObjectID
+					if len(currentProbe.Config.Target) > 1 {
+						for i := 1; i < len(currentProbe.Config.Target); i++ {
+							target := currentProbe.Config.Target[i]
+							if target.Agent != primitive.NilObjectID {
+								currentAllowedAgents = append(currentAllowedAgents, target.Agent)
+							}
+						}
+					}
+
+					// Update if changed
+					if !equalAgentLists(allowedAgentsList, currentAllowedAgents) {
+						trafficSimServerMutex.Lock()
+						if trafficSimServer != nil {
+							updateAllowedAgents(trafficSimServer, currentAllowedAgents)
+							allowedAgentsList = currentAllowedAgents
+						}
+						trafficSimServerMutex.Unlock()
+					}
+				}
 			}
 		}
 	}
+}
+
+// Fix 3: Add helper function to compare agent lists
+func equalAgentLists(a, b []primitive.ObjectID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Create maps for comparison
+	aMap := make(map[primitive.ObjectID]bool)
+	for _, id := range a {
+		aMap[id] = true
+	}
+
+	for _, id := range b {
+		if !aMap[id] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func handleTrafficSimClient(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int,
