@@ -204,14 +204,14 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 	if goarch == "amd64" {
 		patterns = append(patterns, "x86_64", "amd64")
 	} else if goarch == "arm64" {
-		patterns = append(patterns, "aarch64", "arm64")
+		patterns = append(patterns, "amd64", "arm64")
 	}
 
 	for _, asset := range release.Assets {
 		name := strings.ToLower(asset.Name)
 
 		// Must contain netwatcher-agent in the name
-		if !strings.Contains(name, "netwatcher-agent") && !strings.Contains(name, "netwatcher_agent") {
+		if !strings.Contains(name, "netwatcher") && !strings.Contains(name, "netwatcher") {
 			continue
 		}
 
@@ -232,7 +232,7 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 	// Fallback: look for any asset with netwatcher-agent in the name
 	for _, asset := range release.Assets {
 		name := strings.ToLower(asset.Name)
-		if strings.Contains(name, "netwatcher-agent") || strings.Contains(name, "netwatcher_agent") {
+		if strings.Contains(name, "netwatcher") || strings.Contains(name, "netwatcher") {
 			return &asset
 		}
 	}
