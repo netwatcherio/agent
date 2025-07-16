@@ -32,7 +32,44 @@ type ProbeWorkerS struct {
 }
 
 func makeProbeKey(probe probes.Probe) string {
-	// Create a normalized version of the config for hashing
+	// For TrafficSim servers, we want to treat allowed agent changes as updates, not new probes
+	// So we'll exclude the allowed agents from the key for server probes
+	if probe.Type == probes.ProbeType_TRAFFICSIM && probe.Config.Server {
+		// For server probes, only include the server address/port in the key
+		// This ensures that changes to allowed agents don't create a new probe
+		normalizedConfig := struct {
+			Target   string `json:"target"`
+			Duration int    `json:"duration"`
+			Count    int    `json:"count"`
+			Interval int    `json:"interval"`
+			Server   bool   `json:"server"`
+			Pending  int64  `json:"pending"`
+		}{
+			Duration: probe.Config.Duration,
+			Count:    probe.Config.Count,
+			Interval: probe.Config.Interval,
+			Server:   probe.Config.Server,
+			Pending:  probe.Config.Pending.Unix(),
+		}
+
+		// Only include the server address (first target) for server probes
+		if len(probe.Config.Target) > 0 {
+			normalizedConfig.Target = fmt.Sprintf("%s|%s|%s",
+				probe.Config.Target[0].Target,
+				probe.Config.Target[0].Agent.Hex(),
+				probe.Config.Target[0].Group.Hex())
+		}
+
+		configBytes, err := json.Marshal(normalizedConfig)
+		if err != nil {
+			return fmt.Sprintf("%s_%s_error", probe.ID, probe.Type)
+		}
+
+		hash := sha256.Sum256(configBytes)
+		return fmt.Sprintf("%s_%s_%x", probe.ID, probe.Type, hash[:8])
+	}
+
+	// For all other probes (including TrafficSim clients), use the original logic
 	normalizedConfig := struct {
 		Target   []string `json:"target"`
 		Duration int      `json:"duration"`
@@ -51,7 +88,6 @@ func makeProbeKey(probe probes.Probe) string {
 	// Create a sorted, normalized representation of targets
 	targetStrings := make([]string, len(probe.Config.Target))
 	for i, target := range probe.Config.Target {
-		// Create a consistent string representation of each target
 		targetStrings[i] = fmt.Sprintf("%s|%s|%s", target.Target, target.Agent.Hex(), target.Group.Hex())
 	}
 
@@ -59,18 +95,13 @@ func makeProbeKey(probe probes.Probe) string {
 	sort.Strings(targetStrings)
 	normalizedConfig.Target = targetStrings
 
-	// Serialize the normalized config to JSON
 	configBytes, err := json.Marshal(normalizedConfig)
 	if err != nil {
-		// Handle error or fall back to empty hash
 		return fmt.Sprintf("%s_%s_error", probe.ID, probe.Type)
 	}
 
-	// Compute SHA-256 hash of the normalized config
 	hash := sha256.Sum256(configBytes)
-
-	// Return key in format: <ID>_<Type>_<hash>
-	return fmt.Sprintf("%s_%s_%x", probe.ID, probe.Type, hash[:8]) // using first 8 bytes of hash
+	return fmt.Sprintf("%s_%s_%x", probe.ID, probe.Type, hash[:8])
 }
 
 // Alternative approach: specialized comparison for TrafficSim probes
