@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,21 +32,116 @@ type ProbeWorkerS struct {
 }
 
 func makeProbeKey(probe probes.Probe) string {
-	// Serialize the config to JSON
-	configBytes, err := json.Marshal(probe.Config)
+	// Create a normalized version of the config for hashing
+	normalizedConfig := struct {
+		Target   []string `json:"target"`
+		Duration int      `json:"duration"`
+		Count    int      `json:"count"`
+		Interval int      `json:"interval"`
+		Server   bool     `json:"server"`
+		Pending  int64    `json:"pending"`
+	}{
+		Duration: probe.Config.Duration,
+		Count:    probe.Config.Count,
+		Interval: probe.Config.Interval,
+		Server:   probe.Config.Server,
+		Pending:  probe.Config.Pending.Unix(),
+	}
+
+	// Create a sorted, normalized representation of targets
+	targetStrings := make([]string, len(probe.Config.Target))
+	for i, target := range probe.Config.Target {
+		// Create a consistent string representation of each target
+		targetStrings[i] = fmt.Sprintf("%s|%s|%s", target.Target, target.Agent.Hex(), target.Group.Hex())
+	}
+
+	// Sort the target strings to ensure consistent ordering
+	sort.Strings(targetStrings)
+	normalizedConfig.Target = targetStrings
+
+	// Serialize the normalized config to JSON
+	configBytes, err := json.Marshal(normalizedConfig)
 	if err != nil {
 		// Handle error or fall back to empty hash
 		return fmt.Sprintf("%s_%s_error", probe.ID, probe.Type)
 	}
 
-	/*probe.CreatedAt = time.Time{}
-	probe.UpdatedAt = time.Time{}*/
-
-	// Compute SHA-256 hash of the config
+	// Compute SHA-256 hash of the normalized config
 	hash := sha256.Sum256(configBytes)
 
 	// Return key in format: <ID>_<Type>_<hash>
 	return fmt.Sprintf("%s_%s_%x", probe.ID, probe.Type, hash[:8]) // using first 8 bytes of hash
+}
+
+// Alternative approach: specialized comparison for TrafficSim probes
+func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
+	// For server probes, we need special handling
+	if oldProbe.Config.Server && newProbe.Config.Server {
+		// Check if the server address/port changed (always at index 0)
+		if len(oldProbe.Config.Target) > 0 && len(newProbe.Config.Target) > 0 {
+			if oldProbe.Config.Target[0].Target != newProbe.Config.Target[0].Target {
+				return true
+			}
+			if oldProbe.Config.Target[0].Agent != newProbe.Config.Target[0].Agent {
+				return true
+			}
+		}
+
+		// For server configs, compare allowed agents regardless of order
+		oldAgents := extractAllowedAgents(oldProbe.Config.Target)
+		newAgents := extractAllowedAgents(newProbe.Config.Target)
+
+		if !sameAgentSets(oldAgents, newAgents) {
+			return true
+		}
+
+		return false
+	}
+
+	// For client probes
+	if !oldProbe.Config.Server && !newProbe.Config.Server {
+		// Check if target address/port changed
+		if len(oldProbe.Config.Target) > 0 && len(newProbe.Config.Target) > 0 {
+			if oldProbe.Config.Target[0].Target != newProbe.Config.Target[0].Target {
+				return true
+			}
+			if oldProbe.Config.Target[0].Agent != newProbe.Config.Target[0].Agent {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Server flag changed
+	return oldProbe.Config.Server != newProbe.Config.Server
+}
+
+// Helper function to extract allowed agents from targets (skipping index 0)
+func extractAllowedAgents(targets []probes.ProbeTarget) map[primitive.ObjectID]bool {
+	agents := make(map[primitive.ObjectID]bool)
+	if len(targets) > 1 {
+		for i := 1; i < len(targets); i++ {
+			if targets[i].Agent != primitive.NilObjectID {
+				agents[targets[i].Agent] = true
+			}
+		}
+	}
+	return agents
+}
+
+// Helper function to compare two agent sets
+func sameAgentSets(set1, set2 map[primitive.ObjectID]bool) bool {
+	if len(set1) != len(set2) {
+		return false
+	}
+
+	for agent := range set1 {
+		if !set2[agent] {
+			return false
+		}
+	}
+
+	return true
 }
 
 var (
@@ -105,62 +201,64 @@ func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 	return foundProbe, nil
 }
 
-func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
-	// Check if target address/port changed
-	if len(oldProbe.Config.Target) > 0 && len(newProbe.Config.Target) > 0 {
-		if oldProbe.Config.Target[0].Target != newProbe.Config.Target[0].Target {
-			return true
-		}
-		if oldProbe.Config.Target[0].Agent != newProbe.Config.Target[0].Agent {
-			return true
-		}
-	}
-
-	// Check if server flag changed
-	if oldProbe.Config.Server != newProbe.Config.Server {
-		return true
-	}
-
-	// Check if allowed agents changed for server
-	if oldProbe.Config.Server {
-		// For servers, check if the number of targets changed
-		if len(oldProbe.Config.Target) != len(newProbe.Config.Target) {
-			return true
-		}
-
-		// Check if any allowed agents changed
-		if len(oldProbe.Config.Target) > 1 && len(newProbe.Config.Target) > 1 {
-			// Create maps of allowed agents
-			oldAgents := make(map[primitive.ObjectID]bool)
-			newAgents := make(map[primitive.ObjectID]bool)
-
-			for i := 1; i < len(oldProbe.Config.Target); i++ {
-				if oldProbe.Config.Target[i].Agent != primitive.NilObjectID {
-					oldAgents[oldProbe.Config.Target[i].Agent] = true
-				}
+/*
+	func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
+		// Check if target address/port changed
+		if len(oldProbe.Config.Target) > 0 && len(newProbe.Config.Target) > 0 {
+			if oldProbe.Config.Target[0].Target != newProbe.Config.Target[0].Target {
+				return true
 			}
-
-			for i := 1; i < len(newProbe.Config.Target); i++ {
-				if newProbe.Config.Target[i].Agent != primitive.NilObjectID {
-					newAgents[newProbe.Config.Target[i].Agent] = true
-				}
+			if oldProbe.Config.Target[0].Agent != newProbe.Config.Target[0].Agent {
+				return true
 			}
+		}
 
-			// Compare the maps
-			if len(oldAgents) != len(newAgents) {
+		// Check if server flag changed
+		if oldProbe.Config.Server != newProbe.Config.Server {
+			return true
+		}
+
+		// Check if allowed agents changed for server
+		if oldProbe.Config.Server {
+			// For servers, check if the number of targets changed
+			if len(oldProbe.Config.Target) != len(newProbe.Config.Target) {
 				return true
 			}
 
-			for agent := range oldAgents {
-				if !newAgents[agent] {
+			// Check if any allowed agents changed
+			if len(oldProbe.Config.Target) > 1 && len(newProbe.Config.Target) > 1 {
+				// Create maps of allowed agents
+				oldAgents := make(map[primitive.ObjectID]bool)
+				newAgents := make(map[primitive.ObjectID]bool)
+
+				for i := 1; i < len(oldProbe.Config.Target); i++ {
+					if oldProbe.Config.Target[i].Agent != primitive.NilObjectID {
+						oldAgents[oldProbe.Config.Target[i].Agent] = true
+					}
+				}
+
+				for i := 1; i < len(newProbe.Config.Target); i++ {
+					if newProbe.Config.Target[i].Agent != primitive.NilObjectID {
+						newAgents[newProbe.Config.Target[i].Agent] = true
+					}
+				}
+
+				// Compare the maps
+				if len(oldAgents) != len(newAgents) {
 					return true
+				}
+
+				for agent := range oldAgents {
+					if !newAgents[agent] {
+						return true
+					}
 				}
 			}
 		}
-	}
 
-	return false
-}
+		return false
+	}
+*/
 func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
 	log.Infof("Stopping TrafficSim (server=%v) for probe %s", isServer, probeID.Hex())
 

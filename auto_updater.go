@@ -172,6 +172,10 @@ func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
 
 // isNewerVersion checks if the new version is newer than current
 func (u *AutoUpdater) isNewerVersion(newVersion, currentVersion string) bool {
+	if currentVersion == "dev" {
+		return false
+	}
+
 	newVersion = strings.TrimPrefix(newVersion, "v")
 	currentVersion = strings.TrimPrefix(currentVersion, "v")
 	return newVersion != currentVersion
@@ -211,7 +215,7 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 		name := strings.ToLower(asset.Name)
 
 		// Must contain netwatcher-agent in the name
-		if !strings.Contains(name, "netwatcher") && !strings.Contains(name, "netwatcher") {
+		if !strings.Contains(name, "netwatcher") && !strings.Contains(name, "netwatcher-agent") {
 			continue
 		}
 
@@ -232,7 +236,7 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 	// Fallback: look for any asset with netwatcher-agent in the name
 	for _, asset := range release.Assets {
 		name := strings.ToLower(asset.Name)
-		if strings.Contains(name, "netwatcher") || strings.Contains(name, "netwatcher") {
+		if strings.Contains(name, "netwatcher") || strings.Contains(name, "netwatcher-agent") {
 			return &asset
 		}
 	}
@@ -345,7 +349,7 @@ func (u *AutoUpdater) extractTarGz(archivePath string) (string, error) {
 
 		if header.Typeflag == tar.TypeReg {
 			name := filepath.Base(header.Name)
-			if strings.Contains(name, "netwatcher-agent") || strings.Contains(name, "netwatcher_agent") {
+			if strings.Contains(name, "netwatcher") || strings.Contains(name, "netwatcher-agent") {
 				path := filepath.Join(tempDir, name)
 				outFile, err := os.Create(path)
 				if err != nil {
@@ -385,7 +389,7 @@ func (u *AutoUpdater) extractZip(archivePath string) (string, error) {
 		}
 
 		name := filepath.Base(f.Name)
-		if strings.Contains(name, "netwatcher-agent") || strings.Contains(name, "netwatcher_agent") {
+		if strings.Contains(name, "netwatcher") || strings.Contains(name, "netwatcher-agent") {
 			rc, err := f.Open()
 			if err != nil {
 				return "", err
