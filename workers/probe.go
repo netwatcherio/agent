@@ -119,12 +119,12 @@ func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
 		}
 
 		// For server configs, compare allowed agents regardless of order
-		oldAgents := extractAllowedAgents(oldProbe.Config.Target)
+		/*oldAgents := extractAllowedAgents(oldProbe.Config.Target)
 		newAgents := extractAllowedAgents(newProbe.Config.Target)
 
 		if !sameAgentSets(oldAgents, newAgents) {
 			return true
-		}
+		}*/
 
 		return false
 	}
