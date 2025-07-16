@@ -53,7 +53,7 @@ type TrafficSim struct {
 	inTestCycle   bool
 
 	// Enhanced tracking
-	flowStats        map[string]*FlowStats // key: "src->dst"
+	flowStats        map[string]*FlowStats // key: "src-dst"
 	flowStatsMu      sync.RWMutex
 	serverStats      *ServerStats
 	lastServerReport time.Time
@@ -66,7 +66,7 @@ type Connection struct {
 	ExpectedSeq  int
 	AgentID      primitive.ObjectID
 	ClientStats  *ClientStats
-	FlowKey      string // "src->dst" identifier
+	FlowKey      string // "src-dst" identifier
 }
 
 type ClientStats struct {
@@ -101,7 +101,7 @@ type FlowServerStats struct {
 }
 
 type FlowStats struct {
-	Direction     string                `json:"direction"` // "client->server" or "server->client"
+	Direction     string                `json:"direction"` // "client-server" or "server-client"
 	StartTime     time.Time             `json:"startTime"`
 	EndTime       time.Time             `json:"endTime"`
 	PacketsSent   int                   `json:"packetsSent"`
@@ -190,7 +190,7 @@ func (ts *TrafficSim) initFlowTracking() {
 
 // Get or create flow stats
 func (ts *TrafficSim) getOrCreateFlow(src, dst primitive.ObjectID, direction string) *FlowStats {
-	flowKey := fmt.Sprintf("%s->%s", src.Hex(), dst.Hex())
+	flowKey := fmt.Sprintf("%s-%s", src.Hex(), dst.Hex())
 
 	ts.flowStatsMu.Lock()
 	defer ts.flowStatsMu.Unlock()
@@ -740,7 +740,7 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, errChan chan<- error, m
 			ts.ClientStats.mu.Unlock()
 
 			// Get flow for this test cycle
-			flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client->server")
+			flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
 
 			testStartTime := time.Now()
 			packetsInTest := TrafficSim_ReportSeq / TrafficSim_DataInterval
@@ -866,7 +866,7 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, packetsInTest int) {
 							ts.ClientStats.PacketTimes[seq] = pTime
 
 							// Mark packet as timed out in flow
-							flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client->server")
+							flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
 							flow.mu.Lock()
 							if detail, exists := flow.PacketDetails[seq]; exists {
 								detail.TimedOut = true
@@ -904,11 +904,8 @@ func (ts *TrafficSim) reportEnhancedStats(probe *Probe) {
 	}
 	ts.flowStatsMu.RUnlock()
 
-	enhancedStats := map[string]interface{}{
-		"traditional": stats,
-		"flows":       flowStats,
-		"timestamp":   time.Now(),
-	}
+	stats["flows"] = flowStats
+	stats["timestamp"] = time.Now()
 
 	if ts.DataChan != nil && ts.isRunning() {
 		if ts.Probe.ID == primitive.NilObjectID {
@@ -927,7 +924,7 @@ func (ts *TrafficSim) reportEnhancedStats(probe *Probe) {
 			ProbeID:   ts.Probe.ID,
 			Triggered: false,
 			CreatedAt: time.Now(),
-			Data:      enhancedStats,
+			Data:      stats,
 			Target: ProbeTarget{
 				Target: string(ProbeType_TRAFFICSIM) + "%%%" + ts.IPAddress + ":" + strconv.FormatInt(ts.Port, 10),
 				Agent:  ts.Probe.Config.Target[0].Agent,
@@ -996,7 +993,7 @@ func (ts *TrafficSim) handleACK(data TrafficSimData) {
 			ts.ClientStats.PacketTimes[seq] = pTime
 
 			// Update flow stats
-			flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client->server")
+			flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
 			ts.recordPacketReceived(flow, seq, pTime.Sent)
 
 			log.Printf("TrafficSim: Received ACK for packet %d, RTT: %dms", seq, receivedTime-pTime.Sent)
@@ -1267,7 +1264,7 @@ func (ts *TrafficSim) handleConnection(conn *net.UDPConn, addr *net.UDPAddr, msg
 	ts.ConnectionsMu.Lock()
 	connection, exists := ts.Connections[tsMsg.Src]
 	if !exists {
-		flowKey := fmt.Sprintf("%s->%s", tsMsg.Src.Hex(), ts.ThisAgent.Hex())
+		flowKey := fmt.Sprintf("%s-%s", tsMsg.Src.Hex(), ts.ThisAgent.Hex())
 		connection = &Connection{
 			Addr:         addr,
 			LastResponse: time.Now(),
