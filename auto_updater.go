@@ -172,7 +172,8 @@ func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
 
 // isNewerVersion checks if the new version is newer than current
 func (u *AutoUpdater) isNewerVersion(newVersion, currentVersion string) bool {
-	if currentVersion == "dev" {
+	if strings.Contains(currentVersion, "dev") {
+		log.Info("Using development version, not updating.")
 		return false
 	}
 
