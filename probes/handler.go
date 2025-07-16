@@ -27,6 +27,8 @@ const (
 	ProbeType_NETWORKINFO       ProbeType = "NETINFO"
 	ProbeType_SYSTEMINFO        ProbeType = "SYSINFO"
 	ProbeType_TRAFFICSIM        ProbeType = "TRAFFICSIM"
+	ProbeType_WEB               ProbeType = "WEB"
+	ProbeType_DNS               ProbeType = "DNS"
 )
 
 type ProbeConfig struct {
