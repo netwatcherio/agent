@@ -568,6 +568,14 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 	ts.Probe = mtrProbe
 	ts.initFlowTracking()
 
+	// Initialize client stats early so we can track connection failures
+	ts.ClientStats = &ClientStats{
+		LastReportTime: time.Now(),
+		ReportInterval: 15 * time.Second,
+		PacketTimes:    make(map[int]PacketTime),
+		ConnectionLost: false,
+	}
+
 	for ts.isRunning() && !ts.isStopping() {
 		select {
 		case <-ctx.Done():
@@ -589,30 +597,37 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 			log.Printf("TrafficSim: Local IP updated to %s", ts.localIP)
 		}
 
+		// Try to establish connection, but continue test even if it fails
+		connectionEstablished := false
 		if err := ts.establishConnection(); err != nil {
-			log.Printf("TrafficSim: Connection failed: %v", err)
-			// Mark connection as lost for stats purposes
-			if ts.ClientStats != nil {
-				ts.ClientStats.mu.Lock()
-				ts.ClientStats.ConnectionLost = true
-				ts.ClientStats.mu.Unlock()
+			log.Printf("TrafficSim: Initial connection failed: %v", err)
+			// Mark connection as lost but continue with the test
+			ts.ClientStats.mu.Lock()
+			ts.ClientStats.ConnectionLost = true
+			ts.ClientStats.mu.Unlock()
+
+			// Create a basic UDP connection for sending packets even if handshake failed
+			if err := ts.createBasicConnection(); err != nil {
+				log.Printf("TrafficSim: Failed to create basic connection: %v", err)
+				if !ts.waitOrStop(RetryInterval) {
+					return nil
+				}
+				continue
 			}
-			if !ts.waitOrStop(RetryInterval) {
-				return nil
-			}
-			continue
+		} else {
+			connectionEstablished = true
+			ts.ClientStats.mu.Lock()
+			ts.ClientStats.ConnectionLost = false
+			ts.ClientStats.mu.Unlock()
 		}
 
 		// Run the client session
-		if err := ts.runClientSession(ctx, mtrProbe); err != nil {
+		if err := ts.runClientSession(ctx, mtrProbe, connectionEstablished); err != nil {
 			log.Printf("TrafficSim: Client session error: %v", err)
 			if ts.Conn != nil {
 				ts.Conn.Close()
 			}
-			if !ts.waitOrStop(RetryInterval) {
-				return nil
-			}
-			continue
+			// Don't wait/retry here - let it continue to next cycle
 		}
 	}
 
@@ -649,16 +664,10 @@ func (ts *TrafficSim) establishConnection() error {
 	}
 
 	ts.Conn = conn
-	ts.ClientStats = &ClientStats{
-		LastReportTime: time.Now(),
-		ReportInterval: 15 * time.Second,
-		PacketTimes:    make(map[int]PacketTime),
-		ConnectionLost: false,
-	}
 	ts.testComplete = make(chan bool, 1)
 
 	if err := ts.sendHello(); err != nil {
-		conn.Close()
+		// Don't close connection here - we'll use it anyway
 		return fmt.Errorf("failed to establish connection: %w", err)
 	}
 
@@ -666,12 +675,35 @@ func (ts *TrafficSim) establishConnection() error {
 	return nil
 }
 
-func (ts *TrafficSim) runClientSession(ctx context.Context, mtrProbe *Probe) error {
+// createBasicConnection creates a UDP connection without handshake
+func (ts *TrafficSim) createBasicConnection() error {
+	toAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ts.IPAddress, ts.Port))
+	if err != nil {
+		return fmt.Errorf("could not resolve %s:%d: %w", ts.IPAddress, ts.Port, err)
+	}
+
+	localAddr, err := net.ResolveUDPAddr("udp4", ts.localIP+":0")
+	if err != nil {
+		return fmt.Errorf("could not resolve local address: %w", err)
+	}
+
+	conn, err := net.DialUDP("udp4", localAddr, toAddr)
+	if err != nil {
+		return fmt.Errorf("unable to create UDP connection to %s:%d: %w", ts.IPAddress, ts.Port, err)
+	}
+
+	ts.Conn = conn
+	ts.testComplete = make(chan bool, 1)
+	log.Printf("TrafficSim: Created basic UDP connection to %s:%d (no handshake)", ts.IPAddress, ts.Port)
+	return nil
+}
+
+func (ts *TrafficSim) runClientSession(ctx context.Context, mtrProbe *Probe, connectionEstablished bool) error {
 	errChan := make(chan error, 3) // Increased for ping goroutine
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	ts.wg.Add(3)
+	ts.wg.Add(2) // Only 2 goroutines initially
 	go func() {
 		defer ts.wg.Done()
 		ts.runTestCycles(sessionCtx, errChan, mtrProbe)
@@ -680,10 +712,15 @@ func (ts *TrafficSim) runClientSession(ctx context.Context, mtrProbe *Probe) err
 		defer ts.wg.Done()
 		ts.receiveDataLoop(sessionCtx, errChan)
 	}()
-	go func() {
-		defer ts.wg.Done()
-		ts.runPingLoop(sessionCtx, errChan)
-	}()
+
+	// Only run ping loop if connection was established
+	if connectionEstablished {
+		ts.wg.Add(1)
+		go func() {
+			defer ts.wg.Done()
+			ts.runPingLoop(sessionCtx, errChan)
+		}()
+	}
 
 	select {
 	case err := <-errChan:
