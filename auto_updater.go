@@ -299,22 +299,27 @@ func (u *AutoUpdater) extractAndReplace(archivePath, filename string) error {
 		return fmt.Errorf("failed to make binary executable: %w", err)
 	}
 
-	backupPath := currentExe + ".backup"
+	// Create a unique backup name with timestamp
+	backupPath := fmt.Sprintf("%s.backup.%d", currentExe, time.Now().Unix())
 
-	if err := u.copyFile(currentExe, backupPath); err != nil {
-		return fmt.Errorf("failed to create backup: %w", err)
+	// Rename the current executable instead of copying
+	if err := os.Rename(currentExe, backupPath); err != nil {
+		return fmt.Errorf("failed to rename current executable: %w", err)
 	}
 
-	if err := u.copyFile(newBinaryPath, currentExe); err != nil {
+	// Move the new binary to the original location
+	if err := os.Rename(newBinaryPath, currentExe); err != nil {
+		// Try to restore the backup
 		os.Rename(backupPath, currentExe)
-		return fmt.Errorf("failed to replace executable: %w", err)
+		return fmt.Errorf("failed to move new executable: %w", err)
 	}
 
-	os.Remove(backupPath)
-
-	if newBinaryPath != archivePath {
-		os.Remove(newBinaryPath)
-	}
+	// Schedule cleanup of the backup file after restart
+	// The old process will continue running from the renamed file
+	go func() {
+		time.Sleep(5 * time.Second)
+		os.Remove(backupPath)
+	}()
 
 	return nil
 }
