@@ -75,6 +75,7 @@ type ClientStats struct {
 	PacketTimes      map[int]PacketTime `json:"-"`
 	LastReportTime   time.Time          `json:"lastReportTime"`
 	ReportInterval   time.Duration      `json:"reportInterval"`
+	ConnectionLost   bool               `json:"connectionLost"`
 	mu               sync.RWMutex
 }
 
@@ -124,6 +125,7 @@ type PacketDetail struct {
 	TimedOut   bool          `json:"timedOut"`
 	Duplicate  bool          `json:"duplicate"`
 	OutOfOrder bool          `json:"outOfOrder"`
+	SendFailed bool          `json:"sendFailed"` // New field to track send failures
 }
 
 type RTTStatistics struct {
@@ -144,10 +146,11 @@ type JitterStatistics struct {
 }
 
 type PacketTime struct {
-	Sent     int64
-	Received int64
-	TimedOut bool
-	Size     int
+	Sent       int64
+	Received   int64
+	TimedOut   bool
+	SendFailed bool // New field to track send failures
+	Size       int
 }
 
 const (
@@ -208,18 +211,30 @@ func (ts *TrafficSim) getOrCreateFlow(src, dst primitive.ObjectID, direction str
 	return flow
 }
 
-// Record packet sent
-func (ts *TrafficSim) recordPacketSent(flow *FlowStats, seq int, size int) {
+// Record packet sent (updated to handle send failures)
+func (ts *TrafficSim) recordPacketSent(flow *FlowStats, seq int, size int, sendFailed bool) {
 	flow.mu.Lock()
 	defer flow.mu.Unlock()
 
 	flow.PacketsSent++
-	flow.BytesSent += int64(size)
-	flow.PacketDetails[seq] = &PacketDetail{
-		Sequence: seq,
-		SentTime: time.Now(),
-		Size:     size,
+	if !sendFailed {
+		flow.BytesSent += int64(size)
 	}
+
+	detail := &PacketDetail{
+		Sequence:   seq,
+		SentTime:   time.Now(),
+		Size:       size,
+		SendFailed: sendFailed,
+	}
+
+	// If send failed, immediately mark as timed out
+	if sendFailed {
+		detail.TimedOut = true
+		flow.PacketsLost++
+	}
+
+	flow.PacketDetails[seq] = detail
 }
 
 // Record packet received
@@ -257,7 +272,7 @@ func (ts *TrafficSim) calculateFlowStats(flow *FlowStats) map[string]interface{}
 	// Collect RTT data and calculate jitter
 	for _, seq := range sequences {
 		detail := flow.PacketDetails[seq]
-		if !detail.RecvTime.IsZero() && detail.RTT > 0 {
+		if !detail.RecvTime.IsZero() && detail.RTT > 0 && !detail.SendFailed {
 			rtts = append(rtts, detail.RTT)
 			if lastRTT > 0 {
 				jitter := detail.RTT - lastRTT
@@ -267,8 +282,8 @@ func (ts *TrafficSim) calculateFlowStats(flow *FlowStats) map[string]interface{}
 				jitters = append(jitters, jitter)
 			}
 			lastRTT = detail.RTT
-		} else if detail.TimedOut {
-			flow.PacketsLost++
+		} else if detail.TimedOut || detail.SendFailed {
+			// Already counted in PacketsLost during recordPacketSent or waitForResponses
 		}
 	}
 
@@ -453,6 +468,20 @@ func (ts *TrafficSim) cleanupOldFlows() {
 }
 
 // Generate server report for client
+// BIDIRECTIONAL REPORTING EXPLANATION:
+// The server generates periodic reports about each connected client flow.
+// These reports include:
+// - Server->Client statistics (packets/bytes sent from server to client)
+// - Client->Server statistics (packets/bytes received from client to server)
+// - Flow health metrics (out of order packets, duplicates, etc.)
+//
+// The client receives these reports and can use them to understand:
+// 1. How well its packets are reaching the server (client->server flow)
+// 2. How well it's receiving server responses (server->client flow)
+// 3. Any asymmetric network issues between the two directions
+//
+// This enables true bidirectional monitoring where both endpoints have
+// visibility into the full duplex communication channel.
 func (ts *TrafficSim) generateServerReport() map[string]interface{} {
 	if ts.serverStats == nil {
 		return nil
@@ -463,13 +492,17 @@ func (ts *TrafficSim) generateServerReport() map[string]interface{} {
 
 	flows := make(map[string]interface{})
 	for agentID, flow := range ts.serverStats.ActiveFlows {
+		// Each flow report contains bidirectional statistics:
+		// - packetsReceived: Client->Server direction
+		// - packetsSent: Server->Client direction
+		// This allows the client to see both directions of traffic
 		flows[agentID] = map[string]interface{}{
-			"packetsReceived": flow.PacketsRecv,
-			"packetsSent":     flow.PacketsSent,
-			"bytesReceived":   flow.BytesRecv,
-			"bytesSent":       flow.BytesSent,
-			"outOfOrder":      flow.OutOfOrder,
-			"duplicates":      flow.Duplicates,
+			"packetsReceived": flow.PacketsRecv, // Client->Server packets
+			"packetsSent":     flow.PacketsSent, // Server->Client packets
+			"bytesReceived":   flow.BytesRecv,   // Client->Server bytes
+			"bytesSent":       flow.BytesSent,   // Server->Client bytes
+			"outOfOrder":      flow.OutOfOrder,  // Client->Server sequencing issues
+			"duplicates":      flow.Duplicates,  // Client->Server duplicate packets
 			"lastSeen":        flow.LastSeen,
 			"uptime":          time.Since(flow.FirstSeen).Seconds(),
 		}
@@ -558,6 +591,12 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 
 		if err := ts.establishConnection(); err != nil {
 			log.Printf("TrafficSim: Connection failed: %v", err)
+			// Mark connection as lost for stats purposes
+			if ts.ClientStats != nil {
+				ts.ClientStats.mu.Lock()
+				ts.ClientStats.ConnectionLost = true
+				ts.ClientStats.mu.Unlock()
+			}
 			if !ts.waitOrStop(RetryInterval) {
 				return nil
 			}
@@ -614,6 +653,7 @@ func (ts *TrafficSim) establishConnection() error {
 		LastReportTime: time.Now(),
 		ReportInterval: 15 * time.Second,
 		PacketTimes:    make(map[int]PacketTime),
+		ConnectionLost: false,
 	}
 	ts.testComplete = make(chan bool, 1)
 
@@ -746,7 +786,7 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, errChan chan<- error, m
 			packetsInTest := TrafficSim_ReportSeq / TrafficSim_DataInterval
 
 			// Send packets for this test cycle
-			allPacketsSent := true
+			connectionError := false
 			for i := 0; i < packetsInTest; i++ {
 				select {
 				case <-ctx.Done():
@@ -774,22 +814,57 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, errChan chan<- error, m
 					}
 
 					msgSize := len(dataMsg)
-					if _, err := ts.Conn.Write([]byte(dataMsg)); err != nil {
-						if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-							log.Printf("TrafficSim: Temporary error sending data message: %v", err)
+					_, sendErr := ts.Conn.Write([]byte(dataMsg))
+
+					// Handle send failures
+					if sendErr != nil {
+						if netErr, ok := sendErr.(net.Error); ok && netErr.Temporary() {
+							log.Printf("TrafficSim: Temporary error sending data message: %v", sendErr)
+							// Record as sent but failed
+							ts.recordPacketSent(flow, currentSeq, msgSize, true)
+
+							ts.ClientStats.mu.Lock()
+							ts.ClientStats.PacketTimes[currentSeq] = PacketTime{
+								Sent:       sentTime,
+								Size:       msgSize,
+								SendFailed: true,
+								TimedOut:   true,
+							}
+							ts.ClientStats.mu.Unlock()
 							continue
 						}
-						allPacketsSent = false
+						// Non-temporary error, connection likely lost
+						connectionError = true
+						// Record remaining packets as failed
+						for j := i; j < packetsInTest; j++ {
+							if j > i {
+								ts.Mutex.Lock()
+								ts.Sequence++
+								currentSeq = ts.Sequence
+								ts.Mutex.Unlock()
+							}
+							ts.recordPacketSent(flow, currentSeq, msgSize, true)
+
+							ts.ClientStats.mu.Lock()
+							ts.ClientStats.PacketTimes[currentSeq] = PacketTime{
+								Sent:       sentTime,
+								Size:       msgSize,
+								SendFailed: true,
+								TimedOut:   true,
+							}
+							ts.ClientStats.mu.Unlock()
+						}
 						break
 					}
 
-					// Record packet sent
-					ts.recordPacketSent(flow, currentSeq, msgSize)
+					// Record successful packet sent
+					ts.recordPacketSent(flow, currentSeq, msgSize, false)
 
 					ts.ClientStats.mu.Lock()
 					ts.ClientStats.PacketTimes[currentSeq] = PacketTime{
-						Sent: sentTime,
-						Size: msgSize,
+						Sent:       sentTime,
+						Size:       msgSize,
+						SendFailed: false,
 					}
 					ts.ClientStats.mu.Unlock()
 
@@ -803,13 +878,13 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, errChan chan<- error, m
 				}
 			}
 
-			if !allPacketsSent {
+			if connectionError {
 				ts.setInTestCycle(false)
-				errChan <- fmt.Errorf("failed to send all packets")
+				errChan <- fmt.Errorf("connection lost during packet transmission")
 				return
 			}
 
-			// Wait for responses
+			// Wait for responses (only for packets that were sent successfully)
 			log.Printf("TrafficSim: Finished sending %d packets, waiting for responses...", packetsInTest)
 			ts.waitForResponses(ctx, packetsInTest)
 
@@ -860,6 +935,11 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, packetsInTest int) {
 
 			for seq := 1; seq <= packetsInTest; seq++ {
 				if pTime, ok := ts.ClientStats.PacketTimes[seq]; ok {
+					// Skip packets that failed to send
+					if pTime.SendFailed {
+						continue
+					}
+
 					if pTime.Received == 0 && !pTime.TimedOut {
 						if now-pTime.Sent > int64(PacketTimeout.Milliseconds()) {
 							pTime.TimedOut = true
@@ -870,6 +950,7 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, packetsInTest int) {
 							flow.mu.Lock()
 							if detail, exists := flow.PacketDetails[seq]; exists {
 								detail.TimedOut = true
+								flow.PacketsLost++
 							}
 							flow.mu.Unlock()
 
@@ -988,7 +1069,7 @@ func (ts *TrafficSim) handleACK(data TrafficSimData) {
 	defer ts.ClientStats.mu.Unlock()
 
 	if pTime, ok := ts.ClientStats.PacketTimes[seq]; ok {
-		if pTime.Received == 0 && !pTime.TimedOut {
+		if pTime.Received == 0 && !pTime.TimedOut && !pTime.SendFailed {
 			pTime.Received = receivedTime
 			ts.ClientStats.PacketTimes[seq] = pTime
 
@@ -999,16 +1080,29 @@ func (ts *TrafficSim) handleACK(data TrafficSimData) {
 			log.Printf("TrafficSim: Received ACK for packet %d, RTT: %dms", seq, receivedTime-pTime.Sent)
 		} else if pTime.TimedOut {
 			log.Printf("TrafficSim: Received late ACK for packet %d (already marked as timed out)", seq)
+		} else if pTime.SendFailed {
+			log.Printf("TrafficSim: Received ACK for packet %d that failed to send", seq)
 		}
 	}
 
 	ts.LastResponse = time.Now()
 }
 
+// Handle server reports for bidirectional monitoring
+// The client processes these reports to understand:
+// 1. Server's view of the client->server flow
+// 2. Server's transmission statistics (server->client flow)
+// 3. Any discrepancies between what client sent vs what server received
 func (ts *TrafficSim) handleServerReport(data TrafficSimData) {
 	if data.Report != nil {
 		log.Printf("TrafficSim: Received server report: %+v", data.Report)
-		// Process server report data as needed
+
+		// TODO: Future enhancement - compare server's view with client's view
+		// to detect asymmetric packet loss or network issues
+		// For example:
+		// - Client sent 60 packets but server only received 55
+		// - Server sent 60 ACKs but client only received 50
+		// This would indicate different loss rates in each direction
 	}
 }
 
@@ -1037,6 +1131,7 @@ func (ts *TrafficSim) calculateStats(mtrProbe *Probe) map[string]interface{} {
 	var totalRTT, minRTT, maxRTT int64
 	var rtts []float64
 	lostPackets := 0
+	sendFailures := 0
 	outOfOrder := 0
 	duplicatePackets := 0
 	receivedSequences := []int{}
@@ -1051,9 +1146,18 @@ func (ts *TrafficSim) calculateStats(mtrProbe *Probe) map[string]interface{} {
 	// First pass: collect RTT data and identify lost packets
 	for _, seq := range keys {
 		pTime := ts.ClientStats.PacketTimes[seq]
+
+		// Count send failures separately
+		if pTime.SendFailed {
+			sendFailures++
+			lostPackets++
+			log.Printf("TrafficSim: Packet %d failed to send", seq)
+			continue
+		}
+
 		if pTime.Received == 0 || pTime.TimedOut {
 			lostPackets++
-			log.Printf("TrafficSim: Packet %d lost", seq)
+			log.Printf("TrafficSim: Packet %d lost (timeout)", seq)
 			continue
 		}
 
@@ -1098,8 +1202,8 @@ func (ts *TrafficSim) calculateStats(mtrProbe *Probe) map[string]interface{} {
 		lossPercentage = (float64(lostPackets) / float64(totalPackets)) * 100
 	}
 
-	log.Printf("TrafficSim: Stats - Total: %d, Lost: %d (%.2f%%), Out of Order: %d, Avg RTT: %.2fms",
-		totalPackets, lostPackets, lossPercentage, outOfOrder, avgRTT)
+	log.Printf("TrafficSim: Stats - Total: %d, Lost: %d (%.2f%%), Send Failures: %d, Out of Order: %d, Avg RTT: %.2fms",
+		totalPackets, lostPackets, lossPercentage, sendFailures, outOfOrder, avgRTT)
 
 	// Trigger MTR if packet loss exceeds threshold
 	if totalPackets > 0 && lossPercentage > 5.0 && ts.isRunning() && !ts.isStopping() {
@@ -1108,6 +1212,7 @@ func (ts *TrafficSim) calculateStats(mtrProbe *Probe) map[string]interface{} {
 
 	return map[string]interface{}{
 		"lostPackets":      lostPackets,
+		"sendFailures":     sendFailures,
 		"lossPercentage":   lossPercentage,
 		"outOfSequence":    outOfOrder,
 		"duplicatePackets": duplicatePackets,
@@ -1117,6 +1222,7 @@ func (ts *TrafficSim) calculateStats(mtrProbe *Probe) map[string]interface{} {
 		"stdDevRTT":        stdDevRTT,
 		"totalPackets":     totalPackets,
 		"reportTime":       time.Now(),
+		"connectionLost":   ts.ClientStats.ConnectionLost,
 	}
 }
 
@@ -1212,6 +1318,9 @@ func (ts *TrafficSim) runServer() error {
 	return nil
 }
 
+// Send periodic reports to all connected clients
+// These reports enable bidirectional monitoring by sharing the server's
+// perspective of each flow with the respective clients
 func (ts *TrafficSim) sendServerReports(conn *net.UDPConn) {
 	report := ts.generateServerReport()
 	if report == nil {
