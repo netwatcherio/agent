@@ -679,15 +679,16 @@ func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ip
 
 	if needNewServer {
 		trafficSimServer = &probes.TrafficSim{
-			Running:       0, // Start with 0, will be set to 1 by Start()
-			Errored:       false,
-			IsServer:      true,
-			ThisAgent:     thisAgent,
-			OtherAgent:    primitive.ObjectID{},
-			IPAddress:     ipAddress,
-			Port:          int64(port),
-			AllowedAgents: allowedAgentsList,
-			Probe:         &probe,
+			Running:                0, // Start with 0, will be set to 1 by Start()
+			Errored:                false,
+			IsServer:               true,
+			ThisAgent:              thisAgent,
+			OtherAgent:             primitive.ObjectID{},
+			IPAddress:              ipAddress,
+			Port:                   int64(port),
+			AllowedAgents:          allowedAgentsList,
+			Probe:                  &probe,
+			InterfaceCheckInterval: 30 * time.Second,
 		}
 
 		log.Infof("Starting TrafficSim server on %s:%d with allowed agents: %v", ipAddress, port, allowedAgentsList)
@@ -785,15 +786,16 @@ func handleTrafficSimClient(probe probes.Probe, thisAgent primitive.ObjectID, ip
 
 	// Create new client
 	simClient := &probes.TrafficSim{
-		Running:    0, // Start with 0, will be set to 1 by Start()
-		Errored:    false,
-		Conn:       nil,
-		ThisAgent:  thisAgent,
-		OtherAgent: probe.Config.Target[0].Agent,
-		IPAddress:  ipAddress,
-		Port:       int64(port),
-		Probe:      &probe,
-		DataChan:   dataChan,
+		Running:                0, // Start with 0, will be set to 1 by Start()
+		Errored:                false,
+		Conn:                   nil,
+		ThisAgent:              thisAgent,
+		OtherAgent:             probe.Config.Target[0].Agent,
+		IPAddress:              ipAddress,
+		Port:                   int64(port),
+		Probe:                  &probe,
+		DataChan:               dataChan,
+		InterfaceCheckInterval: 30 * time.Second,
 	}
 
 	trafficSimClients[probe.ID] = simClient

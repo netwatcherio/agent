@@ -49,7 +49,6 @@ type TrafficSim struct {
 	Sequence      int
 	DataChan      chan ProbeData
 	Probe         *Probe
-	localIP       string
 	testComplete  chan bool
 	stopChan      chan struct{}
 	wg            sync.WaitGroup
@@ -71,6 +70,12 @@ type TrafficSim struct {
 	connectionValid     bool
 	connectionValidMu   sync.RWMutex
 	lastConnectionCheck time.Time
+
+	localIP                string
+	localIPMu              sync.RWMutex
+	preferredInterface     string // Name of preferred interface (e.g., "en0", "eth0")
+	lastInterfaceCheck     time.Time
+	InterfaceCheckInterval time.Duration
 
 	sync.Mutex
 }
@@ -290,7 +295,33 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, errChan chan<- error, m
 	}
 }
 
+// getInterfaceByIP finds the interface that has the given IP
+func (ts *TrafficSim) getInterfaceByIP(ip string) (*net.Interface, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ipnet.IP.String() == ip {
+					return &iface, nil
+				}
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("interface with IP %s not found", ip)
+}
+
 // New method to send a data packet with proper error handling
+// Modified sendDataPacket to handle interface changes
 func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker, flow *FlowStats) bool {
 	ts.Mutex.Lock()
 	ts.Sequence++
@@ -370,6 +401,14 @@ func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker, flow *FlowStats) bool 
 		if ts.isConnectionError(sendErr) {
 			log.Printf("TrafficSim: Connection error detected, marking connection as invalid")
 			ts.setConnectionValid(false)
+
+			// If it's an address-related error, force interface reselection
+			if strings.Contains(sendErr.Error(), "can't assign requested address") {
+				ts.localIPMu.Lock()
+				ts.localIP = ""
+				ts.lastInterfaceCheck = time.Time{}
+				ts.localIPMu.Unlock()
+			}
 		}
 
 		ts.incrementPacketsInCycle()
@@ -515,30 +554,286 @@ func (ts *TrafficSim) receiveDataLoop(ctx context.Context, errChan chan<- error)
 	}
 }
 
-// Fixed establishUDPConnection with better error handling
+// Modified establishUDPConnection with better error handling and retries
 func (ts *TrafficSim) establishUDPConnection() bool {
+	// Get current local IP - this will select the best interface
+	localIP, err := ts.getLocalIP()
+	if err != nil {
+		log.Printf("TrafficSim: Failed to get local IP: %v", err)
+		return false
+	}
+
 	toAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ts.IPAddress, ts.Port))
 	if err != nil {
 		log.Printf("TrafficSim: Could not resolve %s:%d: %v", ts.IPAddress, ts.Port, err)
 		return false
 	}
 
-	localAddr, err := net.ResolveUDPAddr("udp4", ts.localIP+":0")
+	// Try to establish connection with retries on different interfaces if needed
+	maxRetries := 3
+	for retry := 0; retry < maxRetries; retry++ {
+		localAddr, err := net.ResolveUDPAddr("udp4", localIP+":0")
+		if err != nil {
+			log.Printf("TrafficSim: Could not resolve local address %s: %v", localIP, err)
+			// Try to get a new IP
+			localIP, err = ts.getLocalIP()
+			if err != nil {
+				return false
+			}
+			continue
+		}
+
+		conn, err := net.DialUDP("udp4", localAddr, toAddr)
+		if err != nil {
+			log.Printf("TrafficSim: Unable to connect from %s to %s:%d: %v", localIP, ts.IPAddress, ts.Port, err)
+
+			// If it's a network-related error, try to get a new interface
+			if strings.Contains(err.Error(), "can't assign requested address") ||
+				strings.Contains(err.Error(), "network is unreachable") {
+				// Force interface reselection
+				ts.localIPMu.Lock()
+				ts.localIP = ""
+				ts.lastInterfaceCheck = time.Time{}
+				ts.localIPMu.Unlock()
+
+				// Get a new IP
+				localIP, err = ts.getLocalIP()
+				if err != nil {
+					return false
+				}
+
+				// Small delay before retry
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			return false
+		}
+
+		// Connection successful - save the interface name for future preference
+		if iface, err := ts.getInterfaceByIP(localIP); err == nil {
+			ts.preferredInterface = iface.Name
+		}
+
+		// Set the new connection
+		ts.setConnection(conn)
+		log.Printf("TrafficSim: UDP connection established from %s to %s:%d", localIP, ts.IPAddress, ts.Port)
+		return true
+	}
+
+	return false
+}
+
+// isIPStillValid checks if an IP address is still valid on the system
+func (ts *TrafficSim) isIPStillValid(ip string) bool {
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		log.Printf("TrafficSim: Could not resolve local address: %v", err)
 		return false
 	}
 
-	conn, err := net.DialUDP("udp4", localAddr, toAddr)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ipnet.IP.String() == ip {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// testInterfaceConnectivity tests if an interface can actually send packets
+func (ts *TrafficSim) testInterfaceConnectivity(localIP string) bool {
+	// Try to create a UDP socket bound to this IP
+	localAddr, err := net.ResolveUDPAddr("udp4", localIP+":0")
 	if err != nil {
-		log.Printf("TrafficSim: Unable to connect to %s:%d: %v", ts.IPAddress, ts.Port, err)
 		return false
 	}
 
-	// Set the new connection
-	ts.setConnection(conn)
-	log.Printf("TrafficSim: UDP connection established to %s:%d", ts.IPAddress, ts.Port)
+	// Try to dial a well-known public DNS server
+	// Using 8.8.8.8:53 (Google DNS) as it's generally accessible
+	remoteAddr, err := net.ResolveUDPAddr("udp4", "8.8.8.8:53")
+	if err != nil {
+		return false
+	}
+
+	conn, err := net.DialUDP("udp4", localAddr, remoteAddr)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	// Set a short deadline
+	conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
+
+	// Try to send a small packet
+	_, err = conn.Write([]byte{0x00})
+	if err != nil {
+		return false
+	}
+
+	// If we can bind and send, consider it valid
+	// We don't wait for a response as we just want to test binding
 	return true
+}
+
+// NetworkInterface represents a network interface with scoring for selection
+type NetworkInterface struct {
+	Name      string
+	IP        net.IP
+	Interface net.Interface
+	Score     int
+}
+
+// selectBestInterface selects the most suitable network interface for outbound traffic
+func (ts *TrafficSim) selectBestInterface() (net.Interface, string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return net.Interface{}, "", fmt.Errorf("failed to list interfaces: %w", err)
+	}
+
+	var candidates []NetworkInterface
+
+	for _, iface := range interfaces {
+		// Skip down interfaces
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		// Skip loopback interfaces
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		// Get addresses for this interface
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			// Only consider IPv4 addresses
+			ip := ipnet.IP.To4()
+			if ip == nil {
+				continue
+			}
+
+			// Skip link-local addresses
+			if ip.IsLinkLocalUnicast() {
+				continue
+			}
+
+			// Calculate score for this interface
+			score := ts.scoreInterface(iface, ip)
+
+			candidates = append(candidates, NetworkInterface{
+				Name:      iface.Name,
+				IP:        ip,
+				Interface: iface,
+				Score:     score,
+			})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return net.Interface{}, "", fmt.Errorf("no suitable network interfaces found")
+	}
+
+	// Sort by score (highest first)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Score > candidates[j].Score
+	})
+
+	// Test connectivity for top candidates
+	for _, candidate := range candidates {
+		if ts.testInterfaceConnectivity(candidate.IP.String()) {
+			return candidate.Interface, candidate.IP.String(), nil
+		}
+	}
+
+	// If no interface passed connectivity test, return the highest scored one
+	best := candidates[0]
+	return best.Interface, best.IP.String(), nil
+}
+
+// scoreInterface assigns a score to an interface based on various criteria
+func (ts *TrafficSim) scoreInterface(iface net.Interface, ip net.IP) int {
+	score := 0
+
+	// Prefer running interfaces
+	if iface.Flags&net.FlagRunning != 0 {
+		score += 20
+	}
+
+	// Prefer multicast capable interfaces
+	if iface.Flags&net.FlagMulticast != 0 {
+		score += 5
+	}
+
+	// Prefer broadcast capable interfaces
+	if iface.Flags&net.FlagBroadcast != 0 {
+		score += 5
+	}
+
+	// Prefer interfaces with standard names
+	name := strings.ToLower(iface.Name)
+	if strings.HasPrefix(name, "en") || strings.HasPrefix(name, "eth") {
+		score += 15
+	} else if strings.HasPrefix(name, "wlan") || strings.HasPrefix(name, "wi") {
+		score += 10
+	}
+
+	// Prefer previously used interface
+	if ts.preferredInterface != "" && iface.Name == ts.preferredInterface {
+		score += 25
+	}
+
+	// Prefer private network ranges (more likely to be primary interfaces)
+	if ip.IsPrivate() {
+		score += 10
+
+		// Prefer common private ranges
+		if ip[0] == 192 && ip[1] == 168 {
+			score += 5 // Home/small office networks
+		} else if ip[0] == 10 {
+			score += 3 // Corporate networks
+		}
+	}
+
+	// Avoid virtual interfaces
+	if strings.Contains(name, "veth") || strings.Contains(name, "docker") ||
+		strings.Contains(name, "br-") || strings.Contains(name, "virbr") {
+		score -= 20
+	}
+
+	// Avoid VPN interfaces
+	if strings.Contains(name, "tun") || strings.Contains(name, "tap") ||
+		strings.Contains(name, "utun") || strings.Contains(name, "ppp") {
+		score -= 15
+	}
+
+	// Avoid VMware interfaces
+	if strings.Contains(name, "vmnet") {
+		score -= 20
+	}
+
+	return score
 }
 
 // Fixed runClientSession to handle connection failures better
@@ -1268,6 +1563,41 @@ func (ts *TrafficSim) cleanupOldPacketTimes(currentCycleStart int) {
 	}
 }
 
+// Add a periodic interface check to detect network changes proactively
+func (ts *TrafficSim) runInterfaceMonitor(ctx context.Context) {
+	ticker := time.NewTicker(ts.InterfaceCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !ts.isRunning() {
+				return
+			}
+
+			// Check if current IP is still valid
+			ts.localIPMu.RLock()
+			currentIP := ts.localIP
+			ts.localIPMu.RUnlock()
+
+			if currentIP != "" && !ts.isIPStillValid(currentIP) {
+				log.Printf("TrafficSim: Current IP %s is no longer valid, forcing interface reselection", currentIP)
+
+				// Force reselection
+				ts.localIPMu.Lock()
+				ts.localIP = ""
+				ts.lastInterfaceCheck = time.Time{}
+				ts.localIPMu.Unlock()
+
+				// Mark connection as invalid to force reconnection
+				ts.setConnectionValid(false)
+			}
+		}
+	}
+}
+
 // Modified runClient to handle session restarts properly
 func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 	ts.Probe = mtrProbe
@@ -1283,6 +1613,12 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 		ts.testComplete = make(chan bool, 1)
 	}
 
+	// Start interface monitor
+	monitorCtx, cancelMonitor := context.WithCancel(ctx)
+	defer cancelMonitor()
+
+	go ts.runInterfaceMonitor(monitorCtx)
+
 	// Main client loop
 	for ts.isRunning() && !ts.isStopping() {
 		select {
@@ -1293,7 +1629,8 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 		default:
 		}
 
-		currentIP, err := getLocalIP()
+		// Get current IP (this will handle interface selection)
+		currentIP, err := ts.getLocalIP()
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get local IP: %v", err)
 			if !ts.waitOrStop(RetryInterval) {
@@ -1302,10 +1639,7 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 			continue
 		}
 
-		if ts.localIP != currentIP {
-			ts.localIP = currentIP
-			log.Printf("TrafficSim: Local IP updated to %s", ts.localIP)
-		}
+		log.Printf("TrafficSim: Using local IP %s", currentIP)
 
 		// Try to establish connection but don't block on failure
 		connectionEstablished := ts.tryEstablishConnection()
@@ -1320,6 +1654,11 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 
 			log.Printf("TrafficSim: Client session error: %v, will restart session", err)
 
+			// Force interface recheck on session error
+			ts.localIPMu.Lock()
+			ts.lastInterfaceCheck = time.Time{}
+			ts.localIPMu.Unlock()
+
 			// Wait a bit before restarting the session
 			select {
 			case <-time.After(5 * time.Second):
@@ -1333,6 +1672,32 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 
 	log.Print("TrafficSim: Client stopped")
 	return nil
+}
+
+// getLocalIP - Improved version with better interface selection
+func (ts *TrafficSim) getLocalIP() (string, error) {
+	ts.localIPMu.Lock()
+	defer ts.localIPMu.Unlock()
+
+	// Check if we need to refresh the interface selection
+	if time.Since(ts.lastInterfaceCheck) < ts.InterfaceCheckInterval && ts.localIP != "" {
+		// Verify the cached IP is still valid
+		if ts.isIPStillValid(ts.localIP) {
+			return ts.localIP, nil
+		}
+	}
+
+	// Get the best interface
+	iface, ip, err := ts.selectBestInterface()
+	if err != nil {
+		return "", err
+	}
+
+	ts.localIP = ip
+	ts.lastInterfaceCheck = time.Now()
+	log.Printf("TrafficSim: Selected interface %s with IP %s", iface.Name, ip)
+
+	return ip, nil
 }
 
 const (
