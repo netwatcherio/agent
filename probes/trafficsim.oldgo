@@ -450,7 +450,7 @@ func (ts *TrafficSim) reportStats(probe *Probe) {
 			return
 		}
 
-		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
+		reportingAgent, err := primitive.ObjectIDFromHex(os.getEnv("AGENT_ID"))
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return
@@ -646,7 +646,7 @@ func (ts *TrafficSim) triggerMTR(mtrProbe *Probe, lossPercentage float64) {
 	}
 
 	if ts.DataChan != nil && ts.isRunning() {
-		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
+		reportingAgent, err := primitive.ObjectIDFromHex(os.getEnv("AGENT_ID"))
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return

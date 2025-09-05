@@ -841,7 +841,7 @@ func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	if err != nil {
 		log.Errorf("MTR error: %v", err)
 	} else {
-		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
+		reportingAgent, err := primitive.ObjectIDFromHex(os.getEnv("AGENT_ID"))
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return

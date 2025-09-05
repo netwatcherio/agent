@@ -7,7 +7,6 @@ import (
 	probing "github.com/prometheus-community/pro-bing"
 	log "github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"os"
 	"runtime"
 	"time"
 )
@@ -102,7 +101,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 		log.Info(string(marshal))
 
-		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
+		reportingAgent, err := primitive.ObjectIDFromHex("123")
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return
