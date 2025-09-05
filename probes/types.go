@@ -1,6 +1,7 @@
 package probes
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -9,7 +10,7 @@ type Probe struct {
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 	WorkspaceId int       `json:"workspaceId"`
-	AgentId     int       `json:"agentId"`
+	AgentID     uint      `json:"agentID"`
 	Type        ProbeType `json:"type"`
 	Enabled     bool      `json:"enabled"`
 	IntervalSec int       `json:"intervalSec"`
@@ -50,12 +51,18 @@ const (
 	ProbeType_DNS               ProbeType = "DNS"
 )
 
+// ProbeData What the agent posts (flattened main-level fields + kind + raw payload)
 type ProbeData struct {
-	ID        uint        `json:"id"bson:"_id"`
-	ProbeID   uint        `json:"probe"bson:"probe"`
-	Triggered bool        `json:"triggered"bson:"triggered"`
-	CreatedAt time.Time   `bson:"createdAt"json:"createdAt"`
-	UpdatedAt time.Time   `bson:"updatedAt"json:"updatedAt"`
-	Data      interface{} `json:"data,omitempty"bson:"data,omitempty"`
-	Target    ProbeTarget `bson:"target" json:"target"`
+	ID              uint      `json:"id"`
+	ProbeID         uint      `json:"probe_id"`
+	ProbeAgentID    uint      `json:"probe_agent_id"` // probe ID owner - used for reverse probes
+	Triggered       bool      `json:"triggered"`
+	TriggeredReason string    `json:"triggered_reason"`
+	CreatedAt       time.Time `json:"created_at"` // this is the timestamp that the agent provides
+	// ReceivedAt       time.Time       `json:"received_at"` // this is the timestamp the backend provides
+	Type    ProbeType       `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+	// Optional: carry target string if you still resolve AGENT types dynamically
+	Target      string `json:"target,omitempty"`
+	TargetAgent uint   `json:"targetAgent,omitempty"`
 }

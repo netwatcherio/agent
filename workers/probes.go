@@ -144,8 +144,8 @@ func extractAllowedAgents(targets []probes.ProbeTarget) map[primitive.ObjectID]b
 	agents := make(map[primitive.ObjectID]bool)
 	/*if len(targets) > 1 {
 		for i := 1; i < len(targets); i++ {
-			if targets[i].AgentId != primitive.NilObjectID {
-				agents[targets[i].AgentId] = true
+			if targets[i].AgentID != primitive.NilObjectID {
+				agents[targets[i].AgentID] = true
 			}
 		} todo
 	}*/
@@ -819,9 +819,18 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	if err != nil {
 		log.Errorf("SystemInfo error: %v", err)
 	} else {
+		marshal, err := json.Marshal(data)
+		if err != nil {
+			return
+		}
+
 		dataChan <- probes.ProbeData{
-			ProbeID: uint(probe.ID), // todo
-			Data:    data,
+			ID:           probe.ID, // todo
+			Type:         probes.ProbeType_SYSTEMINFO,
+			Payload:      marshal,
+			ProbeID:      probe.ID,
+			ProbeAgentID: probe.AgentID, // probe ownership id
+			CreatedAt:    time.Now(),
 		}
 	}
 
@@ -934,9 +943,18 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 	if err != nil {
 		log.Errorf("NetworkInfo error: %v", err)
 	} else {
+		marshal, err := json.Marshal(data)
+		if err != nil {
+			return
+		}
+
 		dataChan <- probes.ProbeData{
-			ProbeID: probe.ID,
-			Data:    data,
+			ID:           probe.ID, // todo
+			Type:         probes.ProbeType_NETWORKINFO,
+			Payload:      marshal,
+			ProbeID:      probe.ID,
+			ProbeAgentID: probe.AgentID, // probe ownership id
+			CreatedAt:    time.Now(),
 		}
 	}
 
