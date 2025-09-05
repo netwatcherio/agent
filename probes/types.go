@@ -64,5 +64,5 @@ type ProbeData struct {
 	Payload json.RawMessage `json:"payload"`
 	// Optional: carry target string if you still resolve AGENT types dynamically
 	Target      string `json:"target,omitempty"`
-	TargetAgent uint   `json:"targetAgent,omitempty"`
+	TargetAgent uint   `json:"target_agent,omitempty"`
 }
