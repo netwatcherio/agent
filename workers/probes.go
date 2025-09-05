@@ -6,16 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"sort"
-	"strconv"
-	"strings"
+	"github.com/netwatcherio/netwatcher-agent/probes"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/netwatcherio/netwatcher-agent/probes"
-	"github.com/showwin/speedtest-go/speedtest"
 	log "github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"golang.org/x/sync/syncmap"
@@ -34,7 +28,7 @@ type ProbeWorkerS struct {
 func makeProbeKey(probe probes.Probe) string {
 	// For TrafficSim servers, we want to treat allowed agent changes as updates, not new probes
 	// So we'll exclude the allowed agents from the key for server probes
-	if probe.Type == probes.ProbeType_TRAFFICSIM && probe.Config.Server {
+	if probe.Type == probes.ProbeType_TRAFFICSIM {
 		// For server probes, only include the server address/port in the key
 		// This ensures that changes to allowed agents don't create a new probe
 		normalizedConfig := struct {
@@ -45,20 +39,19 @@ func makeProbeKey(probe probes.Probe) string {
 			Server   bool   `json:"server"`
 			Pending  int64  `json:"pending"`
 		}{
-			Duration: probe.Config.Duration,
-			Count:    probe.Config.Count,
-			Interval: probe.Config.Interval,
-			Server:   probe.Config.Server,
-			Pending:  probe.Config.Pending.Unix(),
+			Duration: probe.DurationSec,
+			Count:    probe.Count,
+			Interval: probe.IntervalSec,
+			Server:   probe.Server,
 		}
 
 		// Only include the server address (first target) for server probes
-		if len(probe.Config.Target) > 0 {
+		/*if len(probe.Target) > 0 {
 			normalizedConfig.Target = fmt.Sprintf("%s|%s|%s",
-				probe.Config.Target[0].Target,
-				probe.Config.Target[0].Agent.Hex(),
-				probe.Config.Target[0].Group.Hex())
-		}
+				probe.Target[0].Target,
+				probe.Target[0].Agent.Hex(),
+				probe.Target[0].Group.Hex())
+		}*/
 
 		configBytes, err := json.Marshal(normalizedConfig)
 		if err != nil {
@@ -76,24 +69,23 @@ func makeProbeKey(probe probes.Probe) string {
 		Count    int      `json:"count"`
 		Interval int      `json:"interval"`
 		Server   bool     `json:"server"`
-		Pending  int64    `json:"pending"`
 	}{
-		Duration: probe.Config.Duration,
-		Count:    probe.Config.Count,
-		Interval: probe.Config.Interval,
-		Server:   probe.Config.Server,
-		Pending:  probe.Config.Pending.Unix(),
+		Target:   make([]string, 0), // todo
+		Duration: probe.DurationSec,
+		Count:    probe.Count,
+		Interval: probe.IntervalSec,
+		Server:   probe.Server,
 	}
 
 	// Create a sorted, normalized representation of targets
-	targetStrings := make([]string, len(probe.Config.Target))
-	for i, target := range probe.Config.Target {
+	/*targetStrings := make([]string, len(probe.Target))
+	for i, target := range probe.Target {
 		targetStrings[i] = fmt.Sprintf("%s|%s|%s", target.Target, target.Agent.Hex(), target.Group.Hex())
-	}
+	}*/
 
 	// Sort the target strings to ensure consistent ordering
-	sort.Strings(targetStrings)
-	normalizedConfig.Target = targetStrings
+	/*sort.Strings(targetStrings)
+	normalizedConfig.Target = targetStrings*/
 
 	configBytes, err := json.Marshal(normalizedConfig)
 	if err != nil {
@@ -105,22 +97,22 @@ func makeProbeKey(probe probes.Probe) string {
 }
 
 // Alternative approach: specialized comparison for TrafficSim probes
-func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
+func trafficSimConfigChanged(oldprobe, newprobe probes.Probe) bool {
 	// For server probes, we need special handling
-	if oldProbe.Config.Server && newProbe.Config.Server {
+	if oldprobe.Server && newprobe.Server {
 		// Check if the server address/port changed (always at index 0)
-		if len(oldProbe.Config.Target) > 0 && len(newProbe.Config.Target) > 0 {
-			if oldProbe.Config.Target[0].Target != newProbe.Config.Target[0].Target {
+		/*if len(oldprobe.Target) > 0 && len(newprobe.Target) > 0 {
+			if oldprobe.Target[0].Target != newprobe.Target[0].Target {
 				return true
 			}
-			if oldProbe.Config.Target[0].Agent != newProbe.Config.Target[0].Agent {
+			if oldprobe.Target[0].Agent != newprobe.Target[0].Agent {
 				return true
 			}
-		}
+		}*/
 
 		// For server configs, compare allowed agents regardless of order
-		/*oldAgents := extractAllowedAgents(oldProbe.Config.Target)
-		newAgents := extractAllowedAgents(newProbe.Config.Target)
+		/*oldAgents := extractAllowedAgents(oldprobe.Target)
+		newAgents := extractAllowedAgents(newprobe.Target)
 
 		if !sameAgentSets(oldAgents, newAgents) {
 			return true
@@ -130,33 +122,33 @@ func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
 	}
 
 	// For client probes
-	if !oldProbe.Config.Server && !newProbe.Config.Server {
+	if !oldprobe.Server && !newprobe.Server {
 		// Check if target address/port changed
-		if len(oldProbe.Config.Target) > 0 && len(newProbe.Config.Target) > 0 {
-			if oldProbe.Config.Target[0].Target != newProbe.Config.Target[0].Target {
+		/*if len(oldprobe.Target) > 0 && len(newprobe.Target) > 0 {
+			if oldprobe.Target[0].Target != newprobe.Target[0].Target {
 				return true
 			}
-			if oldProbe.Config.Target[0].Agent != newProbe.Config.Target[0].Agent {
+			if oldprobe.Target[0].Agent != newprobe.Target[0].Agent {
 				return true
 			}
-		}
+		}*/
 		return false
 	}
 
 	// Server flag changed
-	return oldProbe.Config.Server != newProbe.Config.Server
+	return oldprobe.Server != newprobe.Server
 }
 
 // Helper function to extract allowed agents from targets (skipping index 0)
 func extractAllowedAgents(targets []probes.ProbeTarget) map[primitive.ObjectID]bool {
 	agents := make(map[primitive.ObjectID]bool)
-	if len(targets) > 1 {
+	/*if len(targets) > 1 {
 		for i := 1; i < len(targets); i++ {
-			if targets[i].Agent != primitive.NilObjectID {
-				agents[targets[i].Agent] = true
+			if targets[i].AgentId != primitive.NilObjectID {
+				agents[targets[i].AgentId] = true
 			}
-		}
-	}
+		} todo
+	}*/
 	return agents
 }
 
@@ -181,11 +173,11 @@ var (
 	// Track TrafficSim instances with better synchronization
 	// Note: TrafficSim tracking uses just probe ID (not composite key) since
 	// there can only be one TrafficSim instance per probe ID
-	trafficSimServer       *probes.TrafficSim
+	/*trafficSimServer       *probes.TrafficSim
 	trafficSimServerMutex  sync.RWMutex
 	trafficSimClients      = make(map[primitive.ObjectID]*probes.TrafficSim)
 	trafficSimClientsMutex sync.RWMutex
-
+	*/
 	// Speed test state
 	speedTestRunning    bool
 	speedTestMutex      sync.Mutex
@@ -208,8 +200,8 @@ func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 		}
 
 		if probeWorker.Probe.Type == probes.ProbeType_MTR {
-			for _, target := range probeWorker.Probe.Config.Target {
-				for _, givenTarget := range probe.Config.Target {
+			/*for _, target := range probeWorker.probe.Target {
+				for _, givenTarget := range probe.Target {
 					targetAddr := givenTarget.Target
 					if strings.Contains(targetAddr, ":") {
 						targetAddr = strings.Split(targetAddr, ":")[0]
@@ -221,7 +213,7 @@ func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 						return false
 					}
 				}
-			}
+			}*/
 		}
 		return true
 	})
@@ -235,42 +227,42 @@ func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 /*
 	func trafficSimConfigChanged(oldProbe, newProbe probes.Probe) bool {
 		// Check if target address/port changed
-		if len(oldProbe.Config.Target) > 0 && len(newProbe.Config.Target) > 0 {
-			if oldProbe.Config.Target[0].Target != newProbe.Config.Target[0].Target {
+		if len(oldprobe.Target) > 0 && len(newprobe.Target) > 0 {
+			if oldprobe.Target[0].Target != newprobe.Target[0].Target {
 				return true
 			}
-			if oldProbe.Config.Target[0].Agent != newProbe.Config.Target[0].Agent {
+			if oldprobe.Target[0].Agent != newprobe.Target[0].Agent {
 				return true
 			}
 		}
 
 		// Check if server flag changed
-		if oldProbe.Config.Server != newProbe.Config.Server {
+		if oldprobe.Server != newprobe.Server {
 			return true
 		}
 
 		// Check if allowed agents changed for server
-		if oldProbe.Config.Server {
+		if oldprobe.Server {
 			// For servers, check if the number of targets changed
-			if len(oldProbe.Config.Target) != len(newProbe.Config.Target) {
+			if len(oldprobe.Target) != len(newprobe.Target) {
 				return true
 			}
 
 			// Check if any allowed agents changed
-			if len(oldProbe.Config.Target) > 1 && len(newProbe.Config.Target) > 1 {
+			if len(oldprobe.Target) > 1 && len(newprobe.Target) > 1 {
 				// Create maps of allowed agents
 				oldAgents := make(map[primitive.ObjectID]bool)
 				newAgents := make(map[primitive.ObjectID]bool)
 
-				for i := 1; i < len(oldProbe.Config.Target); i++ {
-					if oldProbe.Config.Target[i].Agent != primitive.NilObjectID {
-						oldAgents[oldProbe.Config.Target[i].Agent] = true
+				for i := 1; i < len(oldprobe.Target); i++ {
+					if oldprobe.Target[i].Agent != primitive.NilObjectID {
+						oldAgents[oldprobe.Target[i].Agent] = true
 					}
 				}
 
-				for i := 1; i < len(newProbe.Config.Target); i++ {
-					if newProbe.Config.Target[i].Agent != primitive.NilObjectID {
-						newAgents[newProbe.Config.Target[i].Agent] = true
+				for i := 1; i < len(newprobe.Target); i++ {
+					if newprobe.Target[i].Agent != primitive.NilObjectID {
+						newAgents[newprobe.Target[i].Agent] = true
 					}
 				}
 
@@ -290,7 +282,7 @@ func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 		return false
 	}
 */
-func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
+/*func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
 	log.Infof("Stopping TrafficSim (server=%v) for probe %s", isServer, probeID.Hex())
 
 	if isServer {
@@ -359,8 +351,8 @@ func stopTrafficSim(probeID primitive.ObjectID, isServer bool) {
 		}
 	}
 }
-
-func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID) {
+*/
+func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan probes.ProbeData, thisAgent primitive.ObjectID) {
 	go func(aC chan []probes.Probe, dC chan probes.ProbeData) {
 		for {
 			p := <-aC
@@ -373,7 +365,7 @@ func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeDa
 
 				if !exists {
 					// New probe - create worker
-					log.Infof("Starting NEW worker for probe %s (type: %s)", probe.ID.Hex(), probe.Type)
+					log.Infof("Starting NEW worker for probe %v (type: %s)", probe.ID, probe.Type)
 
 					ctx, cancel := context.WithCancel(context.Background())
 					stopChan := make(chan struct{})
@@ -391,7 +383,7 @@ func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeDa
 					}
 
 					checkWorkers.Store(probeKey, worker)
-					startCheckWorker(probe, dataChan, thisAgent)
+					startCheckWorker(probe, probeDataChan, thisAgent)
 				} else {
 					// Existing probe - check for updates
 					oldWorker := existingWorker.(ProbeWorkerS)
@@ -399,13 +391,13 @@ func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeDa
 					if probe.Type == probes.ProbeType_TRAFFICSIM {
 						if trafficSimConfigChanged(oldWorker.Probe, probe) {
 							// Configuration changed - restart
-							log.Infof("TrafficSim probe %s (type: %s) configuration changed, restarting", probe.ID.Hex(), probe.Type)
+							log.Infof("TrafficSim probe %v (type: %s) configuration changed, restarting", probe.ID, probe.Type)
 
 							// Stop the old worker
 							stopProbeWorker(&oldWorker)
 
 							// Stop TrafficSim instance
-							stopTrafficSim(probe.ID, oldWorker.Probe.Config.Server)
+							//stopTrafficSim(probe.ID, oldWorker.probe.Server)
 
 							// Brief pause for cleanup
 							time.Sleep(500 * time.Millisecond)
@@ -427,15 +419,15 @@ func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeDa
 							}
 
 							checkWorkers.Store(probeKey, newWorker)
-							log.Infof("Starting UPDATED worker for probe %s (type: %s)", probe.ID.Hex(), probe.Type)
-							startCheckWorker(probe, dataChan, thisAgent)
+							log.Infof("Starting UPDATED worker for probe %v (type: %s)", probe.ID, probe.Type)
+							startCheckWorker(probe, probeDataChan, thisAgent)
 						} else {
 							// Update probe data without restart
 							oldWorker.Probe = probe
 							checkWorkers.Store(probeKey, oldWorker)
 
 							// If it's a server, update allowed agents
-							if probe.Config.Server {
+							if probe.Server {
 								updateServerAllowedAgents(probe)
 							}
 						}
@@ -454,14 +446,14 @@ func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeDa
 				probeKey := key.(string)
 				if !containsKey(newKeys, probeKey) {
 					probeWorker := value.(ProbeWorkerS)
-					log.Warnf("Probe %s (type: %s) marked for removal", probeWorker.Probe.ID.Hex(), probeWorker.Probe.Type)
+					log.Warnf("Probe %v (type: %s) marked for removal", probeWorker.Probe.ID, probeWorker.Probe.Type)
 
 					// Stop the worker
 					stopProbeWorker(&probeWorker)
 
 					// Stop TrafficSim if applicable
 					if probeWorker.Probe.Type == probes.ProbeType_TRAFFICSIM {
-						stopTrafficSim(probeWorker.Probe.ID, probeWorker.Probe.Config.Server)
+						//stopTrafficSim(probeWorker.Probe.ID, probeWorker.probe.Server)
 					}
 
 					// Remove from map
@@ -470,7 +462,7 @@ func InitProbeWorker(checkChan chan []probes.Probe, dataChan chan probes.ProbeDa
 				return true
 			})
 		}
-	}(checkChan, dataChan)
+	}(probeGetChan, probeDataChan)
 }
 
 func stopProbeWorker(worker *ProbeWorkerS) {
@@ -496,44 +488,44 @@ func stopProbeWorker(worker *ProbeWorkerS) {
 
 		select {
 		case <-done:
-			log.Debugf("Worker for probe %s (type: %s) stopped gracefully", worker.Probe.ID.Hex(), worker.Probe.Type)
+			log.Debugf("Worker for probe %v (type: %s) stopped gracefully", worker.Probe.ID, worker.Probe.Type)
 		case <-time.After(5 * time.Second):
-			log.Warnf("Timeout waiting for worker %s (type: %s) to stop", worker.Probe.ID.Hex(), worker.Probe.Type)
+			log.Warnf("Timeout waiting for worker %v (type: %s) to stop", worker.Probe.ID, worker.Probe.Type)
 		}
 	}
 }
 
 func updateServerAllowedAgents(probe probes.Probe) {
-	var allowedAgentsList []primitive.ObjectID
+	// var allowedAgentsList []primitive.ObjectID todo
 
 	// The issue is here - we need to handle the target list properly
 	// The first target (index 0) contains the server address/port
 	// Subsequent targets contain allowed agent IDs
 
 	// Check if we have allowed agents in the config
-	if len(probe.Config.Target) > 1 {
+	/*if len(probe.Target) > 1 {
 		// Skip the first target (server address) and collect agent IDs
-		for i := 1; i < len(probe.Config.Target); i++ {
-			target := probe.Config.Target[i]
+		for i := 1; i < len(probe.Target); i++ {
+			target := probe.Target[i]
 			// Only add valid agent IDs
 			if target.Agent != primitive.NilObjectID {
 				allowedAgentsList = append(allowedAgentsList, target.Agent)
 			}
 		}
-	}
+	}*/
 
 	// If no specific agents are listed, this might mean "allow all"
 	// You may want to handle this case differently based on your requirements
 
-	trafficSimServerMutex.Lock()
+	/*trafficSimServerMutex.Lock()
 	defer trafficSimServerMutex.Unlock()
 
 	if trafficSimServer != nil {
 		updateAllowedAgents(trafficSimServer, allowedAgentsList)
-		log.Infof("Updated allowed agents for server probe %s: %v", probe.ID.Hex(), allowedAgentsList)
+		log.Infof("Updated allowed agents for server probe %s: %v", probe.ID, allowedAgentsList)
 	} else {
-		log.Warnf("Attempted to update allowed agents but server is nil for probe %s", probe.ID.Hex())
-	}
+		log.Warnf("Attempted to update allowed agents but server is nil for probe %s", probe.ID)
+	}*/
 }
 
 func containsKey(keys []string, key string) bool {
@@ -561,7 +553,7 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 		// Get the worker
 		workerInterface, exists := checkWorkers.Load(probeKey)
 		if !exists {
-			log.Warnf("Probe %s (type: %s) not found when starting worker", probe.ID.Hex(), probe.Type)
+			log.Warnf("Probe %s (type: %s) not found when starting worker", probe.ID, probe.Type)
 			return
 		}
 
@@ -577,22 +569,22 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 		for {
 			select {
 			case <-worker.Ctx.Done():
-				log.Infof("Worker for probe %s (type: %s) stopped by context", probe.ID.Hex(), probe.Type)
+				log.Infof("Worker for probe %s (type: %s) stopped by context", probe.ID, probe.Type)
 				return
 			case <-worker.StopChan:
-				log.Infof("Worker for probe %s (type: %s) stopped by StopChan", probe.ID.Hex(), probe.Type)
+				log.Infof("Worker for probe %s (type: %s) stopped by StopChan", probe.ID, probe.Type)
 				return
 			default:
 				// Get current probe data
 				workerInterface, exists := checkWorkers.Load(probeKey)
 				if !exists {
-					log.Warnf("Probe %s (type: %s) no longer exists", probe.ID.Hex(), probe.Type)
+					log.Warnf("Probe %s (type: %s) no longer exists", probe.ID, probe.Type)
 					return
 				}
 
 				currentWorker := workerInterface.(ProbeWorkerS)
 				if currentWorker.ToRemove {
-					log.Infof("Probe %s (type: %s) marked for removal", probe.ID.Hex(), probe.Type)
+					log.Infof("Probe %s (type: %s) marked for removal", probe.ID, probe.Type)
 					return
 				}
 
@@ -624,7 +616,7 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 
 				case "AGENT":
 					// Agent probe type - skip for now as it's likely metadata
-					log.Debugf("Skipping AGENT probe type for probe %s", probe.ID.Hex())
+					log.Debugf("Skipping AGENT probe type for probe %s", probe.ID)
 					time.Sleep(30 * time.Second)
 
 				default:
@@ -637,34 +629,34 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 }
 
 func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID, ctx context.Context, stopChan chan struct{}) {
-	checkCfg := probe.Config
-	checkAddress := strings.Split(checkCfg.Target[0].Target, ":")
+	//checkCfg := probe.Config
+	//checkAddress := strings.Split(checkCfg.Target[0].Target, ":")
 
-	portNum, err := strconv.Atoi(checkAddress[1])
+	/*portNum, err := strconv.Atoi(checkAddress[1])
 	if err != nil {
 		log.Errorf("Invalid port number: %v", err)
 		return
-	}
+	}*/
 
-	mtrProbe, err := findMatchingMTRProbe(probe)
+	/*mtrProbe, err := findMatchingMTRProbe(probe)
 	if err != nil {
 		log.Errorf("Failed to find matching MTR probe: %v", err)
 	}
-
-	if probe.Config.Server {
-		handleTrafficSimServer(probe, thisAgent, checkAddress[0], portNum, stopChan)
+	*/
+	if probe.Server {
+		//handleTrafficSimServer(probe, thisAgent, checkAddress[0], portNum, stopChan)
 	} else {
-		handleTrafficSimClient(probe, thisAgent, checkAddress[0], portNum, dataChan, &mtrProbe, stopChan)
+		//handleTrafficSimClient(probe, thisAgent, checkAddress[0], portNum, dataChan, &mtrProbe, stopChan)
 	}
 }
 
-func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int, stopChan chan struct{}) {
+/*func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int, stopChan chan struct{}) {
 	var allowedAgentsList []primitive.ObjectID
 
 	// Same fix as above - properly handle the target list
-	if len(probe.Config.Target) > 1 {
-		for i := 1; i < len(probe.Config.Target); i++ {
-			target := probe.Config.Target[i]
+	if len(probe.Target) > 1 {
+		for i := 1; i < len(probe.Target); i++ {
+			target := probe.Target[i]
 			if target.Agent != primitive.NilObjectID {
 				allowedAgentsList = append(allowedAgentsList, target.Agent)
 			}
@@ -700,7 +692,7 @@ func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ip
 
 		// Wait for stop signal
 		<-stopChan
-		log.Infof("Stopping TrafficSim server for probe %s", probe.ID.Hex())
+		log.Infof("Stopping TrafficSim server for probe %s", probe.ID)
 		stopTrafficSim(probe.ID, true)
 	} else {
 		// Update allowed agents for existing server
@@ -725,9 +717,9 @@ func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ip
 
 					// Check if allowed agents have changed
 					var currentAllowedAgents []primitive.ObjectID
-					if len(currentProbe.Config.Target) > 1 {
-						for i := 1; i < len(currentProbe.Config.Target); i++ {
-							target := currentProbe.Config.Target[i]
+					if len(currentprobe.Target) > 1 {
+						for i := 1; i < len(currentprobe.Target); i++ {
+							target := currentprobe.Target[i]
 							if target.Agent != primitive.NilObjectID {
 								currentAllowedAgents = append(currentAllowedAgents, target.Agent)
 							}
@@ -748,7 +740,7 @@ func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ip
 		}
 	}
 }
-
+*/
 // Fix 3: Add helper function to compare agent lists
 func equalAgentLists(a, b []primitive.ObjectID) bool {
 	if len(a) != len(b) {
@@ -770,53 +762,55 @@ func equalAgentLists(a, b []primitive.ObjectID) bool {
 	return true
 }
 
+/*
 func handleTrafficSimClient(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int,
-	dataChan chan probes.ProbeData, mtrProbe *probes.Probe, stopChan chan struct{}) {
 
-	trafficSimClientsMutex.Lock()
+		dataChan chan probes.ProbeData, mtrProbe *probes.Probe, stopChan chan struct{}) {
 
-	// Check if client already exists and is running using atomic operations
-	if existingClient, exists := trafficSimClients[probe.ID]; exists && atomic.LoadInt32(&existingClient.Running) == 1 {
+		trafficSimClientsMutex.Lock()
+
+		// Check if client already exists and is running using atomic operations
+		if existingClient, exists := trafficSimClients[probe.ID]; exists && atomic.LoadInt32(&existingClient.Running) == 1 {
+			trafficSimClientsMutex.Unlock()
+
+			// Wait for stop signal
+			<-stopChan
+			return
+		}
+
+		// Create new client
+		simClient := &probes.TrafficSim{
+			Running:                0, // Start with 0, will be set to 1 by Start()
+			Errored:                false,
+			Conn:                   nil,
+			ThisAgent:              thisAgent,
+			OtherAgent:             probe.Target[0].Agent,
+			IPAddress:              ipAddress,
+			Port:                   int64(port),
+			Probe:                  &probe,
+			DataChan:               dataChan,
+			InterfaceCheckInterval: 30 * time.Second,
+		}
+
+		trafficSimClients[probe.ID] = simClient
+		client := simClient
 		trafficSimClientsMutex.Unlock()
+
+		log.Infof("Starting TrafficSim client for probe %s to %s:%d", probe.ID, ipAddress, port)
+
+		// Start client in goroutine (Start() will set Running to 1)
+		go client.Start(mtrProbe)
 
 		// Wait for stop signal
 		<-stopChan
-		return
+		log.Infof("Stopping TrafficSim client for probe %s", probe.ID)
+		stopTrafficSim(probe.ID, false)
 	}
-
-	// Create new client
-	simClient := &probes.TrafficSim{
-		Running:                0, // Start with 0, will be set to 1 by Start()
-		Errored:                false,
-		Conn:                   nil,
-		ThisAgent:              thisAgent,
-		OtherAgent:             probe.Config.Target[0].Agent,
-		IPAddress:              ipAddress,
-		Port:                   int64(port),
-		Probe:                  &probe,
-		DataChan:               dataChan,
-		InterfaceCheckInterval: 30 * time.Second,
-	}
-
-	trafficSimClients[probe.ID] = simClient
-	client := simClient
-	trafficSimClientsMutex.Unlock()
-
-	log.Infof("Starting TrafficSim client for probe %s to %s:%d", probe.ID.Hex(), ipAddress, port)
-
-	// Start client in goroutine (Start() will set Running to 1)
-	go client.Start(mtrProbe)
-
-	// Wait for stop signal
-	<-stopChan
-	log.Infof("Stopping TrafficSim client for probe %s", probe.ID.Hex())
-	stopTrafficSim(probe.ID, false)
-}
-
+*/
 func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	log.Info("SystemInfo: Running system hardware usage test")
 
-	interval := probe.Config.Interval
+	interval := probe.IntervalSec
 	if interval <= 0 {
 		interval = 1
 	}
@@ -826,7 +820,7 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		log.Errorf("SystemInfo error: %v", err)
 	} else {
 		dataChan <- probes.ProbeData{
-			ProbeID: probe.ID,
+			ProbeID: uint(probe.ID), // todo
 			Data:    data,
 		}
 	}
@@ -835,31 +829,31 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 }
 
 func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	log.Infof("MTR: Running test for %s", probe.Config.Target[0].Target)
+	// log.Infof("MTR: Running test for %s", probe.Target[0].Target)
 
-	data, err := probes.Mtr(&probe, false)
+	/*data, err := probes.Mtr(&probe, false)
 	if err != nil {
 		log.Errorf("MTR error: %v", err)
 	} else {
-		reportingAgent, err := primitive.ObjectIDFromHex(os.getEnv("AGENT_ID"))
+		reportingAgent, err := primitive.ObjectIDFromHex("123")
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return
-		}
+		}*/
 
-		dataChan <- probes.ProbeData{
-			ProbeID:   probe.ID,
-			Triggered: false,
-			Data:      data,
-			Target: probes.ProbeTarget{
-				Target: string(probes.ProbeType_MTR) + "%%%" + probe.Config.Target[0].Target,
-				Agent:  probe.Config.Target[0].Agent,
-				Group:  reportingAgent,
-			},
-		}
-	}
+	/*dataChan <- probes.ProbeData{
+		ProbeID:   probe.ID,
+		Triggered: false,
+		Data:      data,
+		Target: probes.ProbeTarget{
+			Target: string(probes.ProbeType_MTR) + "%%%" + probe.Target[0].Target,
+			Agent:  probe.Target[0].Agent,
+			Group:  reportingAgent,
+		},
+	}*/
+	//}
 
-	time.Sleep(time.Duration(probe.Config.Interval) * time.Minute)
+	//time.Sleep(time.Duration(probe.Interval) * time.Minute)
 }
 
 func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
@@ -870,58 +864,58 @@ func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		return
 	}
 
-	if probe.Config.Target[0].Target == "ok" {
+	/*if probe.Target[0].Target == "ok" {
 		log.Info("SpeedTest: Target is ok, skipping...")
 		time.Sleep(10 * time.Second)
 		return
-	}
+	}*/
 
-	log.Infof("Running speed test for %s", probe.Config.Target[0].Target)
+	//log.Infof("Running speed test for %s", probe.Target[0].Target)
 	speedTestRunning = true
 
-	data, err := probes.SpeedTest(&probe)
-	speedTestRunning = false
+	/*data, err := probes.SpeedTest(&probe)
+	speedTestRunning = false*/
 
-	if err != nil {
+	/*if err != nil {
 		log.Errorf("SpeedTest error: %v", err)
 		speedTestRetryCount++
 
 		if speedTestRetryCount >= speedTestRetryMax {
-			probe.Config.Target[0].Target = "ok"
+			//probe.Target[0].Target = "ok"
 			log.Warn("SpeedTest: Failed after max retries, setting target to 'ok'")
 		}
 
 		time.Sleep(30 * time.Second)
 		return
-	}
+	}*/
 
 	speedTestRetryCount = 0
-	probe.Config.Target[0].Target = "ok"
+	//probe.Target[0].Target = "ok"
 
-	dataChan <- probes.ProbeData{
+	/*dataChan <- probes.ProbeData{
 		ProbeID: probe.ID,
 		Data:    data,
-	}
+	}*/
 }
 
 func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	speedtestClient := speedtest.New()
-	serverList, err := speedtestClient.FetchServers()
+	//speedtestClient := speedtest.New()
+	/*serverList, err := speedtestClient.FetchServers()
 	if err != nil {
 		log.Errorf("SpeedTest servers error: %v", err)
 		return
-	}
+	}*/
 
-	dataChan <- probes.ProbeData{
+	/*dataChan <- probes.ProbeData{
 		ProbeID: probe.ID,
 		Data:    serverList,
-	}
+	}*/
 
 	time.Sleep(12 * time.Hour)
 }
 
 func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	log.Infof("Ping: Running test for %s", probe.Config.Target[0].Target)
+	/*log.Infof("Ping: Running test for %s", probe.Target[0].Target)
 
 	mtrProbe, err := findMatchingMTRProbe(probe)
 	if err != nil {
@@ -930,7 +924,7 @@ func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 
 	if err := probes.Ping(&probe, dataChan, mtrProbe); err != nil {
 		log.Errorf("Ping error: %v", err)
-	}
+	}*/
 }
 
 func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
@@ -949,10 +943,10 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 	time.Sleep(10 * time.Minute)
 }
 
-func updateAllowedAgents(server *probes.TrafficSim, newAllowedAgents []primitive.ObjectID) {
+/*func updateAllowedAgents(server *probes.TrafficSim, newAllowedAgents []primitive.ObjectID) {
 	server.Mutex.Lock()
 	defer server.Mutex.Unlock()
 
 	server.AllowedAgents = newAllowedAgents
 	log.Infof("Updated allowed agents for TrafficSim server: %v", newAllowedAgents)
-}
+}*/

@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"github.com/netwatcherio/netwatcher-agent/probes"
 	"github.com/netwatcherio/netwatcher-agent/web"
+	"github.com/netwatcherio/netwatcher-agent/workers"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+
 	// "github.com/netwatcherio/netwatcher-agent/workers"
 	log "github.com/sirupsen/logrus"
 	"os"
@@ -86,7 +89,7 @@ func main() {
 
 	// ---------- Wire websocket handler ----------
 	probeGetCh := make(chan []probes.Probe)
-	// probeDataCh := make(chan probes.ProbeData)
+	probeDataCh := make(chan probes.ProbeData)
 
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 	log.SetLevel(log.InfoLevel)
@@ -151,7 +154,8 @@ func main() {
 	}
 
 	// If your workers expect a uint agent ID now:
-	// workers.InitProbeWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
+	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
+	workers.ProbeDataWorker(wsClient, probeDataCh)
 
 	// Handle Ctrl+C / SIGTERM
 	parent, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

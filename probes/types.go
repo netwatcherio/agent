@@ -1,19 +1,38 @@
 package probes
 
 import (
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"time"
 )
 
 type Probe struct {
-	Type          ProbeType          `json:"type"bson:"type"`
-	ID            primitive.ObjectID `json:"id"bson:"_id"`
-	Agent         primitive.ObjectID `json:"agent"bson:"agent"`
-	CreatedAt     time.Time          `bson:"createdAt"json:"createdAt"`
-	UpdatedAt     time.Time          `bson:"updatedAt"json:"updatedAt"`
-	Notifications bool               `json:"notifications"bson:"notifications"` // notifications will be emailed to anyone who has permissions on their account / associated with the site
-	Config        ProbeConfig        `bson:"config"json:"config"`
-	ProbeProcess  int
+	ID          uint      `json:"id"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+	WorkspaceId int       `json:"workspaceId"`
+	AgentId     int       `json:"agentId"`
+	Type        ProbeType `json:"type"`
+	Enabled     bool      `json:"enabled"`
+	IntervalSec int       `json:"intervalSec"`
+	TimeoutSec  int       `json:"timeoutSec"`
+	Count       int       `json:"count"`
+	DurationSec int       `json:"durationSec"`
+	Server      bool      `json:"server"`
+	Labels      struct {
+	} `json:"labels"`
+	Metadata struct {
+	} `json:"metadata"`
+	Targets      []ProbeTarget `json:"targets"`
+	ProbeProcess int
+}
+
+type ProbeTarget struct {
+	ID        int         `json:"id"`
+	CreatedAt time.Time   `json:"createdAt"`
+	UpdatedAt time.Time   `json:"updatedAt"`
+	ProbeId   int         `json:"probeId"`
+	Target    string      `json:"target"`
+	AgentId   interface{} `json:"agentId"`
+	GroupId   interface{} `json:"groupId"`
 }
 
 type ProbeType string
@@ -31,27 +50,12 @@ const (
 	ProbeType_DNS               ProbeType = "DNS"
 )
 
-type ProbeConfig struct {
-	Target   []ProbeTarget `json:"target" bson:"target"`
-	Duration int           `json:"duration" bson:"duration"`
-	Count    int           `json:"count" bson:"count"`
-	Interval int           `json:"interval" bson:"interval"`
-	Server   bool          `bson:"server" json:"server"`
-	Pending  time.Time     `json:"pending" bson:"pending"` // timestamp of when it was made pending / invalidate it after 10 minutes or so?
-}
-
-type ProbeTarget struct {
-	Target string             `json:"target,omitempty" bson:"target"`
-	Agent  primitive.ObjectID `json:"agent,omitempty" bson:"agent"`
-	Group  primitive.ObjectID `json:"group,omitempty" bson:"group"`
-}
-
 type ProbeData struct {
-	ID        primitive.ObjectID `json:"id"bson:"_id"`
-	ProbeID   primitive.ObjectID `json:"probe"bson:"probe"`
-	Triggered bool               `json:"triggered"bson:"triggered"`
-	CreatedAt time.Time          `bson:"createdAt"json:"createdAt"`
-	UpdatedAt time.Time          `bson:"updatedAt"json:"updatedAt"`
-	Data      interface{}        `json:"data,omitempty"bson:"data,omitempty"`
-	Target    ProbeTarget        `bson:"target" json:"target"`
+	ID        uint        `json:"id"bson:"_id"`
+	ProbeID   uint        `json:"probe"bson:"probe"`
+	Triggered bool        `json:"triggered"bson:"triggered"`
+	CreatedAt time.Time   `bson:"createdAt"json:"createdAt"`
+	UpdatedAt time.Time   `bson:"updatedAt"json:"updatedAt"`
+	Data      interface{} `json:"data,omitempty"bson:"data,omitempty"`
+	Target    ProbeTarget `bson:"target" json:"target"`
 }

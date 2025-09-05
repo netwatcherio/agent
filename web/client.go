@@ -187,10 +187,17 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			},
 			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Infof("WS: disconnected from namespace [%s]", msg.Namespace)
+				c.ConnectWithRetry(context.Background())
 				return nil
 			},
 			"probe_get": func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Infof("WS: received probe_get: %s", string(msg.Body))
+				var p []probes.Probe
+
+				if err := json.Unmarshal(msg.Body, &p); err != nil {
+					return err
+				}
+				c.ProbeGetCh <- p
 				return nil
 			},
 		},

@@ -7,15 +7,15 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func InitProbeDataWorker(wsH *web.WebSocketHandler, ch chan probes.ProbeData) {
-	go func(cn *web.WebSocketHandler, c chan probes.ProbeData) {
+func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
+	go func(cn *web.WSClient, c chan probes.ProbeData) {
 		for p := range ch {
 			marshal, err := json.Marshal(p)
 			log.Warn(string(marshal))
 			if err != nil {
 				return
 			}
-			wsH.GetConnection().Emit("probe_post", marshal)
+			wsH.WsConn.Emit("probe_post", marshal)
 		}
 	}(wsH, ch)
 }
