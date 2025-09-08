@@ -913,18 +913,18 @@ func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeD
 	if err != nil {
 		log.Errorf("SpeedTest servers error: %v", err)
 		return
-	}*/
+	}
 
-	/*dataChan <- probes.ProbeData{
+	dataChan <- probes.ProbeData{
 		ProbeID: probe.ID,
-		Data:    serverList,
-	}*/
+		Payload:    serverList,
+	}
 
-	time.Sleep(12 * time.Hour)
+	time.Sleep(12 * time.Hour)*/
 }
 
 func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	/*log.Infof("Ping: Running test for %s", probe.Target[0].Target)
+	log.Infof("Ping: Running test for %s", probe.Targets[0].Target)
 
 	mtrProbe, err := findMatchingMTRProbe(probe)
 	if err != nil {
@@ -933,7 +933,7 @@ func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 
 	if err := probes.Ping(&probe, dataChan, mtrProbe); err != nil {
 		log.Errorf("Ping error: %v", err)
-	}*/
+	}
 }
 
 func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {

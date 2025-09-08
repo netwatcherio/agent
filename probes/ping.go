@@ -6,12 +6,11 @@ import (
 	"fmt"
 	probing "github.com/prometheus-community/pro-bing"
 	log "github.com/sirupsen/logrus"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"runtime"
 	"time"
 )
 
-type PingResult struct {
+type PingPayload struct {
 	// StartTime is the time that the check started at
 	StartTimestamp time.Time `json:"start_timestamp"bson:"start_timestamp"`
 	StopTimestamp  time.Time `json:"stop_timestamp"bson:"stop_timestamp"`
@@ -39,12 +38,16 @@ type PingResult struct {
 func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 	startTime := time.Now()
 
-	pinger, err := probing.NewPinger(ac.Config.Target[0].Target)
+	pinger, err := probing.NewPinger(ac.Targets[0].Target)
 	if err != nil {
 		fmt.Println(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(2*ac.Config.Duration)*time.Second)
+	if !(ac.DurationSec > 60) {
+		ac.DurationSec = 60
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(2*ac.DurationSec)*time.Second)
 	defer cancel()
 
 	osDetect := runtime.GOOS
@@ -65,7 +68,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 		panic("TODO")
 	}
 
-	pinger.Count = ac.Config.Duration
+	pinger.Count = ac.Count
 
 	/*pinger.OnRecv = func(pkt *probing.Packet) {
 		fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n",
@@ -74,7 +77,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 	pinger.OnFinish = func(stats *probing.Statistics) {
 
-		pingR := PingResult{
+		pingR := PingPayload{
 			StartTimestamp:        startTime,
 			StopTimestamp:         time.Now(),
 			PacketsRecv:           stats.PacketsRecv,
@@ -101,27 +104,30 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 		log.Info(string(marshal))
 
-		reportingAgent, err := primitive.ObjectIDFromHex("123")
+		/*reportingAgent, err := primitive.ObjectIDFromHex("123")
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
+			return
+		}*/
+
+		bytes, err := json.Marshal(pingR)
+		if err != nil {
 			return
 		}
 
 		cD := ProbeData{
-			ProbeID: ac.ID,
-			Data:    pingR,
-			Target: ProbeTarget{
-				Target: string(ProbeType_PING) + "%%%" + ac.Config.Target[0].Target,
-				Agent:  ac.Config.Target[0].Agent,
-				Group:  reportingAgent,
-			},
+			ProbeID:      ac.ID,
+			ProbeAgentID: ac.AgentID,
+			Type:         ProbeType_PING,
+			Payload:      bytes,
+			Target:       ac.Targets[0].Target,
 		}
 
 		pingChan <- cD
 
 		// todo configurable threshold
-		if pingR.PacketLoss > 2 && pingR.PacketLoss < 100 {
-			if len(mtrProbe.Config.Target) > 0 {
+		/*if pingR.PacketLoss > 2 && pingR.PacketLoss < 100 {
+			if len(ac.Targets[0].Target) > 0 {
 
 				mtr, err := Mtr(&mtrProbe, true)
 				if err != nil {
@@ -142,7 +148,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 				fmt.Println("Triggered MTR for ", mtrProbe.Config.Target[0].Target, "...")
 				pingChan <- dC
 			}
-		}
+		}*/
 	}
 
 	err = pinger.RunWithContext(ctx) // Blocks until finished.
