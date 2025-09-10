@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-type MtrResult struct {
+type MtrPayload struct {
 	StartTimestamp time.Time `json:"start_timestamp"bson:"start_timestamp"`
 	StopTimestamp  time.Time `json:"stop_timestamp"bson:"stop_timestamp"`
 	Report         struct {
@@ -40,7 +40,7 @@ type MtrResult struct {
 	} `json:"report"bson:"report"`
 }
 
-/*type MtrResult struct {
+/*type MtrPayload struct {
 	StartTimestamp time.Time `json:"start_timestamp"bson:"start_timestamp"`
 	StopTimestamp  time.Time `json:"stop_timestamp"bson:"stop_timestamp"`
 	Triggered      bool      `bson:"triggered"json:"triggered"`
@@ -75,8 +75,8 @@ type MtrResult struct {
 }*/
 
 // Mtr run the check for mtr, take input from checkdata for the test, and update the mtrresult object
-func Mtr(cd *Probe, triggered bool) (MtrResult, error) {
-	var mtrResult MtrResult
+func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
+	var mtrResult MtrPayload
 	mtrResult.StartTimestamp = time.Now()
 
 	triggeredCount := 5
@@ -125,11 +125,17 @@ func Mtr(cd *Probe, triggered bool) (MtrResult, error) {
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		shellArgs := append([]string{"/c", trippyPath + " --icmp --mode json --multipath-strategy classic --dns-resolve-method cloudflare --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Config.Target[0].Target})
+		shellArgs := append([]string{"/c", trippyPath + " " +
+			"--icmp " +
+			"--mode json " +
+			"--multipath-strategy classic" +
+			"--dns-resolve-method cloudflare " +
+			"--report-cycles " + strconv.Itoa(triggeredCount) + " " +
+			"--dns-lookup-as-info " + cd.Targets[0].Target})
 		cmd = exec.CommandContext(context.TODO(), "cmd.exe", shellArgs...)
 	} else {
 		// For Linux and macOS, use /bin/bash
-		shellArgs := append([]string{"-c", trippyPath + " --icmp --mode json --multipath-strategy classic --dns-resolve-method cloudflare --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Config.Target[0].Target})
+		shellArgs := append([]string{"-c", trippyPath + " --icmp --mode json --multipath-strategy classic --dns-resolve-method cloudflare --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Targets[0].Target})
 		cmd = exec.CommandContext(context.TODO(), "/bin/bash", shellArgs...)
 	}
 

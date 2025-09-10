@@ -840,29 +840,25 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	// log.Infof("MTR: Running test for %s", probe.Target[0].Target)
 
-	/*data, err := probes.Mtr(&probe, false)
+	data, err := probes.Mtr(&probe, false)
 	if err != nil {
 		log.Errorf("MTR error: %v", err)
 	} else {
-		reportingAgent, err := primitive.ObjectIDFromHex("123")
+		//reportingAgent, err := primitive.ObjectIDFromHex("123")
+
+		payload, err := json.Marshal(data)
+
 		if err != nil {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return
-		}*/
-
-	/*dataChan <- probes.ProbeData{
-		ProbeID:   probe.ID,
-		Triggered: false,
-		Data:      data,
-		Target: probes.ProbeTarget{
-			Target: string(probes.ProbeType_MTR) + "%%%" + probe.Target[0].Target,
-			Agent:  probe.Target[0].Agent,
-			Group:  reportingAgent,
-		},
-	}*/
-	//}
-
-	//time.Sleep(time.Duration(probe.Interval) * time.Minute)
+		}
+		dataChan <- probes.ProbeData{
+			ProbeID:   probe.ID,
+			Triggered: false,
+			Payload:   payload,
+		}
+	}
+	time.Sleep(time.Duration(probe.IntervalSec) * time.Second)
 }
 
 func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
