@@ -11,72 +11,84 @@ import (
 )
 
 type PingPayload struct {
-	// StartTime is the time that the check started at
-	StartTimestamp time.Time `json:"start_timestamp"bson:"start_timestamp"`
-	StopTimestamp  time.Time `json:"stop_timestamp"bson:"stop_timestamp"`
-	// PacketsRecv is the number of packets received.
-	PacketsRecv int `json:"packets_recv"bson:"packets_recv"`
-	// PacketsSent is the number of packets sent.
-	PacketsSent int `json:"packets_sent"bson:"packets_sent"`
-	// PacketsRecvDuplicates is the number of duplicate responses there were to a sent packet.
-	PacketsRecvDuplicates int `json:"packets_recv_duplicates"bson:"packets_recv_duplicates"`
-	// PacketLoss is the percentage of packets lost.
-	PacketLoss float64 `json:"packet_loss"bson:"packet_loss"`
-	// Addr is the string address of the host being pinged.
-	Addr string `json:"addr"bson:"addr"`
-	// MinRtt is the minimum round-trip time sent via this pinger.
-	MinRtt time.Duration `json:"min_rtt"bson:"min_rtt"`
-	// MaxRtt is the maximum round-trip time sent via this pinger.
-	MaxRtt time.Duration `json:"max_rtt"bson:"max_rtt"`
-	// AvgRtt is the average round-trip time sent via this pinger.
-	AvgRtt time.Duration `json:"avg_rtt"bson:"avg_rtt"`
-	// StdDevRtt is the standard deviation of the round-trip times sent via
-	// this pinger.
-	StdDevRtt time.Duration `json:"std_dev_rtt"bson:"std_dev_rtt"`
+	StartTimestamp        time.Time     `json:"start_timestamp" bson:"start_timestamp"`
+	StopTimestamp         time.Time     `json:"stop_timestamp" bson:"stop_timestamp"`
+	PacketsRecv           int           `json:"packets_recv" bson:"packets_recv"`
+	PacketsSent           int           `json:"packets_sent" bson:"packets_sent"`
+	PacketsRecvDuplicates int           `json:"packets_recv_duplicates" bson:"packets_recv_duplicates"`
+	PacketLoss            float64       `json:"packet_loss" bson:"packet_loss"`
+	Addr                  string        `json:"addr" bson:"addr"`
+	MinRtt                time.Duration `json:"min_rtt" bson:"min_rtt"`
+	MaxRtt                time.Duration `json:"max_rtt" bson:"max_rtt"`
+	AvgRtt                time.Duration `json:"avg_rtt" bson:"avg_rtt"`
+	StdDevRtt             time.Duration `json:"std_dev_rtt" bson:"std_dev_rtt"`
 }
 
 func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
+	if len(ac.Targets) == 0 || ac.Targets[0].Target == "" {
+		return fmt.Errorf("ping: no target provided")
+	}
+	target := ac.Targets[0].Target
+
 	startTime := time.Now()
 
-	pinger, err := probing.NewPinger(ac.Targets[0].Target)
+	pinger, err := probing.NewPinger(target)
 	if err != nil {
-		fmt.Println(err)
+		return fmt.Errorf("ping: new pinger: %w", err)
 	}
 
-	if !(ac.DurationSec > 60) {
-		ac.DurationSec = 60
+	// ----- Configure pinger per pro-bing docs -----
+
+	// Count: if >0, send exactly Count packets; if 0, run until Timeout/context.
+	if ac.Count > 0 {
+		pinger.Count = ac.Count
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(2*ac.DurationSec)*time.Second)
-	defer cancel()
+	// Interval: default 1s if not provided.
+	if ac.IntervalSec > 0 {
+		pinger.Interval = time.Duration(ac.IntervalSec) * time.Second
+	} else {
+		pinger.Interval = time.Second
+	}
 
-	osDetect := runtime.GOOS
+	// Timeout: total runtime cap (pinger exits when reached).
+	// Fall back to 60s if not set on the probe.
+	runCap := time.Duration(ac.DurationSec) * time.Second
+	if runCap <= 0 {
+		runCap = 60 * time.Second
+	}
+	pinger.Timeout = runCap
 
-	switch osDetect {
+	// OS privilege behavior (see README notes):
+	switch runtime.GOOS {
 	case "windows":
+		// Windows requires privileged mode per docs.
+		pinger.SetPrivileged(true)
+		// Optional: Windows-friendly payload size
 		pinger.Size = 548
+	case "linux", "darwin":
+		// On Linux/macOS you can use unprivileged mode if your system is set up,
+		// otherwise enable privileged/raw-socket mode:
 		pinger.SetPrivileged(true)
-		break
-	case "darwin":
-		pinger.SetPrivileged(true)
-		break
-	case "linux":
-		pinger.SetPrivileged(true)
-		break
 	default:
-		log.Fatalf("Unknown OS")
-		panic("TODO")
+		// Default to privileged to be safe.
+		pinger.SetPrivileged(true)
 	}
 
-	pinger.Count = ac.Count
+	// ----- Callbacks -----
 
-	/*pinger.OnRecv = func(pkt *probing.Packet) {
-		fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n",
-			pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt)
-	}*/
-
+	pinger.OnRecv = func(pkt *probing.Packet) {
+		// match README: simple per-packet output (keep or remove)
+		/*fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n",
+		pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt)*/
+	}
+	pinger.OnDuplicateRecv = func(pkt *probing.Packet) {
+		// optional: show dups like README example
+		/*fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v ttl=%v (DUP!)\n",
+		pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt, pkt.TTL)*/
+	}
 	pinger.OnFinish = func(stats *probing.Statistics) {
-
+		// NOTE: stats.* RTT fields are already time.Duration per pro-bing
 		pingR := PingPayload{
 			StartTimestamp:        startTime,
 			StopTimestamp:         time.Now(),
@@ -85,33 +97,19 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 			PacketsRecvDuplicates: stats.PacketsRecvDuplicates,
 			PacketLoss:            stats.PacketLoss,
 			Addr:                  stats.Addr,
-			MinRtt:                time.Duration(stats.MinRtt.Nanoseconds()),
-			MaxRtt:                time.Duration(stats.MaxRtt.Nanoseconds()),
-			AvgRtt:                time.Duration(stats.AvgRtt.Nanoseconds()),
-			StdDevRtt:             time.Duration(stats.StdDevRtt.Nanoseconds()),
+			MinRtt:                stats.MinRtt,
+			MaxRtt:                stats.MaxRtt,
+			AvgRtt:                stats.AvgRtt,
+			StdDevRtt:             stats.StdDevRtt,
 		}
 
-		/*fmt.Printf("\n--- %s ping statistics ---\n", stats.Addr)
-		fmt.Printf("%d packets transmitted, %d packets received, %v%% packet loss\n",
-			stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss)
-		fmt.Printf("round-trip min/avg/max/stddev = %v/%v/%v/%v\n",
-			stats.MinRtt, stats.AvgRtt, stats.MaxRtt, stats.StdDevRtt)*/
-
-		marshal, err := json.Marshal(pingR)
-		if err != nil {
-			//return
-		}
-
-		log.Info(string(marshal))
-
-		/*reportingAgent, err := primitive.ObjectIDFromHex("123")
-		if err != nil {
-			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
-			return
+		/*if marshaled, err := json.Marshal(stats); err == nil {
+			log.WithField("target", target).Info(string(marshaled))
 		}*/
 
 		bytes, err := json.Marshal(pingR)
 		if err != nil {
+			log.WithError(err).Warn("ping: marshal payload")
 			return
 		}
 
@@ -120,52 +118,23 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 			ProbeAgentID: ac.AgentID,
 			Type:         ProbeType_PING,
 			Payload:      bytes,
-			Target:       ac.Targets[0].Target,
+			Target:       target,
 		}
-
 		pingChan <- cD
 
-		// todo configurable threshold
-		/*if pingR.PacketLoss > 2 && pingR.PacketLoss < 100 {
-			if len(ac.Targets[0].Target) > 0 {
-
-				mtr, err := Mtr(&mtrProbe, true)
-				if err != nil {
-					fmt.Println(err)
-				}
-
-				dC := ProbeData{
-					ProbeID:   mtrProbe.ID,
-					Triggered: true,
-					Data:      mtr,
-					Target: ProbeTarget{
-						Target: string(ProbeType_MTR) + "%%%" + mtrProbe.Config.Target[0].Target,
-						Agent:  mtrProbe.Config.Target[0].Agent,
-						Group:  reportingAgent,
-					},
-				}
-
-				fmt.Println("Triggered MTR for ", mtrProbe.Config.Target[0].Target, "...")
-				pingChan <- dC
-			}
-		}*/
+		// Optional: trigger follow-up probes based on loss here.
 	}
 
-	err = pinger.RunWithContext(ctx) // Blocks until finished.
-	if err != nil {
-		log.Error(err)
+	// ----- Run with context so callers can cancel early -----
+	// Context will also stop early even if pinger.Timeout not yet reached.
+	ctx, cancel := context.WithTimeout(context.Background(), runCap)
+	defer cancel()
+
+	if err := pinger.RunWithContext(ctx); err != nil {
+		// per issues, timeout doesn’t return an error; other errors should be surfaced
+		log.WithError(err).Error("ping: RunWithContext failed")
 		return err
 	}
-
-	//stats := pinger.Statistics() // get send/receive/duplicate/rtt stats
-
-	/*fmt.Printf("\n--- %s ping statistics ---\n", stats.Addr)
-	fmt.Printf("%d packets transmitted, %d packets received, %v%% packet loss\n",
-		stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss)
-	fmt.Printf("round-trip min/avg/max/stddev = %v/%v/%v/%v\n",
-		stats.MinRtt, stats.AvgRtt, stats.MaxRtt, stats.StdDevRtt)*/
-
-	//pingChan <- cD
 
 	return nil
 }

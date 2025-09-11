@@ -852,10 +852,14 @@ func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
 			return
 		}
+
 		dataChan <- probes.ProbeData{
-			ProbeID:   probe.ID,
-			Triggered: false,
-			Payload:   payload,
+			ID:           probe.ID, // todo
+			Type:         probes.ProbeType_MTR,
+			Payload:      payload,
+			ProbeID:      probe.ID,
+			ProbeAgentID: probe.AgentID, // probe ownership id
+			CreatedAt:    time.Now(),
 		}
 	}
 	time.Sleep(time.Duration(probe.IntervalSec) * time.Second)
