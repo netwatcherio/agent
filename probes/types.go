@@ -27,13 +27,13 @@ type Probe struct {
 }
 
 type ProbeTarget struct {
-	ID        int         `json:"id"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
-	ProbeId   int         `json:"probe_id"`
-	Target    string      `json:"target"`
-	AgentId   interface{} `json:"agent_id"`
-	GroupId   interface{} `json:"group_id"`
+	ID        int       `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	ProbeId   int       `json:"probe_id"`
+	Target    string    `gorm:"size:512" json:"target"` // ip/host[:port] (leave empty when AgentID is set)
+	AgentID   *uint     `gorm:"index" json:"agent_id"`  // target agent
+	GroupID   *uint     `gorm:"index" json:"group_id"`  // optional grouping/batching
 }
 
 type ProbeType string
