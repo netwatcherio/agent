@@ -825,12 +825,10 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		}
 
 		dataChan <- probes.ProbeData{
-			ID:           probe.ID, // todo
-			Type:         probes.ProbeType_SYSTEMINFO,
-			Payload:      marshal,
-			ProbeID:      probe.ID,
-			ProbeAgentID: probe.AgentID, // probe ownership id
-			CreatedAt:    time.Now(),
+			Type:      probes.ProbeType_SYSTEMINFO,
+			Payload:   marshal,
+			ProbeID:   probe.ID,
+			CreatedAt: time.Now(),
 		}
 	}
 
@@ -854,12 +852,10 @@ func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		}
 
 		dataChan <- probes.ProbeData{
-			ID:           probe.ID, // todo
-			Type:         probes.ProbeType_MTR,
-			Payload:      payload,
-			ProbeID:      probe.ID,
-			ProbeAgentID: probe.AgentID, // probe ownership id
-			CreatedAt:    time.Now(),
+			Type:      probes.ProbeType_MTR,
+			Payload:   payload,
+			ProbeID:   probe.ID,
+			CreatedAt: time.Now(),
 		}
 	}
 	time.Sleep(time.Duration(probe.IntervalSec) * time.Second)
@@ -949,12 +945,10 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 		}
 
 		dataChan <- probes.ProbeData{
-			ID:           probe.ID, // todo
-			Type:         probes.ProbeType_NETWORKINFO,
-			Payload:      marshal,
-			ProbeID:      probe.ID,
-			ProbeAgentID: probe.AgentID, // probe ownership id
-			CreatedAt:    time.Now(),
+			Type:      probes.ProbeType_NETWORKINFO,
+			Payload:   marshal,
+			ProbeID:   probe.ID,
+			CreatedAt: time.Now(),
 		}
 	}
 

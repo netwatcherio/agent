@@ -114,11 +114,10 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 		}
 
 		cD := ProbeData{
-			ProbeID:      ac.ID,
-			ProbeAgentID: ac.AgentID,
-			Type:         ProbeType_PING,
-			Payload:      bytes,
-			Target:       target,
+			ProbeID: ac.ID,
+			Type:    ProbeType_PING,
+			Payload: bytes,
+			Target:  target,
 		}
 		pingChan <- cD
 
