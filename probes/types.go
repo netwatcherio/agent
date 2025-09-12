@@ -7,16 +7,16 @@ import (
 
 type Probe struct {
 	ID          uint      `json:"id"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
-	WorkspaceId int       `json:"workspaceId"`
-	AgentID     uint      `json:"agentID"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	WorkspaceId int       `json:"workspace_id"`
+	AgentID     uint      `json:"agent_id"`
 	Type        ProbeType `json:"type"`
 	Enabled     bool      `json:"enabled"`
-	IntervalSec int       `json:"intervalSec"`
-	TimeoutSec  int       `json:"timeoutSec"`
+	IntervalSec int       `json:"interval_sec"`
+	TimeoutSec  int       `json:"timeout_sec"`
 	Count       int       `json:"count"`
-	DurationSec int       `json:"durationSec"`
+	DurationSec int       `json:"duration_sec"`
 	Server      bool      `json:"server"`
 	Labels      struct {
 	} `json:"labels"`
@@ -28,12 +28,12 @@ type Probe struct {
 
 type ProbeTarget struct {
 	ID        int         `json:"id"`
-	CreatedAt time.Time   `json:"createdAt"`
-	UpdatedAt time.Time   `json:"updatedAt"`
-	ProbeId   int         `json:"probeId"`
+	CreatedAt time.Time   `json:"created_at"`
+	UpdatedAt time.Time   `json:"updated_at"`
+	ProbeId   int         `json:"probe_id"`
 	Target    string      `json:"target"`
-	AgentId   interface{} `json:"agentId"`
-	GroupId   interface{} `json:"groupId"`
+	AgentId   interface{} `json:"agent_id"`
+	GroupId   interface{} `json:"group_id"`
 }
 
 type ProbeType string
@@ -53,9 +53,7 @@ const (
 
 // ProbeData What the agent posts (flattened main-level fields + kind + raw payload)
 type ProbeData struct {
-	ID              uint      `json:"id"`
 	ProbeID         uint      `json:"probe_id"`
-	ProbeAgentID    uint      `json:"probe_agent_id"` // probe ID owner - used for reverse probes
 	Triggered       bool      `json:"triggered"`
 	TriggeredReason string    `json:"triggered_reason"`
 	CreatedAt       time.Time `json:"created_at"` // this is the timestamp that the agent provides

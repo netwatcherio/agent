@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"github.com/kataras/iris/v12/websocket"
 	"github.com/netwatcherio/netwatcher-agent/probes"
-	"golang.org/x/crypto/ssh/agent"
 	"io"
 	"net/http"
 	"os"
@@ -44,18 +43,46 @@ const (
 	AuthFileName          = "agent_auth.json"
 )
 
+type Agent struct {
+	ID        uint      `gorm:"primaryKey;autoIncrement" json:"id"`
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
+	UpdatedAt time.Time `gorm:"index" json:"updated_at"`
+
+	// Ownership / scoping
+	WorkspaceID uint `gorm:"index:idx_ws_pin,priority:1" json:"workspace_id"`
+
+	// Identity
+	Name        string `gorm:"size:255;index" json:"name" form:"name"`
+	Description string `gorm:"size:255;index" json:"description" form:"description"`
+
+	// Network
+	Location         string `gorm:"size:255" json:"location"`
+	PublicIPOverride string `gorm:"size:64" json:"public_ip_override"`
+
+	// Runtime / versioning
+	Version string `gorm:"size:64;index" json:"version"`
+
+	// Health
+	LastSeenAt time.Time `gorm:"index" json:"last_seen_at"`
+
+	Initialized bool `gorm:"default:false" json:"initialized"`
+
+	// Authentication (post-bootstrap)
+	PSKHash string `gorm:"size:255" json:"-"` // bcrypt hash of server-generated PSK
+}
+
 type LoginResponse struct {
-	Status string       `json:"status"`          // "ok" | "bootstrapped"
-	PSK    string       `json:"psk,omitempty"`   // only on bootstrap
-	Agent  *agent.Agent `json:"agent,omitempty"` // convenience
-	Error  string       `json:"error,omitempty"` // on failure
+	Status string `json:"status"`          // "ok" | "bootstrapped"
+	PSK    string `json:"psk,omitempty"`   // only on bootstrap
+	Agent  Agent  `json:"agent,omitempty"` // convenience
+	Error  string `json:"error,omitempty"` // on failure
 }
 
 // --- API payloads (minimal; we keep raw for persistence) ---
 
 type agentLoginRequest struct {
-	WorkspaceID uint   `json:"workspaceId,omitempty"`
-	AgentID     uint   `json:"agentId,omitempty"`
+	WorkspaceID uint   `json:"workspace_id,omitempty"`
+	AgentID     uint   `json:"agent_id,omitempty"`
 	PSK         string `json:"psk,omitempty"`
 	PIN         string `json:"pin,omitempty"`
 }
@@ -140,7 +167,7 @@ func DoLogin(ctx context.Context, cfg Config) (*LoginResponse, error) {
 
 	var out LoginResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("login decode: %w", err)
+		return nil, fmt.Errorf("login decode: %w\n%s", err, raw)
 	}
 
 	if resp.StatusCode != http.StatusOK {

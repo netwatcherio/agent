@@ -113,6 +113,7 @@ func main() {
 			log.Fatalf("failed to save %s: %v", web.AuthFileName, err)
 		}
 		log.Infof("Saved %s (status=%s)", web.AuthFileName, loginResp.Status)
+		cfg.PSK = loginResp.PSK
 	} else if err != nil {
 		// Some other filesystem error (permissions, etc.)
 		log.Fatalf("failed to stat %s: %v", web.AuthFileName, err)
