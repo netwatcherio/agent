@@ -15,6 +15,7 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 			if err != nil {
 				return
 			}
+
 			wsH.WsConn.Emit("probe_post", marshal)
 		}
 	}(wsH, ch)

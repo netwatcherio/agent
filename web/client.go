@@ -193,12 +193,13 @@ func SaveRawAuthJSON(raw []byte) error {
 // --- WebSocket client (neffos + gobwas) ---
 
 type WSClient struct {
-	URL         string
-	WorkspaceID uint
-	AgentID     uint
-	PSK         string
-	ProbeGetCh  chan []probes.Probe
-	WsConn      *neffos.NSConn
+	URL          string
+	WorkspaceID  uint
+	AgentID      uint
+	PSK          string
+	ProbeGetCh   chan []probes.Probe
+	WsConn       *neffos.NSConn
+	AgentVersion string
 }
 
 func (c *WSClient) namespaces() neffos.Namespaces {
@@ -210,6 +211,19 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 				if ok := ns.Emit("probe_get", []byte("hello")); !ok {
 					log.Warn("WS: emit probe_get returned false")
 				}
+
+				// update version on connect/reconnect
+				var versionData = struct {
+					Version string `json:"version"`
+				}{}
+
+				versionData.Version = c.AgentVersion
+				vM, _ := json.Marshal(versionData)
+
+				if ok := ns.Emit("version", vM); !ok {
+					log.Warn("WS: emit version returned not ok")
+				}
+
 				return nil
 			},
 			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {

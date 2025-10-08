@@ -147,11 +147,12 @@ func main() {
 
 	// 2) WS client with gobwas + headers
 	wsClient := &web.WSClient{
-		URL:         cfg.WSURL,       // e.g. ws://host:8080/ws
-		WorkspaceID: cfg.WorkspaceID, // header: X-Workspace-ID
-		AgentID:     cfg.AgentID,     // header: X-Agent-ID
-		PSK:         psk,             // header: X-Agent-PSK
-		ProbeGetCh:  probeGetCh,
+		URL:          cfg.WSURL,       // e.g. ws://host:8080/ws
+		WorkspaceID:  cfg.WorkspaceID, // header: X-Workspace-ID
+		AgentID:      cfg.AgentID,     // header: X-Agent-ID
+		PSK:          psk,             // header: X-Agent-PSK
+		ProbeGetCh:   probeGetCh,
+		AgentVersion: VERSION,
 	}
 
 	// If your workers expect a uint agent ID now:
