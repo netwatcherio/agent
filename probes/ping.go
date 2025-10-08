@@ -1,7 +1,6 @@
 package probes
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	probing "github.com/prometheus-community/pro-bing"
@@ -40,7 +39,9 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 	// ----- Configure pinger per pro-bing docs -----
 
 	// Count: if >0, send exactly Count packets; if 0, run until Timeout/context.
-	if ac.Count > 0 {
+	if ac.Count < 60 {
+		pinger.Count = 60
+	} else {
 		pinger.Count = ac.Count
 	}
 
@@ -53,11 +54,11 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 	// Timeout: total runtime cap (pinger exits when reached).
 	// Fall back to 60s if not set on the probe.
-	runCap := time.Duration(ac.DurationSec) * time.Second
+	/*runCap := time.Duration(ac.DurationSec) * time.Second
 	if runCap <= 0 {
 		runCap = 60 * time.Second
 	}
-	pinger.Timeout = runCap
+	pinger.Timeout = runCap*/
 
 	// OS privilege behavior (see README notes):
 	switch runtime.GOOS {
@@ -124,14 +125,9 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 		// Optional: trigger follow-up probes based on loss here.
 	}
 
-	// ----- Run with context so callers can cancel early -----
-	// Context will also stop early even if pinger.Timeout not yet reached.
-	ctx, cancel := context.WithTimeout(context.Background(), runCap)
-	defer cancel()
-
-	if err := pinger.RunWithContext(ctx); err != nil {
+	if err := pinger.Run(); err != nil {
 		// per issues, timeout doesn’t return an error; other errors should be surfaced
-		log.WithError(err).Error("ping: RunWithContext failed")
+		log.WithError(err).Error("ping: failed")
 		return err
 	}
 

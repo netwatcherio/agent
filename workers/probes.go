@@ -811,8 +811,8 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	log.Info("SystemInfo: Running system hardware usage test")
 
 	interval := probe.IntervalSec
-	if interval <= 0 {
-		interval = 1
+	if interval < 60 {
+		interval = 120
 	}
 
 	data, err := probes.SystemInfo()
@@ -832,7 +832,7 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		}
 	}
 
-	time.Sleep(time.Duration(interval) * time.Minute)
+	time.Sleep(time.Duration(interval) * time.Second)
 }
 
 func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
