@@ -858,6 +858,11 @@ func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 			CreatedAt: time.Now(),
 		}
 	}
+
+	if probe.IntervalSec < 120 {
+		probe.IntervalSec = 120
+	}
+
 	time.Sleep(time.Duration(probe.IntervalSec) * time.Second)
 }
 
