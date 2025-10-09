@@ -54,11 +54,12 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 	// Timeout: total runtime cap (pinger exits when reached).
 	// Fall back to 60s if not set on the probe.
-	/*runCap := time.Duration(ac.DurationSec) * time.Second
-	if runCap <= 0 {
-		runCap = 60 * time.Second
+	if ac.IntervalSec < 60 {
+		ac.IntervalSec = 60
 	}
-	pinger.Timeout = runCap*/
+	runCap := time.Duration(ac.IntervalSec*2) * time.Second
+
+	pinger.Timeout = runCap
 
 	// OS privilege behavior (see README notes):
 	switch runtime.GOOS {
