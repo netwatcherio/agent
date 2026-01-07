@@ -3,12 +3,11 @@ package probes
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/netwatcherio/netwatcher-agent/lib/platform"
 )
 
 type MtrPayload struct {
@@ -84,31 +83,11 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 		triggeredCount = 15
 	}
 
-	trippyPath := filepath.Join(".", "lib")
-	var trippyBinary string
-
-	switch runtime.GOOS {
-	case "windows":
-		if runtime.GOARCH == "amd64" {
-			trippyBinary = "trip.exe"
-		} else {
-			trippyBinary = "trip.exe"
-		}
-	case "darwin":
-		trippyBinary = "trip"
-	case "linux":
-		if runtime.GOARCH == "amd64" {
-			trippyBinary = "trip"
-		} else if runtime.GOARCH == "arm64" {
-			trippyBinary = "trip"
-		} else {
-			return mtrResult, fmt.Errorf("unsupported Linux architecture: %s", runtime.GOARCH)
-		}
-	default:
-		return mtrResult, fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	// Use platform package for binary path resolution
+	if err := platform.CheckSupported(); err != nil {
+		return mtrResult, err
 	}
-
-	trippyPath = filepath.Join(trippyPath, trippyBinary)
+	trippyPath := platform.BinaryPath("trip")
 
 	/*args := []string{
 		"--icmp",
@@ -124,7 +103,7 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	defer cancel()*/
 
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
+	if platform.IsWindows() {
 		shellArgs := append([]string{"/c", trippyPath + " " +
 			"--icmp " +
 			"--mode json " +
