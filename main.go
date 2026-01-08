@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+
 	"github.com/netwatcherio/netwatcher-agent/probes"
 	"github.com/netwatcherio/netwatcher-agent/web"
 	"github.com/netwatcherio/netwatcher-agent/workers"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	// "github.com/netwatcherio/netwatcher-agent/workers"
-	log "github.com/sirupsen/logrus"
 	"os"
 	"os/signal"
 	"runtime"
@@ -19,6 +19,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // Env helpers
@@ -90,6 +92,7 @@ func main() {
 	// ---------- Wire websocket handler ----------
 	probeGetCh := make(chan []probes.Probe)
 	probeDataCh := make(chan probes.ProbeData)
+	speedtestQueueCh := make(chan []probes.SpeedtestQueueItem)
 
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 	log.SetLevel(log.InfoLevel)
@@ -147,12 +150,13 @@ func main() {
 
 	// 2) WS client with gobwas + headers
 	wsClient := &web.WSClient{
-		URL:          cfg.WSURL,       // e.g. ws://host:8080/ws
-		WorkspaceID:  cfg.WorkspaceID, // header: X-Workspace-ID
-		AgentID:      cfg.AgentID,     // header: X-Agent-ID
-		PSK:          psk,             // header: X-Agent-PSK
-		ProbeGetCh:   probeGetCh,
-		AgentVersion: VERSION,
+		URL:              cfg.WSURL,       // e.g. ws://host:8080/ws
+		WorkspaceID:      cfg.WorkspaceID, // header: X-Workspace-ID
+		AgentID:          cfg.AgentID,     // header: X-Agent-ID
+		PSK:              psk,             // header: X-Agent-PSK
+		ProbeGetCh:       probeGetCh,
+		SpeedtestQueueCh: speedtestQueueCh,
+		AgentVersion:     VERSION,
 	}
 
 	// If your workers expect a uint agent ID now:
@@ -173,10 +177,50 @@ func main() {
 			default:
 				time.Sleep(time.Minute * 1)
 				log.Debug("Getting probes again...")
-				ws.WsConn.Emit("probe_get", []byte("please"))
+				if ws.WsConn != nil {
+					ws.WsConn.Emit("probe_get", []byte("please"))
+				}
 			}
 		}
 	}(wsClient, ctx)
+
+	// Speedtest queue worker: poll and process queue
+	go func(ws *web.WSClient, queueCh chan []probes.SpeedtestQueueItem, ctx context.Context) {
+		// Polling ticker (30 seconds)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Poll for new speedtest queue items
+				if ws.WsConn != nil {
+					log.Debug("Polling for speedtest queue...")
+					ws.WsConn.Emit("speedtest_queue_get", []byte("{}"))
+				}
+			case items := <-queueCh:
+				// Process each queue item
+				for _, item := range items {
+					log.Infof("Processing speedtest queue item %d (server: %s)", item.ID, item.ServerID)
+
+					// Run the speedtest
+					result := probes.RunSpeedtestForQueue(item)
+
+					// Send result back to controller
+					if ws.WsConn != nil {
+						data, _ := json.Marshal(result)
+						if ok := ws.WsConn.Emit("speedtest_result", data); !ok {
+							log.Warn("WS: emit speedtest_result returned false")
+						} else {
+							log.Infof("Sent speedtest result for queue item %d", item.ID)
+						}
+					}
+				}
+			}
+		}
+	}(wsClient, speedtestQueueCh, ctx)
 
 	<-parent.Done()
 	log.Info("shutting down")

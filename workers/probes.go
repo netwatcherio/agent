@@ -6,9 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/netwatcherio/netwatcher-agent/probes"
 	"sync"
 	"time"
+
+	"github.com/netwatcherio/netwatcher-agent/probes"
 
 	log "github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -935,6 +936,13 @@ func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	if err := probes.Ping(&probe, dataChan, mtrProbe); err != nil {
 		log.Errorf("Ping error: %v", err)
 	}
+
+	// Sleep for the configured interval before next execution
+	interval := probe.IntervalSec
+	if interval < 60 {
+		interval = 60 // Minimum 60 seconds between probe runs
+	}
+	time.Sleep(time.Duration(interval) * time.Second)
 }
 
 func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {

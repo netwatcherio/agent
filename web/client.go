@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/kataras/iris/v12/websocket"
-	"github.com/netwatcherio/netwatcher-agent/probes"
 	"io"
 	"net/http"
 	"os"
@@ -14,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kataras/iris/v12/websocket"
+	"github.com/netwatcherio/netwatcher-agent/probes"
 
 	"github.com/kataras/neffos"
 	"github.com/kataras/neffos/gobwas"
@@ -193,13 +194,14 @@ func SaveRawAuthJSON(raw []byte) error {
 // --- WebSocket client (neffos + gobwas) ---
 
 type WSClient struct {
-	URL          string
-	WorkspaceID  uint
-	AgentID      uint
-	PSK          string
-	ProbeGetCh   chan []probes.Probe
-	WsConn       *neffos.NSConn
-	AgentVersion string
+	URL              string
+	WorkspaceID      uint
+	AgentID          uint
+	PSK              string
+	ProbeGetCh       chan []probes.Probe
+	SpeedtestQueueCh chan []probes.SpeedtestQueueItem
+	WsConn           *neffos.NSConn
+	AgentVersion     string
 }
 
 func (c *WSClient) namespaces() neffos.Namespaces {
@@ -224,6 +226,20 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Warn("WS: emit version returned not ok")
 				}
 
+				// Fetch and send speedtest servers on connect
+				go func() {
+					servers, err := probes.FetchSpeedtestServers()
+					if err != nil {
+						log.Errorf("WS: failed to fetch speedtest servers: %v", err)
+						return
+					}
+					data, _ := json.Marshal(servers)
+					if ok := ns.Emit("speedtest_servers", data); !ok {
+						log.Warn("WS: emit speedtest_servers returned false")
+					}
+					log.Infof("WS: sent %d speedtest servers to controller", len(servers))
+				}()
+
 				return nil
 			},
 			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {
@@ -239,6 +255,26 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					return err
 				}
 				c.ProbeGetCh <- p
+				return nil
+			},
+			"speedtest_servers_ok": func(ns *neffos.NSConn, msg neffos.Message) error {
+				log.Infof("WS: speedtest_servers acknowledged: %s", string(msg.Body))
+				return nil
+			},
+			"speedtest_queue": func(ns *neffos.NSConn, msg neffos.Message) error {
+				log.Infof("WS: received speedtest_queue: %s", string(msg.Body))
+				var items []probes.SpeedtestQueueItem
+				if err := json.Unmarshal(msg.Body, &items); err != nil {
+					log.Errorf("WS: failed to unmarshal speedtest_queue: %v", err)
+					return err
+				}
+				if c.SpeedtestQueueCh != nil {
+					c.SpeedtestQueueCh <- items
+				}
+				return nil
+			},
+			"speedtest_result_ok": func(ns *neffos.NSConn, msg neffos.Message) error {
+				log.Infof("WS: speedtest_result acknowledged: %s", string(msg.Body))
 				return nil
 			},
 		},

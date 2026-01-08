@@ -3,10 +3,11 @@ package probes
 import (
 	"encoding/json"
 	"fmt"
-	probing "github.com/prometheus-community/pro-bing"
-	log "github.com/sirupsen/logrus"
 	"runtime"
 	"time"
+
+	probing "github.com/prometheus-community/pro-bing"
+	log "github.com/sirupsen/logrus"
 )
 
 type PingPayload struct {
@@ -38,28 +39,23 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 	// ----- Configure pinger per pro-bing docs -----
 
-	// Count: if >0, send exactly Count packets; if 0, run until Timeout/context.
-	if ac.Count < 60 {
-		pinger.Count = 60
-	} else {
+	// Count: use configured count (default to 10 if not set)
+	if ac.Count > 0 {
 		pinger.Count = ac.Count
-	}
-
-	// Interval: default 1s if not provided.
-	if ac.IntervalSec > 0 {
-		pinger.Interval = time.Duration(ac.IntervalSec) * time.Second
 	} else {
-		pinger.Interval = time.Second
+		pinger.Count = 10
 	}
 
-	// Timeout: total runtime cap (pinger exits when reached).
-	// Fall back to 60s if not set on the probe.
-	if ac.IntervalSec < 60 {
-		ac.IntervalSec = 60
-	}
-	runCap := time.Duration(ac.IntervalSec*2) * time.Second
+	// Interval between individual pings: fixed at 1 second
+	// Note: IntervalSec is for SCHEDULING between probe runs, not individual ping interval
+	pinger.Interval = time.Second
 
-	pinger.Timeout = runCap
+	// Timeout: use configured timeout, default to 30s
+	timeout := ac.TimeoutSec
+	if timeout <= 0 {
+		timeout = 30
+	}
+	pinger.Timeout = time.Duration(timeout) * time.Second
 
 	// OS privilege behavior (see README notes):
 	switch runtime.GOOS {
