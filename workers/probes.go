@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -201,20 +202,27 @@ func findMatchingMTRProbe(probe probes.Probe) (probes.Probe, error) {
 		}
 
 		if probeWorker.Probe.Type == probes.ProbeType_MTR {
-			/*for _, target := range probeWorker.probe.Target {
-				for _, givenTarget := range probe.Target {
+			// Check if any target in the MTR probe matches the given probe's targets
+			for _, mtrTarget := range probeWorker.Probe.Targets {
+				for _, givenTarget := range probe.Targets {
+					// Extract the address portion (strip port if present)
 					targetAddr := givenTarget.Target
 					if strings.Contains(targetAddr, ":") {
 						targetAddr = strings.Split(targetAddr, ":")[0]
 					}
 
-					if target.Target == targetAddr || target.Target == givenTarget.Target {
+					mtrAddr := mtrTarget.Target
+					if strings.Contains(mtrAddr, ":") {
+						mtrAddr = strings.Split(mtrAddr, ":")[0]
+					}
+
+					if mtrAddr == targetAddr || mtrTarget.Target == givenTarget.Target {
 						foundProbe = probeWorker.Probe
 						found = true
 						return false
 					}
 				}
-			}*/
+			}
 		}
 		return true
 	})
