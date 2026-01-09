@@ -68,12 +68,16 @@ type PacketTime struct {
 
 // CycleTracker tracks packets for a reporting cycle
 type CycleTracker struct {
-	StartSeq    int
-	EndSeq      int
-	PacketSeqs  []int
-	StartTime   time.Time
-	PacketTimes map[int]PacketTime
-	mu          sync.RWMutex
+	StartSeq        int
+	EndSeq          int
+	PacketSeqs      []int
+	StartTime       time.Time
+	PacketTimes     map[int]PacketTime
+	lastReceivedSeq int         // Last received sequence number for out-of-order detection
+	outOfOrder      int         // Count of packets received out of order
+	duplicates      int         // Count of duplicate packets received
+	receivedSeqs    map[int]int // Track how many times each seq was received
+	mu              sync.RWMutex
 }
 
 // ClientStats tracks client-side statistics
@@ -453,10 +457,14 @@ func (ts *TrafficSim) startCycle() *CycleTracker {
 	defer ts.cycleMu.Unlock()
 
 	cycle := &CycleTracker{
-		StartSeq:    ts.sequence + 1,
-		StartTime:   time.Now(),
-		PacketSeqs:  make([]int, 0, TrafficSimReportSeq),
-		PacketTimes: make(map[int]PacketTime),
+		StartSeq:        ts.sequence + 1,
+		StartTime:       time.Now(),
+		PacketSeqs:      make([]int, 0, TrafficSimReportSeq),
+		PacketTimes:     make(map[int]PacketTime),
+		receivedSeqs:    make(map[int]int), // Track receive count per seq
+		lastReceivedSeq: 0,
+		outOfOrder:      0,
+		duplicates:      0,
 	}
 	ts.currentCycle = cycle
 	ts.packetsInCycle = 0
@@ -557,6 +565,24 @@ func (ts *TrafficSim) handleAck(data TrafficSimData) {
 	ts.cycleMu.RLock()
 	if ts.currentCycle != nil {
 		ts.currentCycle.mu.Lock()
+
+		// Track duplicate detection: increment receive count for this seq
+		ts.currentCycle.receivedSeqs[seq]++
+		receiveCount := ts.currentCycle.receivedSeqs[seq]
+
+		if receiveCount > 1 {
+			// This is a duplicate packet
+			ts.currentCycle.duplicates++
+		} else {
+			// First time receiving this seq - check for out-of-order
+			if ts.currentCycle.lastReceivedSeq > 0 && seq < ts.currentCycle.lastReceivedSeq {
+				// Packet arrived out of order (lower seq after higher seq)
+				ts.currentCycle.outOfOrder++
+			}
+			ts.currentCycle.lastReceivedSeq = seq
+		}
+
+		// Update packet timing (only first receipt)
 		if pt, ok := ts.currentCycle.PacketTimes[seq]; ok && pt.Received == 0 {
 			pt.Received = recvTime
 			ts.currentCycle.PacketTimes[seq] = pt
@@ -655,15 +681,28 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 		lossPercent = (float64(lost) / float64(total)) * 100
 	}
 
+	// Calculate percentages for out-of-order and duplicates
+	outOfOrderPercent := float64(0)
+	duplicatePercent := float64(0)
+	received := total - lost
+	if received > 0 {
+		outOfOrderPercent = (float64(cycle.outOfOrder) / float64(received)) * 100
+		duplicatePercent = (float64(cycle.duplicates) / float64(received)) * 100
+	}
+
 	return map[string]interface{}{
-		"lostPackets":    lost,
-		"lossPercentage": lossPercent,
-		"totalPackets":   total,
-		"averageRTT":     avgRTT,
-		"minRTT":         minRTT,
-		"maxRTT":         maxRTT,
-		"stdDevRTT":      stdDev,
-		"timestamp":      time.Now(),
+		"lostPackets":       lost,
+		"lossPercentage":    lossPercent,
+		"totalPackets":      total,
+		"averageRTT":        avgRTT,
+		"minRTT":            minRTT,
+		"maxRTT":            maxRTT,
+		"stdDevRTT":         stdDev,
+		"outOfOrder":        cycle.outOfOrder,
+		"outOfOrderPercent": outOfOrderPercent,
+		"duplicates":        cycle.duplicates,
+		"duplicatePercent":  duplicatePercent,
+		"timestamp":         time.Now(),
 	}
 }
 

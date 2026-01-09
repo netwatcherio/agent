@@ -24,12 +24,12 @@ import (
 /*
 ENV VARS:
 
-  NW_AGENT_API_URL         e.g. http://localhost:8080/api/agent
-  NW_AGENT_WS_URL          e.g. ws://localhost:8080/ws
-  NW_AGENT_WORKSPACE_ID    uint
-  NW_AGENT_AGENT_ID        uint
-  NW_AGENT_PIN             optional (used if PSK missing)
-  NW_AGENT_PSK             optional (preferred)
+  CONTROLLER_URL           e.g. localhost:8080 or api.example.com (protocol is auto-detected)
+  CONTROLLER_SSL           true/false - use HTTPS/WSS (default: false)
+  WORKSPACE_ID             uint
+  AGENT_ID                 uint
+  AGENT_PIN                optional (used if PSK missing for initial bootstrap)
+  AGENT_PSK                optional (preferred, saved after bootstrap)
 
 Behavior:
   - Try PSK first; otherwise bootstrap via PIN.
@@ -99,12 +99,14 @@ type agentLoginResponse struct {
 // --- Config ---
 
 type Config struct {
-	APIURL      string
-	WSURL       string
-	WorkspaceID uint
-	AgentID     uint
-	PIN         string
-	PSK         string
+	ControllerURL string // Base URL without protocol (e.g., "localhost:8080" or "api.example.com")
+	SSL           bool   // Use HTTPS/WSS instead of HTTP/WS
+	APIURL        string // Derived: http(s)://ControllerURL/api/agent
+	WSURL         string // Derived: ws(s)://ControllerURL/ws
+	WorkspaceID   uint
+	AgentID       uint
+	PIN           string
+	PSK           string
 }
 
 func mustEnv(name string) string {
@@ -124,14 +126,48 @@ func parseUintEnv(name string) uint {
 	return uint(u64)
 }
 
+func parseBoolEnv(name string, defaultVal bool) bool {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return defaultVal
+	}
+	v = strings.ToLower(v)
+	return v == "true" || v == "1" || v == "yes"
+}
+
+// LoadConfigFromEnv loads configuration from environment variables.
+// Uses CONTROLLER_URL as the base and derives API/WS URLs automatically.
+// Set CONTROLLER_SSL=true to use HTTPS/WSS instead of HTTP/WS.
 func LoadConfigFromEnv() Config {
+	controllerURL := mustEnv("CONTROLLER_URL")
+
+	// Strip any protocol prefix if provided (normalize)
+	controllerURL = strings.TrimPrefix(controllerURL, "https://")
+	controllerURL = strings.TrimPrefix(controllerURL, "http://")
+	controllerURL = strings.TrimPrefix(controllerURL, "wss://")
+	controllerURL = strings.TrimPrefix(controllerURL, "ws://")
+	controllerURL = strings.TrimSuffix(controllerURL, "/")
+
+	// Determine SSL from CONTROLLER_SSL env var (defaults to false)
+	ssl := parseBoolEnv("CONTROLLER_SSL", false)
+
+	// Build protocol prefixes
+	httpProto := "http://"
+	wsProto := "ws://"
+	if ssl {
+		httpProto = "https://"
+		wsProto = "wss://"
+	}
+
 	return Config{
-		APIURL:      mustEnv("API_URL"),
-		WSURL:       mustEnv("WS_URL"),
-		WorkspaceID: parseUintEnv("WORKSPACE_ID"),
-		AgentID:     parseUintEnv("AGENT_ID"),
-		PIN:         strings.TrimSpace(os.Getenv("AGENT_PIN")),
-		PSK:         strings.TrimSpace(os.Getenv("AGENT_PSK")),
+		ControllerURL: controllerURL,
+		SSL:           ssl,
+		APIURL:        httpProto + controllerURL + "/api/agent",
+		WSURL:         wsProto + controllerURL + "/ws",
+		WorkspaceID:   parseUintEnv("WORKSPACE_ID"),
+		AgentID:       parseUintEnv("AGENT_ID"),
+		PIN:           strings.TrimSpace(os.Getenv("AGENT_PIN")),
+		PSK:           strings.TrimSpace(os.Getenv("AGENT_PSK")),
 	}
 }
 
