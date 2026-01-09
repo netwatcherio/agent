@@ -638,25 +638,26 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 }
 
 func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID, ctx context.Context, stopChan chan struct{}) {
-	//checkCfg := probe.Config
-	//checkAddress := strings.Split(checkCfg.Target[0].Target, ":")
+	// Create new TrafficSim instance
+	ts := probes.NewTrafficSim(&probe, dataChan)
+	ts.ThisAgent = probe.AgentID // Use the agent ID from the probe
 
-	/*portNum, err := strconv.Atoi(checkAddress[1])
+	// Find matching MTR probe for triggered diagnostics
+	mtrProbe, err := findMatchingMTRProbe(probe)
 	if err != nil {
-		log.Errorf("Invalid port number: %v", err)
-		return
-	}*/
+		log.Debugf("[trafficsim] No matching MTR probe found: %v", err)
+	}
 
-	/*mtrProbe, err := findMatchingMTRProbe(probe)
-	if err != nil {
-		log.Errorf("Failed to find matching MTR probe: %v", err)
-	}
-	*/
-	if probe.Server {
-		//handleTrafficSimServer(probe, thisAgent, checkAddress[0], portNum, stopChan)
-	} else {
-		//handleTrafficSimClient(probe, thisAgent, checkAddress[0], portNum, dataChan, &mtrProbe, stopChan)
-	}
+	log.Infof("[trafficsim] Starting probe %d (server=%v, target=%s:%d)",
+		probe.ID, probe.Server, ts.IPAddress, ts.Port)
+
+	// Start TrafficSim in goroutine
+	go ts.Start(&mtrProbe)
+
+	// Wait for stop signal
+	<-stopChan
+	log.Infof("[trafficsim] Stopping probe %d", probe.ID)
+	ts.Stop()
 }
 
 /*func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int, stopChan chan struct{}) {
