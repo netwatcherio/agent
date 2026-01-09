@@ -24,7 +24,7 @@ import (
 /*
 ENV VARS:
 
-  CONTROLLER_URL           e.g. localhost:8080 or api.example.com (protocol is auto-detected)
+  CONTROLLER_HOST          e.g. localhost:8080 or api.example.com (host:port, no protocol)
   CONTROLLER_SSL           true/false - use HTTPS/WSS (default: false)
   WORKSPACE_ID             uint
   AGENT_ID                 uint
@@ -99,14 +99,14 @@ type agentLoginResponse struct {
 // --- Config ---
 
 type Config struct {
-	ControllerURL string // Base URL without protocol (e.g., "localhost:8080" or "api.example.com")
-	SSL           bool   // Use HTTPS/WSS instead of HTTP/WS
-	APIURL        string // Derived: http(s)://ControllerURL/api/agent
-	WSURL         string // Derived: ws(s)://ControllerURL/ws
-	WorkspaceID   uint
-	AgentID       uint
-	PIN           string
-	PSK           string
+	ControllerHost string // Host:port without protocol (e.g., "localhost:8080" or "api.example.com")
+	SSL            bool   // Use HTTPS/WSS instead of HTTP/WS
+	APIURL         string // Derived: http(s)://ControllerHost/agent
+	WSURL          string // Derived: ws(s)://ControllerHost/ws/agent
+	WorkspaceID    uint
+	AgentID        uint
+	PIN            string
+	PSK            string
 }
 
 func mustEnv(name string) string {
@@ -136,17 +136,17 @@ func parseBoolEnv(name string, defaultVal bool) bool {
 }
 
 // LoadConfigFromEnv loads configuration from environment variables.
-// Uses CONTROLLER_URL as the base and derives API/WS URLs automatically.
+// Uses CONTROLLER_HOST as the base host:port and derives API/WS URLs automatically.
 // Set CONTROLLER_SSL=true to use HTTPS/WSS instead of HTTP/WS.
 func LoadConfigFromEnv() Config {
-	controllerURL := mustEnv("CONTROLLER_URL")
+	controllerHost := mustEnv("CONTROLLER_HOST")
 
-	// Strip any protocol prefix if provided (normalize)
-	controllerURL = strings.TrimPrefix(controllerURL, "https://")
-	controllerURL = strings.TrimPrefix(controllerURL, "http://")
-	controllerURL = strings.TrimPrefix(controllerURL, "wss://")
-	controllerURL = strings.TrimPrefix(controllerURL, "ws://")
-	controllerURL = strings.TrimSuffix(controllerURL, "/")
+	// Strip any protocol prefix if provided (normalize to just host:port)
+	controllerHost = strings.TrimPrefix(controllerHost, "https://")
+	controllerHost = strings.TrimPrefix(controllerHost, "http://")
+	controllerHost = strings.TrimPrefix(controllerHost, "wss://")
+	controllerHost = strings.TrimPrefix(controllerHost, "ws://")
+	controllerHost = strings.TrimSuffix(controllerHost, "/")
 
 	// Determine SSL from CONTROLLER_SSL env var (defaults to false)
 	ssl := parseBoolEnv("CONTROLLER_SSL", false)
@@ -160,14 +160,14 @@ func LoadConfigFromEnv() Config {
 	}
 
 	return Config{
-		ControllerURL: controllerURL,
-		SSL:           ssl,
-		APIURL:        httpProto + controllerURL + "/api/agent",
-		WSURL:         wsProto + controllerURL + "/ws",
-		WorkspaceID:   parseUintEnv("WORKSPACE_ID"),
-		AgentID:       parseUintEnv("AGENT_ID"),
-		PIN:           strings.TrimSpace(os.Getenv("AGENT_PIN")),
-		PSK:           strings.TrimSpace(os.Getenv("AGENT_PSK")),
+		ControllerHost: controllerHost,
+		SSL:            ssl,
+		APIURL:         httpProto + controllerHost + "/agent",
+		WSURL:          wsProto + controllerHost + "/ws/agent",
+		WorkspaceID:    parseUintEnv("WORKSPACE_ID"),
+		AgentID:        parseUintEnv("AGENT_ID"),
+		PIN:            strings.TrimSpace(os.Getenv("AGENT_PIN")),
+		PSK:            strings.TrimSpace(os.Getenv("AGENT_PSK")),
 	}
 }
 

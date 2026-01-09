@@ -16,8 +16,8 @@ const (
 	defaultConfig = `# NetWatcher Agent Configuration
 # See: https://docs.netwatcher.io/agent/configuration
 
-# Controller URL (host:port or domain, no protocol needed)
-CONTROLLER_URL=api.netwatcher.io
+# Controller host (host:port or domain, no protocol needed)
+CONTROLLER_HOST=api.netwatcher.io
 
 # Enable SSL (true = HTTPS/WSS, false = HTTP/WS)
 CONTROLLER_SSL=true
