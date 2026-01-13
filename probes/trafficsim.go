@@ -235,6 +235,39 @@ func (ts *TrafficSim) setConnectionValid(valid bool) {
 	ts.connectionValid = valid
 }
 
+// isNetworkChangeError detects errors indicating the local IP is no longer valid
+func isNetworkChangeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "can't assign requested address") ||
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "no route to host")
+}
+
+// reconnectUDP closes the existing connection and establishes a new one
+func (ts *TrafficSim) reconnectUDP() error {
+	log.Printf("[trafficsim] Reconnecting due to network change...")
+
+	// Close old connection
+	ts.connMu.Lock()
+	if ts.conn != nil {
+		ts.conn.Close()
+		ts.conn = nil
+	}
+	ts.connMu.Unlock()
+
+	// Establish new connection
+	if err := ts.dialUDP(); err != nil {
+		log.Printf("[trafficsim] Reconnection failed: %v", err)
+		return err
+	}
+
+	log.Printf("[trafficsim] Reconnected to %s:%d", ts.IPAddress, ts.Port)
+	return nil
+}
+
 func (ts *TrafficSim) nextSequence() int {
 	ts.sequenceMu.Lock()
 	defer ts.sequenceMu.Unlock()
@@ -420,6 +453,14 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 			default:
 			}
 
+			// Check if we need to reconnect due to network change
+			if !ts.isConnectionValid() {
+				if err := ts.reconnectUDP(); err != nil {
+					// Still send packet (will fail, recording loss)
+					log.Printf("[trafficsim] Reconnection failed, packet %d will fail", i+1)
+				}
+			}
+
 			ts.sendDataPacket(cycle)
 
 			// Wait for interval
@@ -504,6 +545,10 @@ func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker) bool {
 	conn.SetWriteDeadline(time.Now().Add(time.Second))
 	if _, err := conn.Write(msg); err != nil {
 		log.Printf("[trafficsim] Send error for seq %d: %v", seq, err)
+		// Check if this is a network change error
+		if isNetworkChangeError(err) {
+			ts.setConnectionValid(false)
+		}
 		return false
 	}
 
@@ -535,6 +580,13 @@ func (ts *TrafficSim) receiveLoop(ctx context.Context) {
 		n, err := conn.Read(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			// Check for network change errors
+			if isNetworkChangeError(err) {
+				log.Printf("[trafficsim] Network change detected in receive loop: %v", err)
+				ts.setConnectionValid(false)
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 			log.Printf("[trafficsim] Read error: %v", err)
