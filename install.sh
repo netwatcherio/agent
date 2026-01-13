@@ -53,8 +53,9 @@ show_usage() {
 NetWatcher Agent Installation Script
 
 Usage: $0 --id <AGENT_ID> --pin <AGENT_PIN> [OPTIONS]
+       $0 --uninstall [--force] [--install-dir <DIR>]
 
-Required Arguments:
+Required Arguments (for installation):
     --id, -i <AGENT_ID>     Agent ID (MongoDB ObjectID format)
     --pin, -p <AGENT_PIN>   Agent PIN
 
@@ -62,10 +63,11 @@ Optional Arguments:
     --host <HOST>           API host (default: $DEFAULT_HOST)
     --host-ws <HOST_WS>     WebSocket host (default: $DEFAULT_HOST_WS)
     --install-dir <DIR>     Installation directory (default: $INSTALL_DIR)
-    --force                 Force reinstallation even if already installed
+    --force                 Force reinstallation or skip uninstall confirmation
     --no-service            Skip systemd service creation
     --no-start              Don't start the service after installation
     --version <VERSION>     Install specific version (default: latest)
+    --uninstall             Uninstall the agent instead of installing
     --debug                 Enable debug output
     --help, -h              Show this help message
 
@@ -79,6 +81,12 @@ Examples:
 
     # Install to custom directory
     $0 --id 686c6d4298d36e8a13fb7ee6 --pin 036977322 --install-dir /usr/local/netwatcher
+
+    # Uninstall the agent
+    $0 --uninstall
+
+    # Force uninstall without confirmation
+    $0 --uninstall --force
 
 EOF
 }
@@ -123,6 +131,10 @@ parse_arguments() {
                 NO_START=true
                 shift
                 ;;
+            --uninstall)
+                UNINSTALL_MODE=true
+                shift
+                ;;
             --debug)
                 DEBUG=true
                 shift
@@ -145,6 +157,7 @@ parse_arguments() {
     FORCE_INSTALL=${FORCE_INSTALL:-false}
     NO_SERVICE=${NO_SERVICE:-false}
     NO_START=${NO_START:-false}
+    UNINSTALL_MODE=${UNINSTALL_MODE:-false}
     DEBUG=${DEBUG:-false}
 }
 
@@ -664,6 +677,79 @@ show_summary() {
     fi
 }
 
+# Uninstall the agent
+uninstall_agent() {
+    echo "NetWatcher Agent Uninstallation"
+    echo "================================"
+    echo
+
+    local has_service=false
+    local has_files=false
+
+    # Check if service exists
+    if systemctl list-unit-files "${SERVICE_NAME}.service" &>/dev/null; then
+        has_service=true
+    fi
+
+    # Check if installation directory exists
+    if [[ -d "$INSTALL_DIR" ]]; then
+        has_files=true
+    fi
+
+    if [[ "$has_service" == false ]] && [[ "$has_files" == false ]]; then
+        log_warning "NetWatcher Agent does not appear to be installed"
+        return 0
+    fi
+
+    # Confirm uninstallation
+    if [[ "$FORCE_INSTALL" != true ]]; then
+        log_warning "This will completely remove NetWatcher Agent from your system."
+        echo "The following will be removed:"
+        if [[ "$has_service" == true ]]; then
+            echo "  - Systemd service: $SERVICE_NAME"
+        fi
+        if [[ "$has_files" == true ]]; then
+            echo "  - Installation directory: $INSTALL_DIR"
+        fi
+        echo
+
+        read -p "Are you sure you want to continue? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Uninstallation cancelled"
+            return 0
+        fi
+    fi
+
+    # Stop and disable the service
+    if [[ "$has_service" == true ]]; then
+        log_info "Stopping $SERVICE_NAME service..."
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        
+        log_info "Disabling $SERVICE_NAME service..."
+        systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+        
+        # Remove the service file
+        log_info "Removing systemd service file..."
+        rm -f "$SERVICE_FILE"
+        
+        # Reload systemd
+        systemctl daemon-reload
+        
+        log_success "Systemd service removed"
+    fi
+
+    # Remove installation directory
+    if [[ "$has_files" == true ]]; then
+        log_info "Removing installation directory: $INSTALL_DIR"
+        rm -rf "$INSTALL_DIR"
+        log_success "Installation directory removed"
+    fi
+
+    echo
+    log_success "NetWatcher Agent has been uninstalled"
+}
+
 # Main execution
 main() {
     echo "NetWatcher Agent Installation Script"
@@ -671,8 +757,16 @@ main() {
     echo
 
     parse_arguments "$@"
-    validate_arguments
     check_root
+
+    # Handle uninstall mode
+    if [[ "$UNINSTALL_MODE" == true ]]; then
+        uninstall_agent
+        return
+    fi
+
+    # Normal installation flow
+    validate_arguments
     detect_architecture
     install_dependencies
     check_existing_installation
