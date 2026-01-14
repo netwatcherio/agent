@@ -831,104 +831,97 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		interval = 120
 	}
 
+	// Ensure we always sleep to prevent tight loops on any error path
+	defer time.Sleep(time.Duration(interval) * time.Second)
+
 	data, err := probes.SystemInfo()
 	if err != nil {
 		log.Errorf("SystemInfo error: %v", err)
-	} else {
-		marshal, err := json.Marshal(data)
-		if err != nil {
-			return
-		}
-
-		dataChan <- probes.ProbeData{
-			Type:      probes.ProbeType_SYSTEMINFO,
-			Payload:   marshal,
-			ProbeID:   probe.ID,
-			CreatedAt: time.Now(),
-		}
+		return
 	}
 
-	time.Sleep(time.Duration(interval) * time.Second)
+	marshal, err := json.Marshal(data)
+	if err != nil {
+		log.Errorf("SystemInfo marshal error: %v", err)
+		return
+	}
+
+	dataChan <- probes.ProbeData{
+		Type:      probes.ProbeType_SYSTEMINFO,
+		Payload:   marshal,
+		ProbeID:   probe.ID,
+		CreatedAt: time.Now(),
+	}
 }
 
 func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	// log.Infof("MTR: Running test for %s", probe.Target[0].Target)
+	interval := probe.IntervalSec
+	if interval < 120 {
+		interval = 120
+	}
+
+	// Ensure we always sleep to prevent tight loops on any error path
+	defer time.Sleep(time.Duration(interval) * time.Second)
 
 	data, err := probes.Mtr(&probe, false)
 	if err != nil {
 		log.Errorf("MTR error: %v", err)
-	} else {
-		//reportingAgent, err := primitive.ObjectIDFromHex("123")
-
-		payload, err := json.Marshal(data)
-
-		if err != nil {
-			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
-			return
-		}
-
-		dataChan <- probes.ProbeData{
-			Type:      probes.ProbeType_MTR,
-			Payload:   payload,
-			ProbeID:   probe.ID,
-			CreatedAt: time.Now(),
-		}
+		return
 	}
 
-	if probe.IntervalSec < 120 {
-		probe.IntervalSec = 120
+	payload, err := json.Marshal(data)
+	if err != nil {
+		log.Errorf("MTR marshal error: %v", err)
+		return
 	}
 
-	time.Sleep(time.Duration(probe.IntervalSec) * time.Second)
+	dataChan <- probes.ProbeData{
+		Type:      probes.ProbeType_MTR,
+		Payload:   payload,
+		ProbeID:   probe.ID,
+		CreatedAt: time.Now(),
+	}
 }
 
 func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	speedTestMutex.Lock()
-	defer speedTestMutex.Unlock()
-
-	if speedTestRunning {
-		return
-	}
-
-	/*if probe.Target[0].Target == "ok" {
-		log.Info("SpeedTest: Target is ok, skipping...")
-		time.Sleep(10 * time.Second)
-		return
-	}*/
-
-	//log.Infof("Running speed test for %s", probe.Target[0].Target)
-	speedTestRunning = true
-
-	/*data, err := probes.SpeedTest(&probe)
-	speedTestRunning = false*/
-
-	/*if err != nil {
-		log.Errorf("SpeedTest error: %v", err)
-		speedTestRetryCount++
-
-		if speedTestRetryCount >= speedTestRetryMax {
-			//probe.Target[0].Target = "ok"
-			log.Warn("SpeedTest: Failed after max retries, setting target to 'ok'")
-		}
-
-		time.Sleep(30 * time.Second)
-		return
-	}*/
-
-	speedTestRetryCount = 0
-	//probe.Target[0].Target = "ok"
-
-	/*dataChan <- probes.ProbeData{
-		ProbeID: probe.ID,
-		Data:    data,
-	}*/
-
-	// Sleep for interval before next run to prevent tight loop
+	// Calculate interval first for consistent sleep timing
 	interval := probe.IntervalSec
 	if interval < 60 {
 		interval = 300 // Default 5 minutes for speedtest
 	}
-	time.Sleep(time.Duration(interval) * time.Second)
+
+	speedTestMutex.Lock()
+
+	// CRITICAL: If speedtest is already running, sleep to prevent tight loop
+	if speedTestRunning {
+		speedTestMutex.Unlock()
+		log.Debug("SpeedTest: Already running, sleeping to prevent busy wait")
+		time.Sleep(time.Duration(interval) * time.Second)
+		return
+	}
+
+	speedTestRunning = true
+	speedTestMutex.Unlock()
+
+	// Ensure speedTestRunning is reset and we sleep on any exit path
+	defer func() {
+		speedTestMutex.Lock()
+		speedTestRunning = false
+		speedTestMutex.Unlock()
+		time.Sleep(time.Duration(interval) * time.Second)
+	}()
+
+	// SpeedTest functionality is currently disabled
+	// When re-enabled, the actual speedtest logic would go here:
+	// data, err := probes.SpeedTest(&probe)
+	// if err != nil {
+	//     log.Errorf("SpeedTest error: %v", err)
+	//     return
+	// }
+	// dataChan <- probes.ProbeData{ProbeID: probe.ID, Payload: data}
+
+	speedTestRetryCount = 0
+	log.Debug("SpeedTest: Probe handler completed (functionality disabled)")
 }
 
 func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
@@ -973,24 +966,27 @@ func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	log.Info("NetInfo: Checking networking information...")
 
+	// Ensure we always sleep to prevent tight loops on any error path
+	defer time.Sleep(10 * time.Minute)
+
 	data, err := probes.NetworkInfo()
 	if err != nil {
 		log.Errorf("NetworkInfo error: %v", err)
-	} else {
-		marshal, err := json.Marshal(data)
-		if err != nil {
-			return
-		}
-
-		dataChan <- probes.ProbeData{
-			Type:      probes.ProbeType_NETWORKINFO,
-			Payload:   marshal,
-			ProbeID:   probe.ID,
-			CreatedAt: time.Now(),
-		}
+		return
 	}
 
-	time.Sleep(10 * time.Minute)
+	marshal, err := json.Marshal(data)
+	if err != nil {
+		log.Errorf("NetworkInfo marshal error: %v", err)
+		return
+	}
+
+	dataChan <- probes.ProbeData{
+		Type:      probes.ProbeType_NETWORKINFO,
+		Payload:   marshal,
+		ProbeID:   probe.ID,
+		CreatedAt: time.Now(),
+	}
 }
 
 /*func updateAllowedAgents(server *probes.TrafficSim, newAllowedAgents []primitive.ObjectID) {
