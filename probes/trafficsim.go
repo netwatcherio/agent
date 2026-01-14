@@ -132,6 +132,13 @@ type TrafficSim struct {
 	// Connection validity
 	connectionValid   bool
 	connectionValidMu sync.RWMutex
+
+	// Bidirectional mode (server sends test data back to client)
+	ReverseProbeID       uint // ID of reverse probe (B→A) if bidirectional
+	bidirectionalEnabled bool
+	bidirectionalMu      sync.RWMutex
+	reverseSequence      int
+	reverseSequenceMu    sync.Mutex
 }
 
 // AgentConnection tracks a client connection on server side
@@ -142,6 +149,11 @@ type AgentConnection struct {
 	FirstSeen   time.Time
 	PacketsRecv int
 	PacketsSent int
+
+	// Reverse direction tracking (for bidirectional mode)
+	ReverseCycle    *CycleTracker
+	ReverseSequence int
+	LastReportTime  time.Time
 }
 
 // -------------------- Constructor --------------------
@@ -233,6 +245,30 @@ func (ts *TrafficSim) setConnectionValid(valid bool) {
 	ts.connectionValidMu.Lock()
 	defer ts.connectionValidMu.Unlock()
 	ts.connectionValid = valid
+}
+
+// SetReverseProbe enables bidirectional mode with the specified reverse probe ID
+func (ts *TrafficSim) SetReverseProbe(probeID uint) {
+	ts.bidirectionalMu.Lock()
+	defer ts.bidirectionalMu.Unlock()
+	ts.ReverseProbeID = probeID
+	ts.bidirectionalEnabled = true
+	log.Printf("[trafficsim] Bidirectional mode enabled, reverse probe ID: %d", probeID)
+}
+
+// IsBidirectional returns whether bidirectional mode is enabled
+func (ts *TrafficSim) IsBidirectional() bool {
+	ts.bidirectionalMu.RLock()
+	defer ts.bidirectionalMu.RUnlock()
+	return ts.bidirectionalEnabled
+}
+
+// nextReverseSequence returns the next sequence number for reverse direction
+func (ts *TrafficSim) nextReverseSequence() int {
+	ts.reverseSequenceMu.Lock()
+	defer ts.reverseSequenceMu.Unlock()
+	ts.reverseSequence++
+	return ts.reverseSequence
 }
 
 // isNetworkChangeError detects errors indicating the local IP is no longer valid
@@ -603,6 +639,14 @@ func (ts *TrafficSim) receiveLoop(ctx context.Context) {
 			ts.handleAck(msg.Data)
 		case MsgPong:
 			ts.lastResponse = time.Now()
+		case MsgData:
+			// Server sent DATA (bidirectional mode) - send ACK back
+			ack, err := ts.buildAckMessage(msg.Data)
+			if err != nil {
+				continue
+			}
+			conn.Write(ack)
+			ts.lastResponse = time.Now()
 		case MsgReport:
 			// Server stats received
 		}
@@ -869,30 +913,58 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 	connection, exists := ts.connections[msg.SrcAgent]
 	if !exists {
 		connection = &AgentConnection{
-			AgentID:   msg.SrcAgent,
-			Addr:      addr,
-			FirstSeen: time.Now(),
+			AgentID:        msg.SrcAgent,
+			Addr:           addr,
+			FirstSeen:      time.Now(),
+			LastReportTime: time.Now(),
 		}
 		ts.connections[msg.SrcAgent] = connection
 		log.Printf("[trafficsim] New connection from agent %d at %s", msg.SrcAgent, addr.String())
+
+		// Initialize reverse cycle if bidirectional mode is enabled
+		if ts.IsBidirectional() {
+			connection.ReverseCycle = &CycleTracker{
+				StartSeq:     1,
+				StartTime:    time.Now(),
+				PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+				PacketTimes:  make(map[int]PacketTime),
+				receivedSeqs: make(map[int]int),
+			}
+			log.Printf("[trafficsim] Initialized reverse cycle for agent %d", msg.SrcAgent)
+		}
 	}
 	connection.LastSeen = time.Now()
 	connection.PacketsRecv++
 	ts.connectionsMu.Unlock()
 
-	// Build ACK
-	ack, err := ts.buildAckMessage(msg.Data)
-	if err != nil {
-		return
-	}
+	// Handle different message types
+	switch msg.Type {
+	case MsgData, MsgHello:
+		// Client sent data, send ACK back
+		ack, err := ts.buildAckMessage(msg.Data)
+		if err != nil {
+			return
+		}
 
-	if _, err := conn.WriteToUDP(ack, addr); err != nil {
-		log.Printf("[trafficsim] Failed to send ACK: %v", err)
-	}
+		if _, err := conn.WriteToUDP(ack, addr); err != nil {
+			log.Printf("[trafficsim] Failed to send ACK: %v", err)
+		}
 
-	ts.connectionsMu.Lock()
-	connection.PacketsSent++
-	ts.connectionsMu.Unlock()
+		ts.connectionsMu.Lock()
+		connection.PacketsSent++
+		ts.connectionsMu.Unlock()
+
+		// If bidirectional, also send test data back to client
+		if ts.IsBidirectional() && connection.ReverseCycle != nil {
+			ts.sendReverseDataPacket(conn, addr, connection)
+		}
+
+	case MsgAck:
+		// Client ACK'd our reverse data packet - record the response time
+		if ts.IsBidirectional() && connection.ReverseCycle != nil {
+			ts.handleReverseAck(connection, msg.Data)
+		}
+	}
 }
 
 func (ts *TrafficSim) buildAckMessage(data TrafficSimData) ([]byte, error) {
@@ -908,6 +980,118 @@ func (ts *TrafficSim) buildAckMessage(data TrafficSimData) ([]byte, error) {
 	}
 
 	return json.Marshal(ack)
+}
+
+// sendReverseDataPacket sends a test data packet from server to client for bidirectional measurement
+func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr, connection *AgentConnection) {
+	connection.ReverseSequence++
+	seq := connection.ReverseSequence
+	sentTime := time.Now().UnixMilli()
+
+	// Track in reverse cycle
+	connection.ReverseCycle.mu.Lock()
+	connection.ReverseCycle.PacketSeqs = append(connection.ReverseCycle.PacketSeqs, seq)
+	connection.ReverseCycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	connection.ReverseCycle.mu.Unlock()
+
+	// Build DATA message
+	msg := TrafficSimMsg{
+		Type: MsgData,
+		Data: TrafficSimData{
+			Sent: sentTime,
+			Seq:  seq,
+		},
+		SrcAgent:  ts.ThisAgent,
+		DstAgent:  connection.AgentID,
+		Timestamp: sentTime,
+	}
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("[trafficsim] Error building reverse DATA: %v", err)
+		return
+	}
+
+	if _, err := conn.WriteToUDP(msgBytes, addr); err != nil {
+		log.Printf("[trafficsim] Failed to send reverse DATA to agent %d: %v", connection.AgentID, err)
+	}
+
+	connection.PacketsSent++
+
+	// Check if cycle is complete
+	if len(connection.ReverseCycle.PacketSeqs) >= TrafficSimReportSeq {
+		// Report stats and start new cycle
+		go ts.reportReverseStats(connection)
+	}
+}
+
+// handleReverseAck processes ACK from client for server's reverse DATA packet
+func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data TrafficSimData) {
+	seq := data.Seq
+	recvTime := time.Now().UnixMilli()
+
+	connection.ReverseCycle.mu.Lock()
+	defer connection.ReverseCycle.mu.Unlock()
+
+	// Track duplicate/out-of-order
+	connection.ReverseCycle.receivedSeqs[seq]++
+	receiveCount := connection.ReverseCycle.receivedSeqs[seq]
+
+	if receiveCount > 1 {
+		connection.ReverseCycle.duplicates++
+	} else if connection.ReverseCycle.lastReceivedSeq > 0 && seq < connection.ReverseCycle.lastReceivedSeq {
+		connection.ReverseCycle.outOfOrder++
+	}
+	connection.ReverseCycle.lastReceivedSeq = seq
+
+	// Update packet timing
+	if pt, ok := connection.ReverseCycle.PacketTimes[seq]; ok && pt.Received == 0 {
+		pt.Received = recvTime
+		connection.ReverseCycle.PacketTimes[seq] = pt
+	}
+}
+
+// reportReverseStats calculates and reports stats for reverse direction
+func (ts *TrafficSim) reportReverseStats(connection *AgentConnection) {
+	if ts.DataChan == nil || !ts.isRunning() {
+		return
+	}
+
+	// Calculate stats using the same method as client
+	stats := ts.calculateStats(connection.ReverseCycle)
+
+	payload, err := json.Marshal(stats)
+	if err != nil {
+		log.Printf("[trafficsim] Error marshaling reverse stats: %v", err)
+		return
+	}
+
+	// Report with reverse probe ID
+	select {
+	case ts.DataChan <- ProbeData{
+		ProbeID:     ts.ReverseProbeID,
+		Triggered:   false,
+		CreatedAt:   time.Now(),
+		Type:        ProbeType_TRAFFICSIM,
+		Payload:     payload,
+		Target:      connection.Addr.String(),
+		TargetAgent: connection.AgentID,
+	}:
+		log.Printf("[trafficsim] Reported reverse stats for agent %d: loss=%.1f%%, avgRTT=%.1fms",
+			connection.AgentID, stats["lossPercentage"], stats["averageRTT"])
+	default:
+		log.Printf("[trafficsim] DataChan full, dropping reverse stats")
+	}
+
+	// Reset cycle for next round
+	connection.ReverseCycle = &CycleTracker{
+		StartSeq:     connection.ReverseSequence + 1,
+		StartTime:    time.Now(),
+		PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+		PacketTimes:  make(map[int]PacketTime),
+		receivedSeqs: make(map[int]int),
+	}
+	connection.LastReportTime = time.Now()
 }
 
 // -------------------- Stop --------------------
