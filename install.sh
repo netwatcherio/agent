@@ -52,16 +52,17 @@ show_usage() {
     cat << EOF
 NetWatcher Agent Installation Script
 
-Usage: $0 --id <AGENT_ID> --pin <AGENT_PIN> [OPTIONS]
+Usage: $0 --workspace <WORKSPACE_ID> --id <AGENT_ID> --pin <AGENT_PIN> [OPTIONS]
        $0 --uninstall [--force] [--install-dir <DIR>]
 
 Required Arguments (for installation):
-    --id, -i <AGENT_ID>     Agent ID (MongoDB ObjectID format)
-    --pin, -p <AGENT_PIN>   Agent PIN
+    --workspace, -w <WORKSPACE_ID>  Workspace ID
+    --id, -i <AGENT_ID>             Agent ID
+    --pin, -p <AGENT_PIN>           Agent PIN
 
 Optional Arguments:
-    --host <HOST>           API host (default: $DEFAULT_HOST)
-    --host-ws <HOST_WS>     WebSocket host (default: $DEFAULT_HOST_WS)
+    --host <HOST>           Controller host (default: api.netwatcher.io)
+    --ssl <true|false>      Use SSL/HTTPS (default: true)
     --install-dir <DIR>     Installation directory (default: $INSTALL_DIR)
     --force                 Force reinstallation or skip uninstall confirmation
     --no-service            Skip systemd service creation
@@ -72,15 +73,15 @@ Optional Arguments:
     --help, -h              Show this help message
 
 Examples:
-    # Basic installation
-    $0 --id 686c6d4298d36e8a13fb7ee6 --pin 036977322
+    # Basic installation with netwatcher.io (default)
+    $0 --workspace 1 --id 42 --pin 123456789
 
     # Custom host configuration
-    $0 --id 686c6d4298d36e8a13fb7ee6 --pin 036977322 \\
-       --host https://api.netwatcher.io --host-ws wss://api.netwatcher.io/agent_ws
+    $0 --workspace 1 --id 42 --pin 123456789 \\
+       --host myserver.com --ssl true
 
     # Install to custom directory
-    $0 --id 686c6d4298d36e8a13fb7ee6 --pin 036977322 --install-dir /usr/local/netwatcher
+    $0 --workspace 1 --id 42 --pin 123456789 --install-dir /usr/local/netwatcher
 
     # Uninstall the agent
     $0 --uninstall
@@ -95,6 +96,10 @@ EOF
 parse_arguments() {
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --workspace|-w)
+                WORKSPACE_ID="$2"
+                shift 2
+                ;;
             --id|-i)
                 AGENT_ID="$2"
                 shift 2
@@ -104,11 +109,11 @@ parse_arguments() {
                 shift 2
                 ;;
             --host)
-                HOST="$2"
+                CONTROLLER_HOST="$2"
                 shift 2
                 ;;
-            --host-ws)
-                HOST_WS="$2"
+            --ssl)
+                CONTROLLER_SSL="$2"
                 shift 2
                 ;;
             --install-dir)
@@ -152,8 +157,8 @@ parse_arguments() {
     done
 
     # Set defaults if not provided
-    HOST=${HOST:-$DEFAULT_HOST}
-    HOST_WS=${HOST_WS:-$DEFAULT_HOST_WS}
+    CONTROLLER_HOST=${CONTROLLER_HOST:-"api.netwatcher.io"}
+    CONTROLLER_SSL=${CONTROLLER_SSL:-"true"}
     FORCE_INSTALL=${FORCE_INSTALL:-false}
     NO_SERVICE=${NO_SERVICE:-false}
     NO_START=${NO_START:-false}
@@ -163,6 +168,12 @@ parse_arguments() {
 
 # Validate required arguments
 validate_arguments() {
+    if [[ -z "$WORKSPACE_ID" ]]; then
+        log_error "Workspace ID is required. Use --workspace or -w to specify it."
+        show_usage
+        exit 1
+    fi
+
     if [[ -z "$AGENT_ID" ]]; then
         log_error "Agent ID is required. Use --id or -i to specify it."
         show_usage
@@ -172,12 +183,6 @@ validate_arguments() {
     if [[ -z "$AGENT_PIN" ]]; then
         log_error "Agent PIN is required. Use --pin or -p to specify it."
         show_usage
-        exit 1
-    fi
-
-    # Validate Agent ID format (MongoDB ObjectID - 24 hex characters)
-    if [[ ! "$AGENT_ID" =~ ^[0-9a-fA-F]{24}$ ]]; then
-        log_error "Invalid Agent ID format. Expected 24 hexadecimal characters."
         exit 1
     fi
 
@@ -515,10 +520,11 @@ create_config() {
 
     cat > "$config_path" << EOF
 # NetWatcher Agent Configuration
-HOST=$HOST
-HOST_WS=$HOST_WS
-ID=$AGENT_ID
-PIN=$AGENT_PIN
+CONTROLLER_HOST=$CONTROLLER_HOST
+CONTROLLER_SSL=$CONTROLLER_SSL
+WORKSPACE_ID=$WORKSPACE_ID
+AGENT_ID=$AGENT_ID
+AGENT_PIN=$AGENT_PIN
 EOF
 
     # Set appropriate permissions

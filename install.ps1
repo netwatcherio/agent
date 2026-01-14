@@ -7,17 +7,20 @@
     Downloads, installs, and configures the NetWatcher Agent as a Windows Service.
     Supports both installation and uninstallation operations.
 
+.PARAMETER Workspace
+    Workspace ID
+
 .PARAMETER Id
-    Agent ID (MongoDB ObjectID format - 24 hexadecimal characters)
+    Agent ID
 
 .PARAMETER Pin
     Agent PIN (numeric value)
 
 .PARAMETER Host
-    API host (default: https://api.netwatcher.io)
+    Controller host without protocol (default: api.netwatcher.io)
 
-.PARAMETER HostWs
-    WebSocket host (default: wss://api.netwatcher.io/agent_ws)
+.PARAMETER SSL
+    Use SSL/HTTPS (default: true)
 
 .PARAMETER InstallDir
     Installation directory (default: C:\Program Files\NetWatcher-Agent)
@@ -35,10 +38,10 @@
     Uninstall the agent instead of installing
 
 .EXAMPLE
-    .\install.ps1 -Id "686c6d4298d36e8a13fb7ee6" -Pin "036977322"
+    .\install.ps1 -Workspace 1 -Id 42 -Pin "123456789"
 
 .EXAMPLE
-    .\install.ps1 -Id "686c6d4298d36e8a13fb7ee6" -Pin "036977322" -Host "https://myserver.com"
+    .\install.ps1 -Workspace 1 -Id 42 -Pin "123456789" -Host "myserver.com" -SSL $true
 
 .EXAMPLE
     .\install.ps1 -Uninstall
@@ -50,7 +53,9 @@
 [CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
     [Parameter(ParameterSetName = 'Install', Mandatory = $true)]
-    [ValidatePattern('^[0-9a-fA-F]{24}$')]
+    [string]$Workspace,
+
+    [Parameter(ParameterSetName = 'Install', Mandatory = $true)]
     [string]$Id,
 
     [Parameter(ParameterSetName = 'Install', Mandatory = $true)]
@@ -58,10 +63,10 @@ param(
     [string]$Pin,
 
     [Parameter(ParameterSetName = 'Install')]
-    [string]$Host = "https://api.netwatcher.io",
+    [string]$Host = "api.netwatcher.io",
 
     [Parameter(ParameterSetName = 'Install')]
-    [string]$HostWs = "wss://api.netwatcher.io/agent_ws",
+    [bool]$SSL = $true,
 
     [Parameter(ParameterSetName = 'Install')]
     [Parameter(ParameterSetName = 'Uninstall')]
@@ -341,12 +346,14 @@ function Install-Agent {
     $configPath = Join-Path $InstallDir $Script:ConfigFile
     Write-Info "Creating configuration file: $configPath"
 
+    $sslValue = if ($SSL) { "true" } else { "false" }
     $configContent = @"
 # NetWatcher Agent Configuration
-HOST=$Host
-HOST_WS=$HostWs
-ID=$Id
-PIN=$Pin
+CONTROLLER_HOST=$Host
+CONTROLLER_SSL=$sslValue
+WORKSPACE_ID=$Workspace
+AGENT_ID=$Id
+AGENT_PIN=$Pin
 "@
 
     Set-Content -Path $configPath -Value $configContent -Force
