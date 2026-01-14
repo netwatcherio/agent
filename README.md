@@ -24,7 +24,7 @@ A lightweight network monitoring agent that reports metrics to the NetWatcher pl
 
 ```bash
 # Download and run the installer
-curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/main/install.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install.sh | sudo bash -s -- \
   --workspace YOUR_WORKSPACE_ID \
   --id YOUR_AGENT_ID \
   --pin YOUR_AGENT_PIN
@@ -34,7 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/main/install.sh 
 
 ```powershell
 # Download the installer
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/netwatcherio/agent/main/install.ps1" -OutFile "install.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/netwatcherio/agent/master/install.ps1" -OutFile "install.ps1"
 
 # Run the installer
 .\install.ps1 -Workspace YOUR_WORKSPACE_ID -Id YOUR_AGENT_ID -Pin "YOUR_AGENT_PIN"
@@ -46,7 +46,7 @@ For self-hosted NetWatcher instances:
 
 ```bash
 # Linux/macOS
-curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/main/install.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install.sh | sudo bash -s -- \
   --host your-controller.example.com \
   --ssl true \
   --workspace 1 \
