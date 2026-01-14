@@ -54,6 +54,7 @@ NetWatcher Agent Installation Script
 
 Usage: $0 --workspace <WORKSPACE_ID> --id <AGENT_ID> --pin <AGENT_PIN> [OPTIONS]
        $0 --uninstall [--force] [--install-dir <DIR>]
+       $0 --update [--version <VERSION>] [--install-dir <DIR>]
 
 Required Arguments (for installation):
     --workspace, -w <WORKSPACE_ID>  Workspace ID
@@ -69,6 +70,7 @@ Optional Arguments:
     --no-start              Don't start the service after installation
     --version <VERSION>     Install specific version (default: latest)
     --uninstall             Uninstall the agent instead of installing
+    --update                Update only the binary (keeps config/service)
     --debug                 Enable debug output
     --help, -h              Show this help message
 
@@ -82,6 +84,12 @@ Examples:
 
     # Install to custom directory
     $0 --workspace 1 --id 42 --pin 123456789 --install-dir /usr/local/netwatcher
+
+    # Update binary only (manual recovery from failed auto-update)
+    $0 --update
+
+    # Update to specific version
+    $0 --update --version v20260114-abc123
 
     # Uninstall the agent
     $0 --uninstall
@@ -140,6 +148,10 @@ parse_arguments() {
                 UNINSTALL_MODE=true
                 shift
                 ;;
+            --update)
+                UPDATE_MODE=true
+                shift
+                ;;
             --debug)
                 DEBUG=true
                 shift
@@ -163,6 +175,7 @@ parse_arguments() {
     NO_SERVICE=${NO_SERVICE:-false}
     NO_START=${NO_START:-false}
     UNINSTALL_MODE=${UNINSTALL_MODE:-false}
+    UPDATE_MODE=${UPDATE_MODE:-false}
     DEBUG=${DEBUG:-false}
 }
 
@@ -756,6 +769,83 @@ uninstall_agent() {
     log_success "NetWatcher Agent has been uninstalled"
 }
 
+# Update agent binary only (keeps config and service)
+update_agent() {
+    echo "NetWatcher Agent Binary Update"
+    echo "==============================="
+    echo
+
+    # Check if agent is installed
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        log_error "NetWatcher Agent is not installed at $INSTALL_DIR"
+        log_info "Use the full installation command to install first."
+        exit 1
+    fi
+
+    if [[ ! -f "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
+        log_error "Binary not found at ${INSTALL_DIR}/${BINARY_NAME}"
+        log_info "Use the full installation command to install first."
+        exit 1
+    fi
+
+    # Get current version if possible
+    local current_version=""
+    if [[ -x "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
+        current_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || echo "unknown")
+        log_info "Current version: $current_version"
+    fi
+
+    detect_architecture
+    get_latest_version
+
+    log_info "Updating to version: $VERSION"
+
+    # Stop service if running
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        log_info "Stopping $SERVICE_NAME service..."
+        systemctl stop "$SERVICE_NAME"
+    fi
+
+    # Backup current binary
+    local backup_path="${INSTALL_DIR}/${BINARY_NAME}.backup"
+    log_info "Backing up current binary to: $backup_path"
+    cp "${INSTALL_DIR}/${BINARY_NAME}" "$backup_path"
+
+    # Download and install new binary
+    download_and_install
+
+    # Verify new binary works
+    if [[ -x "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
+        local new_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || echo "unknown")
+        log_success "New version installed: $new_version"
+        
+        # Remove backup
+        rm -f "$backup_path"
+    else
+        log_error "New binary is not executable. Rolling back..."
+        mv "$backup_path" "${INSTALL_DIR}/${BINARY_NAME}"
+        chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+        exit 1
+    fi
+
+    # Start service
+    if [[ -f "$SERVICE_FILE" ]]; then
+        log_info "Starting $SERVICE_NAME service..."
+        systemctl start "$SERVICE_NAME"
+        sleep 2
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            log_success "Service restarted successfully"
+        else
+            log_warning "Service may have failed to start. Check logs with: journalctl -u $SERVICE_NAME"
+        fi
+    fi
+
+    echo
+    log_success "NetWatcher Agent binary updated successfully!"
+    echo "  Old version: $current_version"
+    echo "  New version: $new_version"
+}
+
 # Main execution
 main() {
     echo "NetWatcher Agent Installation Script"
@@ -768,6 +858,13 @@ main() {
     # Handle uninstall mode
     if [[ "$UNINSTALL_MODE" == true ]]; then
         uninstall_agent
+        return
+    fi
+
+    # Handle update mode
+    if [[ "$UPDATE_MODE" == true ]]; then
+        install_dependencies
+        update_agent
         return
     fi
 

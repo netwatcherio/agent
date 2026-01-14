@@ -106,6 +106,69 @@ sudo ./install.sh --uninstall
 .\install.ps1 -Uninstall
 ```
 
+## Troubleshooting
+
+### Failed Auto-Updates
+
+If the agent's auto-update fails (e.g., read-only `/tmp`, network issues), use the install script to manually update:
+
+```bash
+# Linux/macOS - Update binary only (preserves config/service)
+sudo ./install.sh --update
+
+# Update to a specific version
+sudo ./install.sh --update --version v20260114-abc123
+
+# Windows
+.\install.ps1 -Update
+.\install.ps1 -Update -Version "v20260114-abc123"
+```
+
+### Manual Binary Replacement
+
+If the install script isn't available, manually replace the binary:
+
+```bash
+# 1. Stop the service
+sudo systemctl stop netwatcher-agent
+
+# 2. Download the latest release
+# Visit: https://github.com/netwatcherio/agent/releases/latest
+# Download the appropriate file for your platform (e.g., linux-amd64.zip)
+
+# 3. Extract and replace
+cd /opt/netwatcher-agent
+unzip ~/Downloads/netwatcher-*.zip -d /tmp/nw-update
+cp /tmp/nw-update/netwatcher-agent ./netwatcher-agent
+chmod +x ./netwatcher-agent
+
+# 4. Verify and restart
+./netwatcher-agent --version
+sudo systemctl start netwatcher-agent
+```
+
+### Common Issues
+
+| Issue | Solution |
+|-------|----------|
+| Auto-update fails with "read-only file system" | Updated agents create `.tmp` folder locally instead of using `/tmp`. Update manually with `--update` flag. |
+| Service fails to start after update | Check logs: `journalctl -u netwatcher-agent -n 50`. Rollback if needed by restoring `.backup` file. |
+| Agent not connecting to controller | Verify `config.conf` settings, check firewall, ensure controller is reachable. |
+| "Unauthorized" errors | Re-bootstrap with correct PIN or generate new agent credentials in the dashboard. |
+
+### Viewing Logs
+
+```bash
+# Linux - Follow logs live
+sudo journalctl -u netwatcher-agent -f
+
+# Linux - Last 100 lines
+sudo journalctl -u netwatcher-agent -n 100
+
+# Windows
+Get-EventLog -LogName Application -Source NetWatcherAgent -Newest 50
+```
+
 ## Building from Source
 
 ```bash

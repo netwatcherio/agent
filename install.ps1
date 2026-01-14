@@ -37,11 +37,20 @@
 .PARAMETER Uninstall
     Uninstall the agent instead of installing
 
+.PARAMETER Update
+    Update only the binary (keeps config and service)
+
 .EXAMPLE
     .\install.ps1 -Workspace 1 -Id 42 -Pin "123456789"
 
 .EXAMPLE
     .\install.ps1 -Workspace 1 -Id 42 -Pin "123456789" -Host "myserver.com" -SSL $true
+
+.EXAMPLE
+    .\install.ps1 -Update
+
+.EXAMPLE
+    .\install.ps1 -Update -Version "v20260114-abc123"
 
 .EXAMPLE
     .\install.ps1 -Uninstall
@@ -82,7 +91,13 @@ param(
     [switch]$NoStart,
 
     [Parameter(ParameterSetName = 'Uninstall', Mandatory = $true)]
-    [switch]$Uninstall
+    [switch]$Uninstall,
+
+    [Parameter(ParameterSetName = 'Update', Mandatory = $true)]
+    [switch]$Update,
+
+    [Parameter(ParameterSetName = 'Update')]
+    [string]$UpdateVersion
 )
 
 # ============================================================================
@@ -511,6 +526,153 @@ function Uninstall-Agent {
 }
 
 # ============================================================================
+# Update Function
+# ============================================================================
+
+function Update-Agent {
+    Write-Host ""
+    Write-Host "NetWatcher Agent Binary Update" -ForegroundColor Cyan
+    Write-Host "===============================" -ForegroundColor Cyan
+    Write-Host ""
+
+    $binaryPath = Join-Path $InstallDir $Script:BinaryName
+
+    # Check if agent is installed
+    if (-not (Test-Path $InstallDir)) {
+        Write-Error "NetWatcher Agent is not installed at $InstallDir"
+        Write-Info "Use the full installation command to install first."
+        exit 1
+    }
+
+    if (-not (Test-Path $binaryPath)) {
+        Write-Error "Binary not found at $binaryPath"
+        Write-Info "Use the full installation command to install first."
+        exit 1
+    }
+
+    # Get current version
+    $currentVersion = "unknown"
+    try {
+        $currentVersion = & $binaryPath --version 2>$null
+    }
+    catch { }
+    Write-Info "Current version: $currentVersion"
+
+    # Detect architecture
+    $arch = Get-SystemArchitecture
+    Write-Info "Detected architecture: windows-$arch"
+
+    # Get version to install
+    $versionToInstall = $UpdateVersion
+    if (-not $versionToInstall) {
+        Write-Info "Fetching latest release information..."
+        $versionToInstall = Get-LatestVersion -Repo $Script:GitHubRepo
+    }
+    Write-Info "Updating to version: $versionToInstall"
+
+    # Stop service if running
+    Stop-AgentService
+
+    # Backup current binary
+    $backupPath = "$binaryPath.backup"
+    Write-Info "Backing up current binary to: $backupPath"
+    Copy-Item -Path $binaryPath -Destination $backupPath -Force
+
+    # Get release assets
+    Write-Info "Fetching release assets..."
+    $assets = Get-ReleaseAssets -Repo $Script:GitHubRepo -Version $versionToInstall
+    
+    if ($assets.Count -eq 0) {
+        Write-Error "No assets found for version $versionToInstall"
+        exit 1
+    }
+
+    # Find matching asset
+    $asset = Find-MatchingAsset -Assets $assets -Architecture $arch
+    
+    if (-not $asset) {
+        Write-Error "No suitable asset found for windows-$arch"
+        exit 1
+    }
+
+    Write-Info "Selected asset: $($asset.name)"
+
+    # Download the release
+    $tempFile = Join-Path $env:TEMP "netwatcher-update.tmp"
+    $downloadUrl = $asset.browser_download_url
+    
+    Write-Info "Downloading from: $downloadUrl"
+    
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempFile -UseBasicParsing
+    }
+    catch {
+        Write-Error "Failed to download: $_"
+        Write-Info "Rolling back..."
+        Move-Item -Path $backupPath -Destination $binaryPath -Force
+        exit 1
+    }
+
+    # Extract or copy based on file type
+    if ($asset.name -match '\.zip$') {
+        Write-Info "Extracting zip archive..."
+        $tempExtract = Join-Path $env:TEMP "netwatcher-extract"
+        if (Test-Path $tempExtract) { Remove-Item -Path $tempExtract -Recurse -Force }
+        Expand-Archive -Path $tempFile -DestinationPath $tempExtract -Force
+        
+        # Find the binary
+        $extractedExe = Get-ChildItem -Path $tempExtract -Filter "*.exe" -Recurse | Select-Object -First 1
+        if ($extractedExe) {
+            Copy-Item -Path $extractedExe.FullName -Destination $binaryPath -Force
+        }
+        Remove-Item -Path $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        Copy-Item -Path $tempFile -Destination $binaryPath -Force
+    }
+
+    # Clean up temp file
+    Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
+
+    # Verify new binary works
+    $newVersion = "unknown"
+    try {
+        $newVersion = & $binaryPath --version 2>$null
+        Write-Success "New version installed: $newVersion"
+        
+        # Remove backup
+        Remove-Item -Path $backupPath -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Error "New binary is not working. Rolling back..."
+        Move-Item -Path $backupPath -Destination $binaryPath -Force
+        exit 1
+    }
+
+    # Start service
+    if (Test-ServiceExists -Name $Script:ServiceName) {
+        Write-Info "Starting $($Script:ServiceDisplayName) service..."
+        Start-Service -Name $Script:ServiceName
+        Start-Sleep -Seconds 2
+        
+        $service = Get-Service -Name $Script:ServiceName
+        if ($service.Status -eq 'Running') {
+            Write-Success "Service restarted successfully"
+        }
+        else {
+            Write-Warning "Service status: $($service.Status)"
+            Write-Info "Check logs with: Get-EventLog -LogName Application -Source $Script:ServiceName"
+        }
+    }
+
+    Write-Host ""
+    Write-Success "NetWatcher Agent binary updated successfully!"
+    Write-Host "  Old version: $currentVersion"
+    Write-Host "  New version: $newVersion"
+}
+
+# ============================================================================
 # Main Execution
 # ============================================================================
 
@@ -525,6 +687,9 @@ if (-not $isAdmin) {
 # Execute based on parameter set
 if ($Uninstall) {
     Uninstall-Agent
+}
+elseif ($Update) {
+    Update-Agent
 }
 else {
     Install-Agent

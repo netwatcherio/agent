@@ -300,7 +300,7 @@ func (ts *TrafficSim) reconnectUDP() error {
 		return err
 	}
 
-	log.Printf("[trafficsim] Reconnected to %s:%d", ts.IPAddress, ts.Port)
+	log.Debugf("[trafficsim] Reconnected to %s:%d", ts.IPAddress, ts.Port)
 	return nil
 }
 
@@ -393,7 +393,7 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 		return fmt.Errorf("handshake failed")
 	}
 
-	log.Printf("[trafficsim] Connected to %s:%d", ts.IPAddress, ts.Port)
+	log.Debugf("[trafficsim] Connected to %s:%d", ts.IPAddress, ts.Port)
 
 	// Start receive loop
 	ts.wg.Add(1)
@@ -464,7 +464,7 @@ func (ts *TrafficSim) handshake() bool {
 	}
 
 	if resp.Type == MsgAck || resp.Type == MsgHello {
-		log.Printf("[trafficsim] Handshake successful, RTT: %dms", time.Now().UnixMilli()-sentTime)
+		log.Debugf("[trafficsim] Handshake successful, RTT: %dms", time.Now().UnixMilli()-sentTime)
 		ts.lastResponse = time.Now()
 		return true
 	}
@@ -477,7 +477,7 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 		// Start new cycle
 		cycle := ts.startCycle()
 
-		log.Printf("[trafficsim] Starting cycle, %d packets", TrafficSimReportSeq)
+		log.Debugf("[trafficsim] Starting cycle, %d packets", TrafficSimReportSeq)
 
 		// Send packets
 		for i := 0; i < TrafficSimReportSeq && ts.isRunning() && !ts.isStopping(); i++ {
@@ -524,8 +524,8 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 			ts.triggerMTR(mtrProbe, loss)
 		}
 
-		log.Printf("[trafficsim] Cycle complete: loss=%.1f%%, avgRTT=%.1fms",
-			stats["lossPercentage"], stats["averageRTT"])
+		log.Infof("[trafficsim] probe=%d loss=%.1f%% avgRTT=%.1fms minRTT=%vms maxRTT=%vms",
+			ts.Probe.ID, stats["lossPercentage"], stats["averageRTT"], stats["minRTT"], stats["maxRTT"])
 	}
 }
 
@@ -856,7 +856,7 @@ func (ts *TrafficSim) runServer() error {
 	ts.setConn(conn)
 	defer conn.Close()
 
-	log.Printf("[trafficsim] Server listening on %s", listenAddr)
+	log.Debugf("[trafficsim] Server listening on %s", listenAddr)
 
 	for ts.isRunning() && !ts.isStopping() {
 		select {
@@ -919,7 +919,7 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 			LastReportTime: time.Now(),
 		}
 		ts.connections[msg.SrcAgent] = connection
-		log.Printf("[trafficsim] New connection from agent %d at %s", msg.SrcAgent, addr.String())
+		log.Debugf("[trafficsim] New connection from agent %d at %s", msg.SrcAgent, addr.String())
 
 		// Initialize reverse cycle if bidirectional mode is enabled
 		if ts.IsBidirectional() {
@@ -930,7 +930,7 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 				PacketTimes:  make(map[int]PacketTime),
 				receivedSeqs: make(map[int]int),
 			}
-			log.Printf("[trafficsim] Initialized reverse cycle for agent %d", msg.SrcAgent)
+			log.Debugf("[trafficsim] Initialized reverse cycle for agent %d", msg.SrcAgent)
 		}
 	}
 	connection.LastSeen = time.Now()
@@ -1077,8 +1077,8 @@ func (ts *TrafficSim) reportReverseStats(connection *AgentConnection) {
 		Target:      connection.Addr.String(),
 		TargetAgent: connection.AgentID,
 	}:
-		log.Printf("[trafficsim] Reported reverse stats for agent %d: loss=%.1f%%, avgRTT=%.1fms",
-			connection.AgentID, stats["lossPercentage"], stats["averageRTT"])
+		log.Infof("[trafficsim] probe=%d (reverse) agent=%d loss=%.1f%% avgRTT=%.1fms",
+			ts.ReverseProbeID, connection.AgentID, stats["lossPercentage"], stats["averageRTT"])
 	default:
 		log.Printf("[trafficsim] DataChan full, dropping reverse stats")
 	}
