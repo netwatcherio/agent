@@ -648,13 +648,10 @@ func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, t
 		log.Debugf("[trafficsim] No matching MTR probe found: %v", err)
 	}
 
-	// For server mode, look for reverse probes to enable bidirectional testing
-	if probe.Server {
-		reverseProbeID := findReverseTrafficSimProbe(probe)
-		if reverseProbeID != 0 {
-			ts.SetReverseProbe(reverseProbeID)
-			log.Debugf("[trafficsim] Server probe %d enabled bidirectional mode with reverse probe %d", probe.ID, reverseProbeID)
-		}
+	// For server mode, enable bidirectional if ReverseProbeID is set by controller
+	if probe.Server && probe.ReverseProbeID != nil && *probe.ReverseProbeID != 0 {
+		ts.SetReverseProbe(*probe.ReverseProbeID)
+		log.Infof("[trafficsim] Server probe %d enabled bidirectional mode with reverse probe %d", probe.ID, *probe.ReverseProbeID)
 	}
 
 	log.Debugf("[trafficsim] Starting probe %d (server=%v, target=%s:%d)",
@@ -667,37 +664,6 @@ func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, t
 	<-stopChan
 	log.Infof("[trafficsim] Stopping probe %d", probe.ID)
 	ts.Stop()
-}
-
-// findReverseTrafficSimProbe finds a TrafficSim client probe that targets our server agent
-// Returns the probe ID if found, 0 otherwise
-func findReverseTrafficSimProbe(serverProbe probes.Probe) uint {
-	var reverseProbeID uint
-
-	checkWorkers.Range(func(key, value interface{}) bool {
-		probeWorker, ok := value.(ProbeWorkerS)
-		if !ok {
-			return true
-		}
-
-		// Skip if not a TrafficSim or if it's another server
-		if probeWorker.Probe.Type != probes.ProbeType_TRAFFICSIM || probeWorker.Probe.Server {
-			return true
-		}
-
-		// Check if this client probe targets our server's agent
-		for _, target := range probeWorker.Probe.Targets {
-			if target.AgentID != nil && *target.AgentID == serverProbe.AgentID {
-				// Found a client probe targeting this server's agent
-				reverseProbeID = probeWorker.Probe.ID
-				log.Debugf("[trafficsim] Found reverse probe %d targeting agent %d", reverseProbeID, serverProbe.AgentID)
-				return false // Stop searching
-			}
-		}
-		return true
-	})
-
-	return reverseProbeID
 }
 
 /*func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int, stopChan chan struct{}) {
@@ -956,6 +922,13 @@ func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		ProbeID: probe.ID,
 		Data:    data,
 	}*/
+
+	// Sleep for interval before next run to prevent tight loop
+	interval := probe.IntervalSec
+	if interval < 60 {
+		interval = 300 // Default 5 minutes for speedtest
+	}
+	time.Sleep(time.Duration(interval) * time.Second)
 }
 
 func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
@@ -972,6 +945,9 @@ func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeD
 	}
 
 	time.Sleep(12 * time.Hour)*/
+
+	// Sleep to prevent tight loop when function is disabled
+	time.Sleep(1 * time.Hour)
 }
 
 func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {

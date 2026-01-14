@@ -459,6 +459,12 @@ download_and_install() {
     # Extract or copy based on file type
     local binary_path="${INSTALL_DIR}/${BINARY_NAME}"
 
+    # For updates, remove the old binary first so we can find the new one
+    if [[ "$UPDATE_MODE" == true ]] && [[ -f "$binary_path" ]]; then
+        # Binary is already backed up, remove it so we can find the new one
+        rm -f "$binary_path"
+    fi
+
     if [[ "$asset_name" == *.tar.gz ]]; then
         log_info "Extracting tar.gz archive..."
         tar -xzf "$temp_file" -C "$INSTALL_DIR"
@@ -473,37 +479,32 @@ download_and_install() {
     # Find the actual binary - it might be named differently
     local found_binary=""
 
-    # First, check if binary exists at expected location
-    if [[ -f "$binary_path" ]]; then
+    # Search for executable files that might be the agent
+    log_debug "Searching for binary in $INSTALL_DIR..."
+
+    # Look for common variations of the binary name (excluding backup)
+    for name in "netwatcher-agent" "netwatcher" "agent"; do
+        local candidate=$(find "$INSTALL_DIR" -name "$name" -type f 2>/dev/null | grep -v '\.backup$' | head -1)
+        if [[ -n "$candidate" ]]; then
+            found_binary="$candidate"
+            log_debug "Found binary: $candidate"
+            break
+        fi
+    done
+
+    # If still not found, look for any file containing "netwatcher" that's not a backup
+    if [[ -z "$found_binary" ]]; then
+        found_binary=$(find "$INSTALL_DIR" -type f -name "*netwatcher*" 2>/dev/null | grep -v '\.backup$' | grep -v '\.conf$' | grep -v '\.json$' | head -1)
+        if [[ -n "$found_binary" ]]; then
+            log_debug "Found netwatcher file: $found_binary"
+        fi
+    fi
+
+    # Move the found binary to expected location if different
+    if [[ -n "$found_binary" ]] && [[ "$found_binary" != "$binary_path" ]]; then
+        log_info "Moving $found_binary to $binary_path"
+        mv "$found_binary" "$binary_path"
         found_binary="$binary_path"
-    else
-        # Search for executable files that might be the agent
-        log_debug "Searching for binary in $INSTALL_DIR..."
-
-        # Look for common variations of the binary name
-        for name in "netwatcher-agent" "netwatcher" "agent" "netwatcher-*"; do
-            local candidate=$(find "$INSTALL_DIR" -name "$name" -type f -executable 2>/dev/null | head -1)
-            if [[ -n "$candidate" ]]; then
-                found_binary="$candidate"
-                log_debug "Found binary: $candidate"
-                break
-            fi
-        done
-
-        # If still not found, look for any executable file
-        if [[ -z "$found_binary" ]]; then
-            found_binary=$(find "$INSTALL_DIR" -type f -executable 2>/dev/null | grep -v '\.sh$' | head -1)
-            if [[ -n "$found_binary" ]]; then
-                log_debug "Found executable: $found_binary"
-            fi
-        fi
-
-        # Move the found binary to expected location if different
-        if [[ -n "$found_binary" ]] && [[ "$found_binary" != "$binary_path" ]]; then
-            log_debug "Moving $found_binary to $binary_path"
-            mv "$found_binary" "$binary_path"
-            found_binary="$binary_path"
-        fi
     fi
 
     # Make binary executable

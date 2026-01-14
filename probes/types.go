@@ -22,8 +22,10 @@ type Probe struct {
 	} `json:"labels"`
 	Metadata struct {
 	} `json:"metadata"`
-	Targets      []ProbeTarget `json:"targets"`
-	ProbeProcess int
+	// For bidirectional TrafficSim: the probe ID to use when reporting reverse direction stats
+	ReverseProbeID *uint         `json:"reverse_probe_id,omitempty"`
+	Targets        []ProbeTarget `json:"targets"`
+	ProbeProcess   int
 }
 
 type ProbeTarget struct {
