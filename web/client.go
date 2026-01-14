@@ -284,33 +284,45 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 				return nil
 			},
 			"probe_get": func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Infof("WS: received probe_get: %s", string(msg.Body))
 				var p []probes.Probe
 
 				if err := json.Unmarshal(msg.Body, &p); err != nil {
+					log.Warnf("WS: probe_get unmarshal error: %v", err)
 					return err
 				}
+
+				if len(p) > 0 {
+					// Log summary instead of full JSON
+					typeCounts := make(map[string]int)
+					for _, probe := range p {
+						typeCounts[string(probe.Type)]++
+					}
+					log.Infof("WS: received %d probes: %v", len(p), typeCounts)
+				} else {
+					log.Debugf("WS: received empty probe list")
+				}
+
 				c.ProbeGetCh <- p
 				return nil
 			},
 			"speedtest_servers_ok": func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Infof("WS: speedtest_servers acknowledged: %s", string(msg.Body))
+				log.Debugf("WS: speedtest_servers acknowledged")
 				return nil
 			},
 			"speedtest_queue": func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Infof("WS: received speedtest_queue: %s", string(msg.Body))
 				var items []probes.SpeedtestQueueItem
 				if err := json.Unmarshal(msg.Body, &items); err != nil {
 					log.Errorf("WS: failed to unmarshal speedtest_queue: %v", err)
 					return err
 				}
+				log.Infof("WS: received %d speedtest queue items", len(items))
 				if c.SpeedtestQueueCh != nil {
 					c.SpeedtestQueueCh <- items
 				}
 				return nil
 			},
 			"speedtest_result_ok": func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Infof("WS: speedtest_result acknowledged: %s", string(msg.Body))
+				log.Debugf("WS: speedtest_result acknowledged")
 				return nil
 			},
 		},

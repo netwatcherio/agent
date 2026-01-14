@@ -374,7 +374,7 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 
 				if !exists {
 					// New probe - create worker
-					log.Infof("Starting NEW worker for probe %v (type: %s)", probe.ID, probe.Type)
+					log.Debugf("Starting NEW worker for probe %v (type: %s)", probe.ID, probe.Type)
 
 					ctx, cancel := context.WithCancel(context.Background())
 					stopChan := make(chan struct{})
@@ -428,7 +428,7 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 							}
 
 							checkWorkers.Store(probeKey, newWorker)
-							log.Infof("Starting UPDATED worker for probe %v (type: %s)", probe.ID, probe.Type)
+							log.Debugf("Starting UPDATED worker for probe %v (type: %s)", probe.ID, probe.Type)
 							startCheckWorker(probe, probeDataChan, thisAgent)
 						} else {
 							// Update probe data without restart
@@ -653,11 +653,11 @@ func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, t
 		reverseProbeID := findReverseTrafficSimProbe(probe)
 		if reverseProbeID != 0 {
 			ts.SetReverseProbe(reverseProbeID)
-			log.Infof("[trafficsim] Server probe %d enabled bidirectional mode with reverse probe %d", probe.ID, reverseProbeID)
+			log.Debugf("[trafficsim] Server probe %d enabled bidirectional mode with reverse probe %d", probe.ID, reverseProbeID)
 		}
 	}
 
-	log.Infof("[trafficsim] Starting probe %d (server=%v, target=%s:%d)",
+	log.Debugf("[trafficsim] Starting probe %d (server=%v, target=%s:%d)",
 		probe.ID, probe.Server, ts.IPAddress, ts.Port)
 
 	// Start TrafficSim in goroutine
