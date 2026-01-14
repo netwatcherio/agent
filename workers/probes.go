@@ -27,6 +27,23 @@ type ProbeWorkerS struct {
 	CancelFunc context.CancelFunc
 }
 
+// currentProbeList stores the current list of probes for this agent
+// Used by TrafficSim servers to detect bidirectional mode for connected clients
+var currentProbeList []probes.Probe
+var currentProbeListMu sync.RWMutex
+
+func getCurrentProbes() []probes.Probe {
+	currentProbeListMu.RLock()
+	defer currentProbeListMu.RUnlock()
+	return currentProbeList
+}
+
+func setCurrentProbes(probes []probes.Probe) {
+	currentProbeListMu.Lock()
+	defer currentProbeListMu.Unlock()
+	currentProbeList = probes
+}
+
 func makeProbeKey(probe probes.Probe) string {
 	// For TrafficSim servers, we want to treat allowed agent changes as updates, not new probes
 	// So we'll exclude the allowed agents from the key for server probes
@@ -366,6 +383,9 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 		for {
 			p := <-aC
 
+			// Store current probes for bidirectional TrafficSim detection
+			setCurrentProbes(p)
+
 			var newKeys []string
 
 			for _, probe := range p {
@@ -602,7 +622,7 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 				// Handle different probe types
 				switch probe.Type {
 				case probes.ProbeType_TRAFFICSIM:
-					handleTrafficSimProbe(probe, dC, thisAgent, worker.Ctx, worker.StopChan)
+					handleTrafficSimProbe(probe, getCurrentProbes(), dC, thisAgent, worker.Ctx, worker.StopChan)
 					return // TrafficSim runs continuously
 
 				case probes.ProbeType_SYSTEMINFO:
@@ -637,7 +657,7 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 	}(probe, dataChan)
 }
 
-func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID, ctx context.Context, stopChan chan struct{}) {
+func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID, ctx context.Context, stopChan chan struct{}) {
 	// Create new TrafficSim instance
 	ts := probes.NewTrafficSim(&probe, dataChan)
 	ts.ThisAgent = probe.AgentID // Use the agent ID from the probe
@@ -648,10 +668,11 @@ func handleTrafficSimProbe(probe probes.Probe, dataChan chan probes.ProbeData, t
 		log.Debugf("[trafficsim] No matching MTR probe found: %v", err)
 	}
 
-	// For server mode, enable bidirectional if ReverseProbeID is set by controller
-	if probe.Server && probe.ReverseProbeID != nil && *probe.ReverseProbeID != 0 {
-		ts.SetReverseProbe(*probe.ReverseProbeID)
-		log.Infof("[trafficsim] Server probe %d enabled bidirectional mode with reverse probe %d", probe.ID, *probe.ReverseProbeID)
+	// For server mode, pass all probes to enable bidirectional detection
+	// The server will check if it has client probes for connected agents
+	if probe.Server {
+		ts.SetAllProbes(allProbes)
+		log.Infof("[trafficsim] Server probe %d loaded %d probes for bidirectional detection", probe.ID, len(allProbes))
 	}
 
 	log.Debugf("[trafficsim] Starting probe %d (server=%v, target=%s:%d)",

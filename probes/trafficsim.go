@@ -133,12 +133,13 @@ type TrafficSim struct {
 	connectionValid   bool
 	connectionValidMu sync.RWMutex
 
-	// Bidirectional mode (server sends test data back to client)
-	ReverseProbeID       uint // ID of reverse probe (B→A) if bidirectional
-	bidirectionalEnabled bool
-	bidirectionalMu      sync.RWMutex
-	reverseSequence      int
-	reverseSequenceMu    sync.Mutex
+	// Bidirectional mode: server sends test data back to connected clients
+	// When a client connects, if this agent has a TRAFFICSIM client probe targeting that agent,
+	// we use the existing connection to measure reverse direction and report with that probe's ID
+	allProbes         []Probe // All probes for this agent to find client probes
+	allProbesMu       sync.RWMutex
+	reverseSequence   int
+	reverseSequenceMu sync.Mutex
 }
 
 // AgentConnection tracks a client connection on server side
@@ -151,6 +152,9 @@ type AgentConnection struct {
 	PacketsSent int
 
 	// Reverse direction tracking (for bidirectional mode)
+	// ClientProbeID is the ID of this agent's TrafficSim client probe targeting the connected agent
+	// Used to report reverse direction stats with the correct probe ID
+	ClientProbeID   uint
 	ReverseCycle    *CycleTracker
 	ReverseSequence int
 	LastReportTime  time.Time
@@ -247,20 +251,34 @@ func (ts *TrafficSim) setConnectionValid(valid bool) {
 	ts.connectionValid = valid
 }
 
-// SetReverseProbe enables bidirectional mode with the specified reverse probe ID
-func (ts *TrafficSim) SetReverseProbe(probeID uint) {
-	ts.bidirectionalMu.Lock()
-	defer ts.bidirectionalMu.Unlock()
-	ts.ReverseProbeID = probeID
-	ts.bidirectionalEnabled = true
-	log.Printf("[trafficsim] Bidirectional mode enabled, reverse probe ID: %d", probeID)
+// SetAllProbes stores all probes for this agent, enabling bidirectional detection
+// When a client connects, the server can check if it has a client probe for that agent
+func (ts *TrafficSim) SetAllProbes(probes []Probe) {
+	ts.allProbesMu.Lock()
+	defer ts.allProbesMu.Unlock()
+	ts.allProbes = probes
+	log.Printf("[trafficsim] Server loaded %d probes for bidirectional detection", len(probes))
 }
 
-// IsBidirectional returns whether bidirectional mode is enabled
-func (ts *TrafficSim) IsBidirectional() bool {
-	ts.bidirectionalMu.RLock()
-	defer ts.bidirectionalMu.RUnlock()
-	return ts.bidirectionalEnabled
+// GetClientProbeForAgent finds a TRAFFICSIM client probe targeting the given agent
+// Returns the probe if found, nil otherwise
+func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
+	ts.allProbesMu.RLock()
+	defer ts.allProbesMu.RUnlock()
+
+	for i := range ts.allProbes {
+		p := &ts.allProbes[i]
+		// Look for TrafficSim client probes (not server)
+		if p.Type == ProbeType_TRAFFICSIM && !p.Server {
+			for _, t := range p.Targets {
+				if t.AgentID != nil && *t.AgentID == targetAgentID {
+					log.Debugf("[trafficsim] Found client probe %d for connected agent %d", p.ID, targetAgentID)
+					return p
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // nextReverseSequence returns the next sequence number for reverse direction
@@ -921,8 +939,9 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		ts.connections[msg.SrcAgent] = connection
 		log.Debugf("[trafficsim] New connection from agent %d at %s", msg.SrcAgent, addr.String())
 
-		// Initialize reverse cycle if bidirectional mode is enabled
-		if ts.IsBidirectional() {
+		// Check if we have a client probe for this connected agent (enables bidirectional mode)
+		if clientProbe := ts.GetClientProbeForAgent(msg.SrcAgent); clientProbe != nil {
+			connection.ClientProbeID = clientProbe.ID
 			connection.ReverseCycle = &CycleTracker{
 				StartSeq:     1,
 				StartTime:    time.Now(),
@@ -930,7 +949,8 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 				PacketTimes:  make(map[int]PacketTime),
 				receivedSeqs: make(map[int]int),
 			}
-			log.Debugf("[trafficsim] Initialized reverse cycle for agent %d", msg.SrcAgent)
+			log.Infof("[trafficsim] Bidirectional mode enabled for agent %d using client probe %d",
+				msg.SrcAgent, clientProbe.ID)
 		}
 	}
 	connection.LastSeen = time.Now()
@@ -954,14 +974,14 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		connection.PacketsSent++
 		ts.connectionsMu.Unlock()
 
-		// If bidirectional, also send test data back to client
-		if ts.IsBidirectional() && connection.ReverseCycle != nil {
+		// If bidirectional (has client probe for this agent), send test data back
+		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
 			ts.sendReverseDataPacket(conn, addr, connection)
 		}
 
 	case MsgAck:
 		// Client ACK'd our reverse data packet - record the response time
-		if ts.IsBidirectional() && connection.ReverseCycle != nil {
+		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
 			ts.handleReverseAck(connection, msg.Data)
 		}
 	}
@@ -1066,10 +1086,10 @@ func (ts *TrafficSim) reportReverseStats(connection *AgentConnection) {
 		return
 	}
 
-	// Report with reverse probe ID
+	// Report with the client probe ID for this connection
 	select {
 	case ts.DataChan <- ProbeData{
-		ProbeID:     ts.ReverseProbeID,
+		ProbeID:     connection.ClientProbeID,
 		Triggered:   false,
 		CreatedAt:   time.Now(),
 		Type:        ProbeType_TRAFFICSIM,
@@ -1078,7 +1098,7 @@ func (ts *TrafficSim) reportReverseStats(connection *AgentConnection) {
 		TargetAgent: connection.AgentID,
 	}:
 		log.Infof("[trafficsim] probe=%d (reverse) agent=%d loss=%.1f%% avgRTT=%.1fms",
-			ts.ReverseProbeID, connection.AgentID, stats["lossPercentage"], stats["averageRTT"])
+			connection.ClientProbeID, connection.AgentID, stats["lossPercentage"], stats["averageRTT"])
 	default:
 		log.Printf("[trafficsim] DataChan full, dropping reverse stats")
 	}
