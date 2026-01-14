@@ -3,15 +3,14 @@ package probes
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/netwatcherio/netwatcher-agent/lib/platform"
 )
 
-type MtrResult struct {
+type MtrPayload struct {
 	StartTimestamp time.Time `json:"start_timestamp"bson:"start_timestamp"`
 	StopTimestamp  time.Time `json:"stop_timestamp"bson:"stop_timestamp"`
 	Report         struct {
@@ -40,7 +39,7 @@ type MtrResult struct {
 	} `json:"report"bson:"report"`
 }
 
-/*type MtrResult struct {
+/*type MtrPayload struct {
 	StartTimestamp time.Time `json:"start_timestamp"bson:"start_timestamp"`
 	StopTimestamp  time.Time `json:"stop_timestamp"bson:"stop_timestamp"`
 	Triggered      bool      `bson:"triggered"json:"triggered"`
@@ -75,8 +74,8 @@ type MtrResult struct {
 }*/
 
 // Mtr run the check for mtr, take input from checkdata for the test, and update the mtrresult object
-func Mtr(cd *Probe, triggered bool) (MtrResult, error) {
-	var mtrResult MtrResult
+func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
+	var mtrResult MtrPayload
 	mtrResult.StartTimestamp = time.Now()
 
 	triggeredCount := 5
@@ -84,31 +83,11 @@ func Mtr(cd *Probe, triggered bool) (MtrResult, error) {
 		triggeredCount = 15
 	}
 
-	trippyPath := filepath.Join(".", "lib")
-	var trippyBinary string
-
-	switch runtime.GOOS {
-	case "windows":
-		if runtime.GOARCH == "amd64" {
-			trippyBinary = "trip.exe"
-		} else {
-			trippyBinary = "trip.exe"
-		}
-	case "darwin":
-		trippyBinary = "trip"
-	case "linux":
-		if runtime.GOARCH == "amd64" {
-			trippyBinary = "trip"
-		} else if runtime.GOARCH == "arm64" {
-			trippyBinary = "trip"
-		} else {
-			return mtrResult, fmt.Errorf("unsupported Linux architecture: %s", runtime.GOARCH)
-		}
-	default:
-		return mtrResult, fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	// Use platform package for binary path resolution
+	if err := platform.CheckSupported(); err != nil {
+		return mtrResult, err
 	}
-
-	trippyPath = filepath.Join(trippyPath, trippyBinary)
+	trippyPath := platform.BinaryPath("trip")
 
 	/*args := []string{
 		"--icmp",
@@ -124,12 +103,18 @@ func Mtr(cd *Probe, triggered bool) (MtrResult, error) {
 	defer cancel()*/
 
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		shellArgs := append([]string{"/c", trippyPath + " --icmp --mode json --multipath-strategy classic --dns-resolve-method cloudflare --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Config.Target[0].Target})
+	if platform.IsWindows() {
+		shellArgs := append([]string{"/c", trippyPath + " " +
+			"--icmp " +
+			"--mode json " +
+			"--multipath-strategy classic" +
+			"--dns-resolve-method cloudflare " +
+			"--report-cycles " + strconv.Itoa(triggeredCount) + " " +
+			"--dns-lookup-as-info " + cd.Targets[0].Target})
 		cmd = exec.CommandContext(context.TODO(), "cmd.exe", shellArgs...)
 	} else {
 		// For Linux and macOS, use /bin/bash
-		shellArgs := append([]string{"-c", trippyPath + " --icmp --mode json --multipath-strategy classic --dns-resolve-method cloudflare --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Config.Target[0].Target})
+		shellArgs := append([]string{"-c", trippyPath + " --icmp --mode json --multipath-strategy classic --dns-resolve-method cloudflare --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Targets[0].Target})
 		cmd = exec.CommandContext(context.TODO(), "/bin/bash", shellArgs...)
 	}
 

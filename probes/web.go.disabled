@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
-	"os"
 	"time"
 )
 
@@ -192,7 +191,7 @@ func WebProbe(ac *Probe, webChan chan ProbeData) error {
 }
 
 func sendWebResult(ac *Probe, webChan chan ProbeData, result WebResult) {
-	reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
+	reportingAgent, err := primitive.ObjectIDFromHex("123")
 	if err != nil {
 		log.Printf("WebProbe: Failed to get reporting agent ID: %v", err)
 		return

@@ -5,14 +5,31 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/joho/godotenv"
 	"os"
 	"runtime"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 const (
-	defaultConfig = "HOST=https://api.netwatcher.io\nHOST_WS=wss://api.netwatcher.io/agent_ws\nID=\nPIN=\n"
+	defaultConfig = `# NetWatcher Agent Configuration
+# See: https://docs.netwatcher.io/agent/configuration
+
+# Controller host (host:port or domain, no protocol needed)
+CONTROLLER_HOST=api.netwatcher.io
+
+# Enable SSL (true = HTTPS/WSS, false = HTTP/WS)
+CONTROLLER_SSL=true
+
+# Agent credentials (provided during agent creation in the panel)
+WORKSPACE_ID=
+AGENT_ID=
+AGENT_PIN=
+
+# Optional: PSK is saved here after initial bootstrap
+# AGENT_PSK=
+`
 )
 
 var (

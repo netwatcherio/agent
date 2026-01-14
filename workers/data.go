@@ -3,19 +3,22 @@ package workers
 import (
 	"encoding/json"
 	"github.com/netwatcherio/netwatcher-agent/probes"
-	"github.com/netwatcherio/netwatcher-agent/ws"
+	"github.com/netwatcherio/netwatcher-agent/web"
 	log "github.com/sirupsen/logrus"
+	"time"
 )
 
-func InitProbeDataWorker(wsH *ws.WebSocketHandler, ch chan probes.ProbeData) {
-	go func(cn *ws.WebSocketHandler, c chan probes.ProbeData) {
+func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
+	go func(cn *web.WSClient, c chan probes.ProbeData) {
 		for p := range ch {
+			p.CreatedAt = time.Now()
 			marshal, err := json.Marshal(p)
 			log.Warn(string(marshal))
 			if err != nil {
 				return
 			}
-			wsH.GetConnection().Emit("probe_post", marshal)
+
+			wsH.WsConn.Emit("probe_post", marshal)
 		}
 	}(wsH, ch)
 }
