@@ -715,7 +715,7 @@ function Update-Agent {
         exit 1
     }
 
-    # Start service
+    # Start service (or create if missing)
     if (Test-ServiceExists -Name $Script:ServiceName) {
         Write-Info "Starting $($Script:ServiceDisplayName) service..."
         Start-Service -Name $Script:ServiceName
@@ -728,6 +728,39 @@ function Update-Agent {
         else {
             Write-Warning "Service status: $($service.Status)"
             Write-Info "Check logs with: Get-EventLog -LogName Application -Source $Script:ServiceName"
+        }
+    }
+    else {
+        # Service doesn't exist - create it
+        Write-Warning "Service not found, creating it..."
+        try {
+            New-Service -Name $Script:ServiceName `
+                -BinaryPathName "`"$binaryPath`" --config `"$(Join-Path $InstallDir 'config.conf')`"" `
+                -DisplayName $Script:ServiceDisplayName `
+                -Description "NetWatcher monitoring agent" `
+                -StartupType Automatic `
+                -ErrorAction Stop
+            
+            Write-Success "Service created"
+            
+            # Configure restart on failure
+            sc.exe failure $Script:ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+            
+            # Start the service
+            Start-Service -Name $Script:ServiceName
+            Start-Sleep -Seconds 2
+            
+            $service = Get-Service -Name $Script:ServiceName
+            if ($service.Status -eq 'Running') {
+                Write-Success "Service started successfully"
+            }
+            else {
+                Write-Warning "Service status: $($service.Status)"
+            }
+        }
+        catch {
+            Write-Error "Failed to create service: $_"
+            Write-Info "You can run the agent manually or reinstall with: .\install.ps1 -Force ..."
         }
     }
 
