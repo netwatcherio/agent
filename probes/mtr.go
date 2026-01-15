@@ -106,19 +106,25 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 
 	var cmd *exec.Cmd
 	if platform.IsWindows() {
-		// Quote the path to handle spaces in "Program Files"
-		shellArgs := append([]string{"/c", "\"" + trippyPath + "\" " +
-			"--udp " +
-			"--mode json " +
-			"--multipath-strategy paris " +
-			"--dns-resolve-method system " +
-			"--report-cycles " + strconv.Itoa(triggeredCount) + " " +
-			"--dns-lookup-as-info " + cd.Targets[0].Target})
-		cmd = exec.CommandContext(context.TODO(), "cmd.exe", shellArgs...)
+		// Use exec.Command directly - no shell needed, handles paths with spaces correctly
+		cmd = exec.CommandContext(context.TODO(), trippyPath,
+			"--udp",
+			"--mode", "json",
+			"--multipath-strategy", "paris",
+			"--dns-resolve-method", "system",
+			"--report-cycles", strconv.Itoa(triggeredCount),
+			"--dns-lookup-as-info",
+			cd.Targets[0].Target)
 	} else {
-		// For Linux and macOS, use /bin/bash
-		shellArgs := append([]string{"-c", trippyPath + " --udp --mode json --multipath-strategy paris --dns-resolve-method system --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Targets[0].Target})
-		cmd = exec.CommandContext(context.TODO(), "/bin/bash", shellArgs...)
+		// For Linux and macOS, use exec.Command directly as well
+		cmd = exec.CommandContext(context.TODO(), trippyPath,
+			"--udp",
+			"--mode", "json",
+			"--multipath-strategy", "paris",
+			"--dns-resolve-method", "system",
+			"--report-cycles", strconv.Itoa(triggeredCount),
+			"--dns-lookup-as-info",
+			cd.Targets[0].Target)
 	}
 
 	output, err := cmd.CombinedOutput()
