@@ -336,8 +336,8 @@ function Install-Agent {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     }
 
-    # Download the release
-    $tempFile = Join-Path $env:TEMP "netwatcher-download.tmp"
+    # Download the release (use .zip extension for Expand-Archive compatibility)
+    $tempFile = Join-Path $env:TEMP "netwatcher-download.zip"
     $downloadUrl = $asset.browser_download_url
     
     Write-Info "Downloading from: $downloadUrl"
@@ -622,7 +622,7 @@ function Update-Agent {
     Write-Info "Selected asset: $($asset.name)"
 
     # Download the release
-    $tempFile = Join-Path $env:TEMP "netwatcher-update.tmp"
+    $tempFile = Join-Path $env:TEMP "netwatcher-update.zip"
     $downloadUrl = $asset.browser_download_url
     
     Write-Info "Downloading from: $downloadUrl"
