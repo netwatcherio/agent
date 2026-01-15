@@ -668,11 +668,12 @@ func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataCha
 		log.Debugf("[trafficsim] No matching MTR probe found: %v", err)
 	}
 
-	// For server mode, pass all probes to enable bidirectional detection
+	// For server mode, enable dynamic probe retrieval for bidirectional detection
 	// The server will check if it has client probes for connected agents
 	if probe.Server {
 		ts.SetAllProbes(allProbes)
-		log.Infof("[trafficsim] Server probe %d loaded %d probes for bidirectional detection", probe.ID, len(allProbes))
+		ts.GetProbesFunc = getCurrentProbes // Dynamic callback for fresh probe list
+		log.Infof("[trafficsim] Server probe %d loaded %d probes for bidirectional detection (dynamic refresh enabled)", probe.ID, len(allProbes))
 	}
 
 	log.Debugf("[trafficsim] Starting probe %d (server=%v, target=%s:%d)",
