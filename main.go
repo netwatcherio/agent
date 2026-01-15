@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"path/filepath"
 
 	"github.com/netwatcherio/netwatcher-agent/lib/platform"
 	"github.com/netwatcherio/netwatcher-agent/probes"
@@ -118,10 +119,18 @@ func runAgent(ctx context.Context) error {
 
 	cfg := web.LoadConfigFromEnv()
 
+	// Get auth file path relative to executable (not working directory)
+	// This is critical for Windows services which run from System32
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %w", err)
+	}
+	authFilePath := filepath.Join(filepath.Dir(exePath), web.AuthFileName)
+
 	// 1) Login and persist exact JSON
 
 	// Check if the auth file exists
-	if _, err := os.Stat(web.AuthFileName); os.IsNotExist(err) {
+	if _, err := os.Stat(authFilePath); os.IsNotExist(err) {
 		// File does not exist → perform login
 		webCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		loginResp, err := web.DoLogin(webCtx, cfg)
@@ -132,27 +141,27 @@ func runAgent(ctx context.Context) error {
 
 		respJson, _ := json.Marshal(loginResp)
 		if err := web.SaveRawAuthJSON(respJson); err != nil {
-			return fmt.Errorf("failed to save %s: %w", web.AuthFileName, err)
+			return fmt.Errorf("failed to save %s: %w", authFilePath, err)
 		}
-		log.Infof("Saved %s (status=%s)", web.AuthFileName, loginResp.Status)
+		log.Infof("Saved %s (status=%s)", authFilePath, loginResp.Status)
 		cfg.PSK = loginResp.PSK
 	} else if err != nil {
 		// Some other filesystem error (permissions, etc.)
-		return fmt.Errorf("failed to stat %s: %w", web.AuthFileName, err)
+		return fmt.Errorf("failed to stat %s: %w", authFilePath, err)
 	} else {
 		// File exists → load PSK from it
-		authData, err := os.ReadFile(web.AuthFileName)
+		authData, err := os.ReadFile(authFilePath)
 		if err != nil {
-			return fmt.Errorf("failed to read %s: %w", web.AuthFileName, err)
+			return fmt.Errorf("failed to read %s: %w", authFilePath, err)
 		}
 
 		// Replace with your own unmarshal/parse logic
 		var loginResp web.LoginResponse
 		if err := json.Unmarshal(authData, &loginResp); err != nil {
-			return fmt.Errorf("failed to parse %s: %w", web.AuthFileName, err)
+			return fmt.Errorf("failed to parse %s: %w", authFilePath, err)
 		}
 
-		log.Infof("Loaded PSK from %s (status=%s)", web.AuthFileName, loginResp.Status)
+		log.Infof("Loaded PSK from %s (status=%s)", authFilePath, loginResp.Status)
 		// Now you can use loginResp.PSK or whatever field you need
 
 		cfg.PSK = loginResp.PSK
