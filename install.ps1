@@ -143,16 +143,40 @@ function Write-Error {
 # ============================================================================
 
 function Get-SystemArchitecture {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-    switch ($arch) {
-        "X64" { return "amd64" }
-        "Arm64" { return "arm64" }
-        "X86" { return "386" }
-        default {
-            Write-Error "Unsupported architecture: $arch"
-            exit 1
+    # Try RuntimeInformation first (converts enum to string for comparison)
+    try {
+        $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        switch ($arch) {
+            "X64" { return "amd64" }
+            "Arm64" { return "arm64" }
+            "X86" { return "386" }
         }
     }
+    catch { }
+    
+    # Fallback to environment variable
+    $envArch = $env:PROCESSOR_ARCHITECTURE
+    switch ($envArch) {
+        "AMD64" { return "amd64" }
+        "ARM64" { return "arm64" }
+        "x86" { return "386" }
+        "IA64" { return "amd64" }  # Itanium, treat as 64-bit
+    }
+    
+    # Final fallback - check pointer size
+    if ([IntPtr]::Size -eq 8) {
+        # 64-bit, but we need to determine if ARM or x64
+        if ($env:PROCESSOR_ARCHITECTURE -match "ARM") {
+            return "arm64"
+        }
+        return "amd64"
+    }
+    elseif ([IntPtr]::Size -eq 4) {
+        return "386"
+    }
+    
+    Write-Error "Unsupported architecture: $envArch"
+    exit 1
 }
 
 function Get-LatestVersion {
