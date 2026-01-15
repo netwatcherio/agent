@@ -273,6 +273,67 @@ function Stop-AgentService {
 }
 
 # ============================================================================
+# Firewall Configuration
+# ============================================================================
+
+function Configure-Firewall {
+    param(
+        [string]$AgentPath,
+        [string]$TripPath
+    )
+    
+    Write-Info "Configuring Windows Firewall rules..."
+    
+    # Remove any existing rules first (to avoid duplicates)
+    Remove-FirewallRules
+    
+    try {
+        # Agent - allow all connections (program-based rule)
+        New-NetFirewallRule -DisplayName "NetWatcher Agent" `
+            -Program $AgentPath `
+            -Action Allow `
+            -Profile Any `
+            -Description "Allows all network connections for NetWatcher Agent" `
+            -ErrorAction Stop | Out-Null
+        
+        Write-Success "Firewall rule created for NetWatcher Agent"
+    }
+    catch {
+        Write-Warning "Failed to create firewall rule for agent: $_"
+    }
+    
+    # Configure trip.exe firewall rules if it exists
+    if ($TripPath -and (Test-Path $TripPath)) {
+        try {
+            # Trip - allow all connections (program-based rule)
+            New-NetFirewallRule -DisplayName "NetWatcher Trip MTR" `
+                -Program $TripPath `
+                -Action Allow `
+                -Profile Any `
+                -Description "Allows all network connections for Trip (MTR/traceroute tool)" `
+                -ErrorAction Stop | Out-Null
+            
+            Write-Success "Firewall rule created for Trip (MTR tool)"
+        }
+        catch {
+            Write-Warning "Failed to create firewall rule for trip: $_"
+        }
+    }
+    else {
+        Write-Info "Trip not yet installed - firewall rule will be created after first run"
+    }
+}
+
+function Remove-FirewallRules {
+    Write-Info "Removing NetWatcher firewall rules..."
+    $existingRules = Get-NetFirewallRule -DisplayName "NetWatcher*" -ErrorAction SilentlyContinue
+    if ($existingRules) {
+        $existingRules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        Write-Success "Firewall rules removed"
+    }
+}
+
+# ============================================================================
 # Installation Functions
 # ============================================================================
 
@@ -470,6 +531,10 @@ AGENT_PIN=$Pin
     # Configure service recovery options (restart on failure)
     sc.exe failure $Script:ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
 
+    # Configure Windows Firewall rules
+    $tripPath = Join-Path $InstallDir "lib\trip.exe"
+    Configure-Firewall -AgentPath $binaryPath -TripPath $tripPath
+
     # Start the service
     if (-not $NoStart) {
         Write-Info "Starting $($Script:ServiceDisplayName) service..."
@@ -571,6 +636,9 @@ function Uninstall-Agent {
             Write-Warning "Could not remove service (it may require a reboot)"
         }
     }
+
+    # Remove firewall rules
+    Remove-FirewallRules
 
     # Remove installation directory
     if ($hasFiles) {
@@ -714,6 +782,10 @@ function Update-Agent {
         Move-Item -Path $backupPath -Destination $binaryPath -Force
         exit 1
     }
+
+    # Ensure firewall rules are configured
+    $tripPath = Join-Path $InstallDir "lib\trip.exe"
+    Configure-Firewall -AgentPath $binaryPath -TripPath $tripPath
 
     # Start service (or create if missing)
     if (Test-ServiceExists -Name $Script:ServiceName) {
