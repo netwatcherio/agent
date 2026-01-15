@@ -5,14 +5,13 @@ package platform
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"time"
+	"strings"
 
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/debug"
 )
-
-// Windows service name
-const serviceName = "NetWatcherAgent"
 
 // AgentRunner is the function signature for the main agent logic.
 type AgentRunner func(ctx context.Context) error
@@ -20,8 +19,6 @@ type AgentRunner func(ctx context.Context) error
 // windowsService wraps the agent runner to implement svc.Handler.
 type windowsService struct {
 	runner AgentRunner
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
 // Execute implements svc.Handler and is called by the Windows SCM.
@@ -31,50 +28,43 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	changes <- svc.Status{State: svc.StartPending}
 
 	// Create context for the agent
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Start the agent in a goroutine
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- s.runner(s.ctx)
+		errCh <- s.runner(ctx)
 	}()
 
-	// Small delay to let the agent initialize
-	time.Sleep(100 * time.Millisecond)
-
-	// We're now running
+	// Report running IMMEDIATELY - don't wait for agent initialization
+	// The agent will continue initializing in the background
 	changes <- svc.Status{State: svc.Running, Accepts: acceptedCmds}
 
-	// Main service loop
+	// Main service loop - handle SCM commands
 	for {
 		select {
 		case err := <-errCh:
-			// Agent exited
+			// Agent exited on its own
+			changes <- svc.Status{State: svc.StopPending}
 			if err != nil {
-				// Return non-zero exit code on error
-				changes <- svc.Status{State: svc.StopPending}
 				return true, 1
 			}
-			changes <- svc.Status{State: svc.StopPending}
 			return false, 0
 
 		case c := <-r:
 			switch c.Cmd {
 			case svc.Interrogate:
-				// SCM wants our status
+				// SCM wants our status - respond with current status
 				changes <- c.CurrentStatus
 
 			case svc.Stop, svc.Shutdown:
-				// Graceful shutdown
+				// Graceful shutdown requested
 				changes <- svc.Status{State: svc.StopPending}
-				s.cancel()
+				cancel()
 
-				// Wait for agent to finish (with timeout)
-				select {
-				case <-errCh:
-				case <-time.After(30 * time.Second):
-				}
-
+				// Wait for agent to finish
+				<-errCh
 				return false, 0
 
 			default:
@@ -86,27 +76,51 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 
 // IsRunningAsService detects if the process was started by the Windows SCM.
 func IsRunningAsService() bool {
-	// The recommended way: check if we're running interactively
-	isInteractive, err := svc.IsWindowsService()
-	if err != nil {
-		// If detection fails, assume interactive
-		return false
+	// Primary detection: use the official Windows API
+	isService, err := svc.IsWindowsService()
+	if err == nil {
+		return isService
 	}
-	return isInteractive
+
+	// Fallback: check if we have an interactive session
+	// Services typically don't have a console attached
+	return !isInteractiveSession()
 }
 
 // RunService runs the agent as a Windows service.
-// This blocks until the service is stopped.
+// This function blocks until the service is stopped.
 func RunService(name string, runner AgentRunner) error {
+	// Use debug.Run for better error messages during development
+	// In production, this behaves the same as svc.Run
 	return svc.Run(name, &windowsService{runner: runner})
 }
 
+// DebugRunService runs the service in debug mode (for testing in console)
+func DebugRunService(name string, runner AgentRunner) error {
+	return debug.Run(name, &windowsService{runner: runner})
+}
+
 // isInteractiveSession checks if stdin is attached to a terminal.
-// Fallback detection method.
 func isInteractiveSession() bool {
 	fi, err := os.Stdin.Stat()
 	if err != nil {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// ServiceError creates a formatted service error for logging
+func ServiceError(format string, args ...interface{}) error {
+	return fmt.Errorf("service: "+format, args...)
+}
+
+// IsDebugMode checks if running in debug/development mode
+func IsDebugMode() bool {
+	// Check for common debug indicators
+	for _, arg := range os.Args {
+		if strings.ToLower(arg) == "--debug" || strings.ToLower(arg) == "-debug" {
+			return true
+		}
+	}
+	return os.Getenv("NETWATCHER_DEBUG") != ""
 }
