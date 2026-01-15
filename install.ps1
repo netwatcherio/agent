@@ -404,8 +404,20 @@ AGENT_PIN=$Pin
     # Remove existing service if present
     if (Test-ServiceExists -Name $Script:ServiceName) {
         Write-Info "Removing existing service..."
+        Stop-Service -Name $Script:ServiceName -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
         sc.exe delete $Script:ServiceName | Out-Null
-        Start-Sleep -Seconds 2
+        
+        # Wait for service to be fully removed (can take time if handles are open)
+        $maxWait = 30
+        $waited = 0
+        while ((Test-ServiceExists -Name $Script:ServiceName) -and $waited -lt $maxWait) {
+            Start-Sleep -Seconds 1
+            $waited++
+        }
+        if ($waited -ge $maxWait) {
+            Write-Warning "Service removal is taking longer than expected. You may need to close the Services panel or reboot."
+        }
     }
 
     # Create the service using PowerShell's New-Service cmdlet (avoids sc.exe quoting issues)
@@ -413,17 +425,38 @@ AGENT_PIN=$Pin
     
     Write-Info "Creating service with binPath: $serviceBinPath"
     
-    try {
-        New-Service -Name $Script:ServiceName `
-            -BinaryPathName $serviceBinPath `
-            -DisplayName $Script:ServiceDisplayName `
-            -StartupType Automatic `
-            -Description "NetWatcher Agent monitors network and voice quality" `
-            -ErrorAction Stop
-        Write-Success "Windows Service created"
+    # Retry loop to handle "marked for deletion" race condition
+    $maxRetries = 5
+    $retryDelay = 2
+    $created = $false
+    
+    for ($i = 1; $i -le $maxRetries; $i++) {
+        try {
+            New-Service -Name $Script:ServiceName `
+                -BinaryPathName $serviceBinPath `
+                -DisplayName $Script:ServiceDisplayName `
+                -StartupType Automatic `
+                -Description "NetWatcher Agent monitors network and voice quality" `
+                -ErrorAction Stop
+            Write-Success "Windows Service created"
+            $created = $true
+            break
+        }
+        catch {
+            if ($_.Exception.Message -match "marked for deletion" -and $i -lt $maxRetries) {
+                Write-Warning "Service still pending deletion, retrying in $retryDelay seconds... (attempt $i/$maxRetries)"
+                Start-Sleep -Seconds $retryDelay
+                $retryDelay = $retryDelay * 2  # Exponential backoff
+            }
+            else {
+                Write-Error "Failed to create service: $_"
+                exit 1
+            }
+        }
     }
-    catch {
-        Write-Error "Failed to create service: $_"
+    
+    if (-not $created) {
+        Write-Error "Failed to create service after $maxRetries attempts. Try closing the Services panel and running again, or reboot."
         exit 1
     }
 
