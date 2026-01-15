@@ -138,6 +138,7 @@ type TrafficSim struct {
 	// we use the existing connection to measure reverse direction and report with that probe's ID
 	allProbes         []Probe // All probes for this agent to find client probes
 	allProbesMu       sync.RWMutex
+	GetProbesFunc     func() []Probe // Callback to dynamically get current probes
 	reverseSequence   int
 	reverseSequenceMu sync.Mutex
 }
@@ -260,19 +261,40 @@ func (ts *TrafficSim) SetAllProbes(probes []Probe) {
 	log.Printf("[trafficsim] Server loaded %d probes for bidirectional detection", len(probes))
 }
 
-// GetClientProbeForAgent finds a TRAFFICSIM client probe targeting the given agent
+// GetClientProbeForAgent finds a probe targeting the given agent that can be used for bidirectional TrafficSim
+// This can be either a dedicated TRAFFICSIM client probe, or an AGENT type probe (which expands to include TRAFFICSIM)
 // Returns the probe if found, nil otherwise
 func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
-	ts.allProbesMu.RLock()
-	defer ts.allProbesMu.RUnlock()
+	// First try using dynamic probe retrieval if available (preferred for freshest data)
+	var probesToCheck []Probe
+	if ts.GetProbesFunc != nil {
+		probesToCheck = ts.GetProbesFunc()
+	} else {
+		// Fallback to stored probe list
+		ts.allProbesMu.RLock()
+		probesToCheck = ts.allProbes
+		ts.allProbesMu.RUnlock()
+	}
 
-	for i := range ts.allProbes {
-		p := &ts.allProbes[i]
-		// Look for TrafficSim client probes (not server)
+	for i := range probesToCheck {
+		p := &probesToCheck[i]
+
+		// Check for standalone TrafficSim client probes (not server)
 		if p.Type == ProbeType_TRAFFICSIM && !p.Server {
 			for _, t := range p.Targets {
 				if t.AgentID != nil && *t.AgentID == targetAgentID {
-					log.Debugf("[trafficsim] Found client probe %d for connected agent %d", p.ID, targetAgentID)
+					log.Debugf("[trafficsim] Found TRAFFICSIM client probe %d for connected agent %d", p.ID, targetAgentID)
+					return p
+				}
+			}
+		}
+
+		// Also check AGENT type probes, as they expand to include TRAFFICSIM clients
+		// When an AGENT probe targets another agent, it generates MTR, PING, and TRAFFICSIM probes
+		if p.Type == "AGENT" {
+			for _, t := range p.Targets {
+				if t.AgentID != nil && *t.AgentID == targetAgentID {
+					log.Debugf("[trafficsim] Found AGENT probe %d targeting agent %d (will use for reverse TrafficSim)", p.ID, targetAgentID)
 					return p
 				}
 			}
