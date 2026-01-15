@@ -3,11 +3,13 @@ package probes
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"time"
 
 	"github.com/netwatcherio/netwatcher-agent/lib/platform"
+	log "github.com/sirupsen/logrus"
 )
 
 type MtrPayload struct {
@@ -120,11 +122,22 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return mtrResult, err
+		// Log both the error and any output for debugging
+		log.WithFields(log.Fields{
+			"error":  err.Error(),
+			"output": string(output),
+			"target": cd.Targets[0].Target,
+			"path":   trippyPath,
+		}).Error("Trip execution failed")
+		return mtrResult, fmt.Errorf("%w: %s", err, string(output))
 	}
 
 	err = json.Unmarshal(output, &mtrResult.Report)
 	if err != nil {
+		log.WithFields(log.Fields{
+			"error":  err.Error(),
+			"output": string(output),
+		}).Error("Failed to parse trip output")
 		return mtrResult, err
 	}
 
