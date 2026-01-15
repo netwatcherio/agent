@@ -408,26 +408,27 @@ AGENT_PIN=$Pin
         Start-Sleep -Seconds 2
     }
 
-    # Create the service using cmd /c for proper sc.exe argument handling
-    # sc.exe has unusual syntax: "option= value" (space after =, option and value as separate args)
-    # Use single quotes with cmd /c to preserve the escaped double quotes
-    $cmdLine = 'sc.exe create ' + $Script:ServiceName + ' binPath= "\"' + $binaryPath + '\" --config \"' + $configPath + '\"" DisplayName= "' + $Script:ServiceDisplayName + '" start= auto obj= LocalSystem'
+    # Create the service using PowerShell's New-Service cmdlet (avoids sc.exe quoting issues)
+    $serviceBinPath = "`"$binaryPath`" --config `"$configPath`""
     
-    Write-Info "Running: $cmdLine"
-    $result = cmd /c $cmdLine 2>&1
-
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Failed to create service: $result"
+    Write-Info "Creating service with binPath: $serviceBinPath"
+    
+    try {
+        New-Service -Name $Script:ServiceName `
+            -BinaryPathName $serviceBinPath `
+            -DisplayName $Script:ServiceDisplayName `
+            -StartupType Automatic `
+            -Description "NetWatcher Agent monitors network and voice quality" `
+            -ErrorAction Stop
+        Write-Success "Windows Service created"
+    }
+    catch {
+        Write-Error "Failed to create service: $_"
         exit 1
     }
 
-    # Set service description
-    sc.exe description $Script:ServiceName "NetWatcher Agent monitors network and voice quality" | Out-Null
-
     # Configure service recovery options (restart on failure)
     sc.exe failure $Script:ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
-
-    Write-Success "Windows Service created"
 
     # Start the service
     if (-not $NoStart) {
