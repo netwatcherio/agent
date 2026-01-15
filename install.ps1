@@ -143,30 +143,30 @@ function Write-Error {
 # ============================================================================
 
 function Get-SystemArchitecture {
-    # Try RuntimeInformation first (converts enum to string for comparison)
+    # Debug: Show what we're detecting
+    $runtimeArch = $null
     try {
-        $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-        switch ($arch) {
-            "X64" { return "amd64" }
-            "Arm64" { return "arm64" }
-            "X86" { return "386" }
-        }
+        $runtimeArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
     }
     catch { }
     
-    # Fallback to environment variable
     $envArch = $env:PROCESSOR_ARCHITECTURE
-    switch ($envArch) {
-        "AMD64" { return "amd64" }
-        "ARM64" { return "arm64" }
-        "x86" { return "386" }
-        "IA64" { return "amd64" }  # Itanium, treat as 64-bit
-    }
+    Write-Info "Debug: RuntimeInfo=$runtimeArch, PROCESSOR_ARCHITECTURE=$envArch"
+    
+    # Try RuntimeInformation first
+    if ($runtimeArch -eq "X64") { return "amd64" }
+    if ($runtimeArch -eq "Arm64") { return "arm64" }
+    if ($runtimeArch -eq "X86") { return "386" }
+    
+    # Fallback to environment variable (case-insensitive)
+    if ($envArch -ieq "AMD64") { return "amd64" }
+    if ($envArch -ieq "ARM64") { return "arm64" }
+    if ($envArch -ieq "x86") { return "386" }
+    if ($envArch -ieq "IA64") { return "amd64" }
     
     # Final fallback - check pointer size
     if ([IntPtr]::Size -eq 8) {
-        # 64-bit, but we need to determine if ARM or x64
-        if ($env:PROCESSOR_ARCHITECTURE -match "ARM") {
+        if ($envArch -imatch "ARM") {
             return "arm64"
         }
         return "amd64"
@@ -175,7 +175,7 @@ function Get-SystemArchitecture {
         return "386"
     }
     
-    Write-Error "Unsupported architecture: $envArch"
+    Write-Error "Unsupported architecture: RuntimeInfo=$runtimeArch, ENV=$envArch"
     exit 1
 }
 
