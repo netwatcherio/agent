@@ -5,6 +5,7 @@ package platform
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 )
@@ -60,8 +61,14 @@ func BinaryName(name string) string {
 }
 
 // BinaryPath returns the full path to a binary in the lib directory.
+// Uses executable directory to ensure it works when running as a service.
 func BinaryPath(name string) string {
-	return filepath.Join(".", "lib", BinaryName(name))
+	exePath, err := os.Executable()
+	if err != nil {
+		// Fallback to relative path if we can't get executable path
+		return filepath.Join(".", "lib", BinaryName(name))
+	}
+	return filepath.Join(filepath.Dir(exePath), "lib", BinaryName(name))
 }
 
 // -------------------- Supported Platform Checks --------------------

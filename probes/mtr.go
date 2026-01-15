@@ -105,16 +105,16 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	var cmd *exec.Cmd
 	if platform.IsWindows() {
 		shellArgs := append([]string{"/c", trippyPath + " " +
-			"--icmp " +
+			"--udp " +
 			"--mode json " +
-			"--multipath-strategy classic " +
-			"--dns-resolve-method cloudflare " +
+			"--multipath-strategy paris " +
+			"--dns-resolve-method system " +
 			"--report-cycles " + strconv.Itoa(triggeredCount) + " " +
 			"--dns-lookup-as-info " + cd.Targets[0].Target})
 		cmd = exec.CommandContext(context.TODO(), "cmd.exe", shellArgs...)
 	} else {
 		// For Linux and macOS, use /bin/bash
-		shellArgs := append([]string{"-c", trippyPath + " --icmp --mode json --multipath-strategy classic --dns-resolve-method cloudflare --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Targets[0].Target})
+		shellArgs := append([]string{"-c", trippyPath + " --udp --mode json --multipath-strategy paris --dns-resolve-method system --report-cycles " + strconv.Itoa(triggeredCount) + " --dns-lookup-as-info " + cd.Targets[0].Target})
 		cmd = exec.CommandContext(context.TODO(), "/bin/bash", shellArgs...)
 	}
 
