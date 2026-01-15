@@ -408,13 +408,21 @@ AGENT_PIN=$Pin
         Start-Sleep -Seconds 2
     }
 
-    # Create the service
+    # Create the service using sc.exe with proper argument handling
     $serviceBinPath = "`"$binaryPath`" --config `"$configPath`""
-    $result = sc.exe create $Script:ServiceName `
-        binPath= $serviceBinPath `
-        DisplayName= $Script:ServiceDisplayName `
-        start= auto `
-        obj= "LocalSystem"
+    
+    # Build the sc.exe arguments - note: sc.exe requires "option= value" format (space after =)
+    $scArgs = @(
+        "create",
+        $Script:ServiceName,
+        "binPath=", $serviceBinPath,
+        "DisplayName=", $Script:ServiceDisplayName,
+        "start=", "auto",
+        "obj=", "LocalSystem"
+    )
+    
+    Write-Info "Running: sc.exe $($scArgs -join ' ')"
+    $result = & sc.exe $scArgs 2>&1
 
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to create service: $result"
