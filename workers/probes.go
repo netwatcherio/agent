@@ -658,6 +658,19 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 }
 
 func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID, ctx context.Context, stopChan chan struct{}) {
+	// Check for bidirectional-only probes (marked with :bidir in target)
+	// These are NOT active client probes - they're used by the TrafficSim SERVER for bidirectional detection
+	// when clients connect to this agent's server. Don't start a client worker for these.
+	if !probe.Server && len(probe.Targets) > 0 {
+		target := probe.Targets[0].Target
+		if strings.HasSuffix(target, ":bidir") {
+			log.Debugf("[trafficsim] Skipping bidir probe %d (target=%s) - used for server bidirectional detection only", probe.ID, target)
+			// Just wait for stop signal without starting anything
+			<-stopChan
+			return
+		}
+	}
+
 	// Create new TrafficSim instance
 	ts := probes.NewTrafficSim(&probe, dataChan)
 	ts.ThisAgent = probe.AgentID // Use the agent ID from the probe
