@@ -191,58 +191,64 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 
-	// Look for assets that match the current platform
-	patterns := []string{
-		fmt.Sprintf("%s_%s", goos, goarch),
-		fmt.Sprintf("%s-%s", goos, goarch),
-	}
+	// Build exact platform string we're looking for
+	// Asset naming convention: netwatcher-{version}-{os}-{arch}.{ext}
+	osPatterns := []string{goos}
+	archPatterns := []string{goarch}
 
-	// Add OS-specific patterns
+	// Add OS aliases
 	if goos == "windows" {
-		patterns = append(patterns, "windows", "win")
+		osPatterns = append(osPatterns, "win")
 	} else if goos == "darwin" {
-		patterns = append(patterns, "darwin", "macos", "mac")
-	} else if goos == "linux" {
-		patterns = append(patterns, "linux")
+		osPatterns = append(osPatterns, "macos", "mac")
 	}
 
-	// Add architecture patterns
+	// Add architecture aliases
 	if goarch == "amd64" {
-		patterns = append(patterns, "x86_64", "amd64")
+		archPatterns = append(archPatterns, "x86_64", "x64")
 	} else if goarch == "arm64" {
-		patterns = append(patterns, "amd64", "arm64")
+		archPatterns = append(archPatterns, "aarch64")
 	}
+
+	log.WithFields(log.Fields{
+		"os_patterns":   osPatterns,
+		"arch_patterns": archPatterns,
+	}).Debug("Looking for matching asset")
 
 	for _, asset := range release.Assets {
 		name := strings.ToLower(asset.Name)
 
-		// Must contain netwatcher-agent in the name
-		if !strings.Contains(name, "netwatcher") && !strings.Contains(name, "netwatcher-agent") {
+		// Must contain netwatcher
+		if !strings.Contains(name, "netwatcher") {
 			continue
 		}
 
-		// Check if it matches our platform patterns
-		matchCount := 0
-		for _, pattern := range patterns {
+		// Must match BOTH os AND architecture
+		var osMatch, archMatch bool
+		for _, pattern := range osPatterns {
 			if strings.Contains(name, strings.ToLower(pattern)) {
-				matchCount++
+				osMatch = true
+				break
+			}
+		}
+		for _, pattern := range archPatterns {
+			if strings.Contains(name, strings.ToLower(pattern)) {
+				archMatch = true
+				break
 			}
 		}
 
-		// If we found at least 2 pattern matches (OS + arch), this is likely our binary
-		if matchCount >= 2 {
+		if osMatch && archMatch {
+			log.WithField("asset", asset.Name).Info("Found matching asset")
 			return &asset
 		}
 	}
 
-	// Fallback: look for any asset with netwatcher-agent in the name
-	for _, asset := range release.Assets {
-		name := strings.ToLower(asset.Name)
-		if strings.Contains(name, "netwatcher") || strings.Contains(name, "netwatcher-agent") {
-			return &asset
-		}
-	}
-
+	// No fallback - if we can't find an exact match, don't download wrong binary
+	log.WithFields(log.Fields{
+		"os":   goos,
+		"arch": goarch,
+	}).Warn("No matching asset found for this platform")
 	return nil
 }
 
