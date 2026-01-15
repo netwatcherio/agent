@@ -261,8 +261,10 @@ func (ts *TrafficSim) SetAllProbes(probes []Probe) {
 	log.Printf("[trafficsim] Server loaded %d probes for bidirectional detection", len(probes))
 }
 
-// GetClientProbeForAgent finds a probe targeting the given agent that can be used for bidirectional TrafficSim
-// This can be either a dedicated TRAFFICSIM client probe, or an AGENT type probe (which expands to include TRAFFICSIM)
+// GetClientProbeForAgent finds a TRAFFICSIM probe targeting the given agent for bidirectional testing.
+// The controller creates TRAFFICSIM probes when:
+// 1. Target agent has a server (client mode)
+// 2. Owner agent has a server (bidirectional mode - target marked with ":bidir")
 // Returns the probe if found, nil otherwise
 func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 	// First try using dynamic probe retrieval if available (preferred for freshest data)
@@ -279,22 +281,11 @@ func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 	for i := range probesToCheck {
 		p := &probesToCheck[i]
 
-		// Check for standalone TrafficSim client probes (not server)
+		// Check for TRAFFICSIM client probes (not server) targeting the connected agent
 		if p.Type == ProbeType_TRAFFICSIM && !p.Server {
 			for _, t := range p.Targets {
 				if t.AgentID != nil && *t.AgentID == targetAgentID {
-					log.Debugf("[trafficsim] Found TRAFFICSIM client probe %d for connected agent %d", p.ID, targetAgentID)
-					return p
-				}
-			}
-		}
-
-		// Also check AGENT type probes, as they expand to include TRAFFICSIM clients
-		// When an AGENT probe targets another agent, it generates MTR, PING, and TRAFFICSIM probes
-		if p.Type == "AGENT" {
-			for _, t := range p.Targets {
-				if t.AgentID != nil && *t.AgentID == targetAgentID {
-					log.Debugf("[trafficsim] Found AGENT probe %d targeting agent %d (will use for reverse TrafficSim)", p.ID, targetAgentID)
+					log.Debugf("[trafficsim] Found TRAFFICSIM probe %d for connected agent %d (bidirectional enabled)", p.ID, targetAgentID)
 					return p
 				}
 			}
