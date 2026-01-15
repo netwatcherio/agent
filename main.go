@@ -6,12 +6,12 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/netwatcherio/netwatcher-agent/lib/platform"
 	"github.com/netwatcherio/netwatcher-agent/probes"
 	"github.com/netwatcherio/netwatcher-agent/web"
 	"github.com/netwatcherio/netwatcher-agent/workers"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 
-	// "github.com/netwatcherio/netwatcher-agent/workers"
 	"os"
 	"os/signal"
 	"runtime"
@@ -21,6 +21,12 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+)
+
+// Command-line flags (parsed in main, used by runAgent)
+var (
+	configPath     string
+	disableUpdater bool
 )
 
 // Env helpers
@@ -47,33 +53,46 @@ func main() {
 	fmt.Printf("Starting NetWatcher Agent - Version: %s...\n", VERSION)
 
 	// ---------- CLI flags ----------
-	var configPath string
-	var disableUpdater bool
 	flag.StringVar(&configPath, "config", "./config.conf", "Path to the config file")
 	flag.BoolVar(&disableUpdater, "no-update", false, "Disable auto-updater")
 	flag.Parse()
 
+	// Check if running as Windows service
+	if platform.IsRunningAsService() {
+		log.Info("Running as Windows service")
+		if err := platform.RunService("NetWatcherAgent", runAgent); err != nil {
+			log.Fatalf("Service error: %v", err)
+		}
+		return
+	}
+
+	// Console mode: run with signal handling
+	log.Info("Running in console mode")
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Handle Ctrl+C / SIGTERM
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Infof("Received signal %v, shutting down...", sig)
+		cancel()
+	}()
+
+	if err := runAgent(ctx); err != nil {
+		log.Fatalf("Agent error: %v", err)
+	}
+}
+
+// runAgent contains the core agent logic.
+// It is called either directly (console mode) or by the Windows service handler.
+func runAgent(ctx context.Context) error {
 	loadConfig(configPath)
 
 	// ---------- Dependencies ----------
 	if err := downloadTrippyDependency(); err != nil {
-		log.Fatalf("Failed to download dependency: %v", err)
+		return fmt.Errorf("failed to download dependency: %w", err)
 	}
-
-	// ---------- Context & signals ----------
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	go func() {
-		for range c {
-			log.Info("Received interrupt signal, shutting down...")
-			cancel()
-			shutdown()
-			return
-		}
-	}()
 
 	// ---------- Updater ----------
 	if !disableUpdater {
@@ -104,33 +123,33 @@ func main() {
 	// Check if the auth file exists
 	if _, err := os.Stat(web.AuthFileName); os.IsNotExist(err) {
 		// File does not exist → perform login
-		webCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		webCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		loginResp, err := web.DoLogin(webCtx, cfg)
 		cancel()
 		if err != nil {
-			log.Fatalf("login error: %v (server said: %s)", err, web.SafeErr(loginResp))
+			return fmt.Errorf("login error: %v (server said: %s)", err, web.SafeErr(loginResp))
 		}
 
 		respJson, _ := json.Marshal(loginResp)
 		if err := web.SaveRawAuthJSON(respJson); err != nil {
-			log.Fatalf("failed to save %s: %v", web.AuthFileName, err)
+			return fmt.Errorf("failed to save %s: %w", web.AuthFileName, err)
 		}
 		log.Infof("Saved %s (status=%s)", web.AuthFileName, loginResp.Status)
 		cfg.PSK = loginResp.PSK
 	} else if err != nil {
 		// Some other filesystem error (permissions, etc.)
-		log.Fatalf("failed to stat %s: %v", web.AuthFileName, err)
+		return fmt.Errorf("failed to stat %s: %w", web.AuthFileName, err)
 	} else {
 		// File exists → load PSK from it
 		authData, err := os.ReadFile(web.AuthFileName)
 		if err != nil {
-			log.Fatalf("failed to read %s: %v", web.AuthFileName, err)
+			return fmt.Errorf("failed to read %s: %w", web.AuthFileName, err)
 		}
 
 		// Replace with your own unmarshal/parse logic
 		var loginResp web.LoginResponse
 		if err := json.Unmarshal(authData, &loginResp); err != nil {
-			log.Fatalf("failed to parse %s: %v", web.AuthFileName, err)
+			return fmt.Errorf("failed to parse %s: %w", web.AuthFileName, err)
 		}
 
 		log.Infof("Loaded PSK from %s (status=%s)", web.AuthFileName, loginResp.Status)
@@ -145,7 +164,7 @@ func main() {
 		psk = cfg.PSK
 	}
 	if psk == "" {
-		log.Fatalf("no PSK available after login; cannot open websocket")
+		return fmt.Errorf("no PSK available after login; cannot open websocket")
 	}
 
 	// 2) WS client with gobwas + headers
@@ -163,11 +182,7 @@ func main() {
 	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
 	workers.ProbeDataWorker(wsClient, probeDataCh)
 
-	// Handle Ctrl+C / SIGTERM
-	parent, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	go wsClient.ConnectWithRetry(parent)
+	go wsClient.ConnectWithRetry(ctx)
 
 	go func(ws *web.WSClient, ctx context.Context) {
 		for {
@@ -222,8 +237,14 @@ func main() {
 		}
 	}(wsClient, speedtestQueueCh, ctx)
 
-	<-parent.Done()
+	// Wait for context cancellation (shutdown signal)
+	<-ctx.Done()
 	log.Info("shutting down")
+
+	// Give goroutines a moment to clean up
+	time.Sleep(500 * time.Millisecond)
+
+	return nil
 }
 
 func shutdown() {
