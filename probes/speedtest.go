@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-type SpeedTestResult struct {
+type SpeedTestPayload struct {
 	TestData  []speedtest.Server `json:"test_data"`
 	Timestamp time.Time          `json:"timestamp" bson:"timestamp"`
 }
@@ -49,7 +49,7 @@ type PLoss struct {
 	Max  int `json:"max"`  // The maximum index value received by the remote.
 }
 
-func SpeedTest(cd *Probe) (SpeedTestResult, error) {
+func SpeedTest(cd *Probe) (SpeedTestPayload, error) {
 	var s1 []speedtest.Server
 	var speedtestClient = speedtest.New()
 
@@ -74,15 +74,15 @@ func SpeedTest(cd *Probe) (SpeedTestResult, error) {
 	serverList, _ := speedtestClient.FetchServers()
 	var targets []*speedtest.Server
 
-	primaryTarget := cd.Config.Target[0].Target
-	if cd.Config.Target[0].Target == "" {
+	primaryTarget := cd.Targets[0].Target
+	if cd.Targets[0].Target == "" {
 		targets2, _ := serverList.FindServer([]int{})
 		targets = append(targets, targets2...)
 
 	} else if primaryTarget != "" && primaryTarget != "expired" && primaryTarget != "ok" {
-		atoi, err := strconv.Atoi(cd.Config.Target[0].Target)
+		atoi, err := strconv.Atoi(cd.Targets[0].Target)
 		if err != nil {
-			return SpeedTestResult{}, err
+			return SpeedTestPayload{}, err
 		}
 		targets2, _ := serverList.FindServer([]int{atoi})
 		targets = append(targets, targets2...)
@@ -94,29 +94,29 @@ func SpeedTest(cd *Probe) (SpeedTestResult, error) {
 		// It is recommended to replace a server at this time
 		err := s.PingTest(nil)
 		if err != nil {
-			return SpeedTestResult{}, err
+			return SpeedTestPayload{}, err
 		}
 		err = s.DownloadTest()
 		if err != nil {
-			return SpeedTestResult{}, err
+			return SpeedTestPayload{}, err
 		}
 		err = s.UploadTest()
 		if err != nil {
-			return SpeedTestResult{}, err
+			return SpeedTestPayload{}, err
 		}
 
 		s1 = append(s1, *s)
 		s.Context.Reset() // reset counter
 	}
 
-	result := SpeedTestResult{
+	result := SpeedTestPayload{
 		TestData:  s1,
 		Timestamp: time.Now(),
 	}
 
 	marshal, err := json.Marshal(result)
 	if err != nil {
-		return SpeedTestResult{}, err
+		return SpeedTestPayload{}, err
 	}
 
 	log.Warnf("%s", marshal)

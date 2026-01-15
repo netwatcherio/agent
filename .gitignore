@@ -5,3 +5,4 @@ config.conf
 *.crt
 *.o
 .DS_Store
+agent_auth.json

@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"math"
 	"net"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,85 +13,230 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	log "github.com/sirupsen/logrus"
 )
 
-// CycleTracker tracks packets for a specific reporting cycle
+// -------------------- Constants --------------------
+
+const (
+	TrafficSimReportSeq        = 60 // Packets per cycle before reporting
+	TrafficSimDataInterval     = 1  // Seconds between packets
+	TrafficSimTimeout          = 2 * time.Second
+	TrafficSimRetryInterval    = 5 * time.Second
+	TrafficSimGracefulShutdown = 70 * time.Second
+)
+
+// -------------------- Message Types --------------------
+
+type TrafficSimMsgType string
+
+const (
+	MsgHello  TrafficSimMsgType = "HELLO"
+	MsgAck    TrafficSimMsgType = "ACK"
+	MsgData   TrafficSimMsgType = "DATA"
+	MsgReport TrafficSimMsgType = "REPORT"
+	MsgPing   TrafficSimMsgType = "PING"
+	MsgPong   TrafficSimMsgType = "PONG"
+)
+
+// TrafficSimMsg is the UDP message structure
+type TrafficSimMsg struct {
+	Type      TrafficSimMsgType `json:"type"`
+	Data      TrafficSimData    `json:"data"`
+	SrcAgent  uint              `json:"src_agent"`
+	DstAgent  uint              `json:"dst_agent"`
+	Timestamp int64             `json:"timestamp"`
+	Size      int               `json:"size"`
+}
+
+// TrafficSimData is the payload within each message
+type TrafficSimData struct {
+	Sent     int64                  `json:"sent"`
+	Received int64                  `json:"received"`
+	Seq      int                    `json:"seq"`
+	Report   map[string]interface{} `json:"report,omitempty"`
+}
+
+// -------------------- Packet Tracking --------------------
+
+type PacketTime struct {
+	Sent     int64
+	Received int64
+	TimedOut bool
+	Size     int
+}
+
+// CycleTracker tracks packets for a reporting cycle
 type CycleTracker struct {
-	StartSeq    int
-	EndSeq      int
-	PacketSeqs  []int // All packet sequences in this cycle
-	StartTime   time.Time
-	PacketTimes map[int]PacketTime // Packet times for this cycle only
+	StartSeq        int
+	EndSeq          int
+	PacketSeqs      []int
+	StartTime       time.Time
+	PacketTimes     map[int]PacketTime
+	lastReceivedSeq int         // Last received sequence number for out-of-order detection
+	outOfOrder      int         // Count of packets received out of order
+	duplicates      int         // Count of duplicate packets received
+	receivedSeqs    map[int]int // Track how many times each seq was received
+	mu              sync.RWMutex
+}
+
+// ClientStats tracks client-side statistics
+type ClientStats struct {
+	PacketTimes map[int]PacketTime
 	mu          sync.RWMutex
 }
 
-// TrafficSim struct with improved cycle tracking
-type TrafficSim struct {
-	// Use atomic for thread-safe access
-	Running       int32 // 0 = stopped, 1 = Running
-	stopping      int32 // 0 = not stopping, 1 = stopping
-	Errored       bool
-	ThisAgent     primitive.ObjectID
-	OtherAgent    primitive.ObjectID
-	Conn          *net.UDPConn
-	connMu        sync.RWMutex // Protect connection access
-	IPAddress     string
-	Port          int64
-	IsServer      bool
-	LastResponse  time.Time
-	AllowedAgents []primitive.ObjectID
-	Connections   map[primitive.ObjectID]*Connection
-	ConnectionsMu sync.RWMutex
-	ClientStats   *ClientStats
-	Sequence      int
-	DataChan      chan ProbeData
-	Probe         *Probe
-	testComplete  chan bool
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
-	currentTestMu sync.RWMutex
-	inTestCycle   bool
+// -------------------- TrafficSim Main Struct --------------------
 
-	// Enhanced tracking
-	flowStats        map[string]*FlowStats // key: "src-dst"
-	flowStatsMu      sync.RWMutex
-	serverStats      *ServerStats
-	lastServerReport time.Time
+// TrafficSim handles UDP traffic simulation between agents
+type TrafficSim struct {
+	// State management (atomic for thread safety)
+	running  int32
+	stopping int32
+
+	// Identity
+	ThisAgent  uint // This agent's ID
+	OtherAgent uint // Target agent's ID
+
+	// Connection
+	conn   *net.UDPConn
+	connMu sync.RWMutex
+
+	// Target
+	IPAddress string
+	Port      int64
+	IsServer  bool
+
+	// Server mode: allowed agents
+	AllowedAgents []uint
+	connections   map[uint]*AgentConnection
+	connectionsMu sync.RWMutex
+
+	// Statistics
+	clientStats  *ClientStats
+	lastResponse time.Time
+	sequence     int
+	sequenceMu   sync.Mutex
 
 	// Cycle tracking
 	currentCycle   *CycleTracker
 	cycleMu        sync.RWMutex
-	packetsInCycle int // Track actual packets sent in current cycle
+	packetsInCycle int
 
-	// Connection state tracking
-	connectionValid     bool
-	connectionValidMu   sync.RWMutex
-	lastConnectionCheck time.Time
+	// Control
+	DataChan chan ProbeData
+	Probe    *Probe
+	stopChan chan struct{}
+	wg       sync.WaitGroup
 
-	localIP                string
-	localIPMu              sync.RWMutex
-	preferredInterface     string // Name of preferred interface (e.g., "en0", "eth0")
-	lastInterfaceCheck     time.Time
-	InterfaceCheckInterval time.Duration
+	// Connection validity
+	connectionValid   bool
+	connectionValidMu sync.RWMutex
 
-	sync.Mutex
+	// Bidirectional mode: server sends test data back to connected clients
+	// When a client connects, if this agent has a TRAFFICSIM client probe targeting that agent,
+	// we use the existing connection to measure reverse direction and report with that probe's ID
+	allProbes         []Probe // All probes for this agent to find client probes
+	allProbesMu       sync.RWMutex
+	GetProbesFunc     func() []Probe // Callback to dynamically get current probes
+	reverseSequence   int
+	reverseSequenceMu sync.Mutex
 }
 
-// New helper methods for safe connection handling
-func (ts *TrafficSim) getConnection() *net.UDPConn {
+// AgentConnection tracks a client connection on server side
+type AgentConnection struct {
+	AgentID     uint
+	Addr        *net.UDPAddr
+	LastSeen    time.Time
+	FirstSeen   time.Time
+	PacketsRecv int
+	PacketsSent int
+
+	// Reverse direction tracking (for bidirectional mode)
+	// ClientProbeID is the ID of this agent's TrafficSim client probe targeting the connected agent
+	// Used to report reverse direction stats with the correct probe ID
+	ClientProbeID   uint
+	ReverseCycle    *CycleTracker
+	ReverseSequence int
+	LastReportTime  time.Time
+}
+
+// -------------------- Constructor --------------------
+
+// NewTrafficSim creates a new TrafficSim instance
+func NewTrafficSim(probe *Probe, dataChan chan ProbeData) *TrafficSim {
+	ts := &TrafficSim{
+		Probe:         probe,
+		DataChan:      dataChan,
+		AllowedAgents: make([]uint, 0),
+		connections:   make(map[uint]*AgentConnection),
+		clientStats:   &ClientStats{PacketTimes: make(map[int]PacketTime)},
+	}
+
+	// Parse probe configuration
+	if probe.Server {
+		ts.IsServer = true
+	}
+
+	// Get target from probe targets
+	if len(probe.Targets) > 0 {
+		target := probe.Targets[0]
+		if target.AgentID != nil {
+			ts.OtherAgent = *target.AgentID
+		}
+		if target.Target != "" {
+			ts.parseTarget(target.Target)
+		}
+	}
+
+	// For server mode, additional targets are allowed agents
+	if ts.IsServer && len(probe.Targets) > 1 {
+		for i := 1; i < len(probe.Targets); i++ {
+			if probe.Targets[i].AgentID != nil {
+				ts.AllowedAgents = append(ts.AllowedAgents, *probe.Targets[i].AgentID)
+			}
+		}
+	}
+
+	return ts
+}
+
+func (ts *TrafficSim) parseTarget(target string) {
+	// Parse "IP:PORT" format
+	if idx := strings.LastIndex(target, ":"); idx != -1 {
+		ts.IPAddress = target[:idx]
+		if port, err := strconv.ParseInt(target[idx+1:], 10, 64); err == nil {
+			ts.Port = port
+		}
+	} else {
+		ts.IPAddress = target
+		ts.Port = 5000 // Default port
+	}
+}
+
+// -------------------- State Management --------------------
+
+func (ts *TrafficSim) isRunning() bool {
+	return atomic.LoadInt32(&ts.running) == 1
+}
+
+func (ts *TrafficSim) isStopping() bool {
+	return atomic.LoadInt32(&ts.stopping) == 1
+}
+
+func (ts *TrafficSim) getConn() *net.UDPConn {
 	ts.connMu.RLock()
 	defer ts.connMu.RUnlock()
-	return ts.Conn
+	return ts.conn
 }
 
-func (ts *TrafficSim) setConnection(conn *net.UDPConn) {
+func (ts *TrafficSim) setConn(conn *net.UDPConn) {
 	ts.connMu.Lock()
 	defer ts.connMu.Unlock()
-	if ts.Conn != nil && ts.Conn != conn {
-		ts.Conn.Close()
+	if ts.conn != nil && ts.conn != conn {
+		ts.conn.Close()
 	}
-	ts.Conn = conn
+	ts.conn = conn
 	ts.setConnectionValid(conn != nil)
 }
 
@@ -107,2778 +250,151 @@ func (ts *TrafficSim) setConnectionValid(valid bool) {
 	ts.connectionValidMu.Lock()
 	defer ts.connectionValidMu.Unlock()
 	ts.connectionValid = valid
-	if !valid {
-		log.Printf("TrafficSim: Connection marked as invalid")
-	}
 }
 
-// Fixed runTestCycles to handle connection failures gracefully
-func (ts *TrafficSim) runTestCycles(ctx context.Context, errChan chan<- error, mtrProbe *Probe, isConnected bool) {
-	connectionState := isConnected
-	consecutiveFailures := 0
-
-	// This loop should NEVER exit unless explicitly stopped
-	for {
-		// Check for shutdown conditions at the start of each cycle
-		select {
-		case <-ctx.Done():
-			log.Printf("TrafficSim: Context cancelled, stopping test cycles")
-			return
-		case <-ts.stopChan:
-			log.Printf("TrafficSim: Stop signal received, stopping test cycles")
-			return
-		default:
-			// Continue with the cycle
-		}
-
-		// Check if we're still running
-		if !ts.isRunning() {
-			log.Printf("TrafficSim: Not running, stopping test cycles")
-			return
-		}
-
-		// Check if we're in the process of stopping
-		if ts.isStopping() {
-			log.Printf("TrafficSim: Stopping flag set, exiting test cycles")
-			ts.setInTestCycle(false)
-			return
-		}
-
-		// Start of a new test cycle
-		ts.setInTestCycle(true)
-
-		// Initialize a new cycle tracker
-		cycle := ts.startNewCycle()
-
-		// Get flow for this test cycle
-		flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
-
-		testStartTime := time.Now()
-		log.Printf("TrafficSim: Starting test cycle (connection state: %v, starting seq: %d)", connectionState, cycle.StartSeq)
-
-		// Check if we need to re-establish connection
-		if !connectionState || !ts.isConnectionValid() {
-			log.Printf("TrafficSim: Connection lost or not established, attempting handshake...")
-			connectionState = ts.continuousHandshakeAttempts(ctx, flow, cycle)
-			if connectionState {
-				consecutiveFailures = 0
-				log.Printf("TrafficSim: Connection re-established successfully")
-			} else {
-				log.Printf("TrafficSim: Failed to re-establish connection, will continue with offline mode")
-			}
-		}
-
-		// Send data packets - track exactly TrafficSim_ReportSeq packets
-		cycleFailures := 0
-
-		for ts.getPacketsInCurrentCycle() < TrafficSim_ReportSeq {
-			// Check for shutdown during packet sending
-			select {
-			case <-ctx.Done():
-				ts.setInTestCycle(false)
-				return
-			case <-ts.stopChan:
-				ts.setInTestCycle(false)
-				return
-			default:
-			}
-
-			if !ts.isRunning() {
-				ts.setInTestCycle(false)
-				return
-			}
-
-			// If we're stopping and have sent at least one packet, break
-			if ts.isStopping() && ts.getPacketsInCurrentCycle() > 0 {
-				break
-			}
-
-			// Check connection validity
-			needsReconnect := !connectionState || !ts.isConnectionValid()
-
-			if needsReconnect {
-				log.Printf("TrafficSim: No connection, attempting reconnection (packet %d/%d in cycle)...",
-					ts.getPacketsInCurrentCycle()+1, TrafficSim_ReportSeq)
-
-				// Try to re-establish connection without losing cycle state
-				if ts.reestablishConnection() {
-					// attemptSingleHandshake will increment sequence and packetsInCycle
-					if ts.attemptSingleHandshake(flow, cycle) {
-						connectionState = true
-						log.Printf("TrafficSim: Reconnection successful")
-					} else {
-						connectionState = false
-						log.Printf("TrafficSim: Reconnection failed")
-					}
-				} else {
-					// Can't establish UDP connection, send a failed packet anyway
-					ts.recordFailedPacket(cycle, flow)
-					cycleFailures++
-					log.Printf("TrafficSim: No connection for packet %d (marked as failed)", ts.Sequence+1)
-				}
-			} else {
-				// We have a connection, send a regular data packet
-				if !ts.sendDataPacket(cycle, flow) {
-					cycleFailures++
-					connectionState = false
-					ts.setConnectionValid(false)
-				}
-			}
-
-			// Wait for interval before next packet
-			select {
-			case <-time.After(TrafficSim_DataInterval * time.Second):
-			case <-ctx.Done():
-				ts.setInTestCycle(false)
-				return
-			case <-ts.stopChan:
-				ts.setInTestCycle(false)
-				return
-			}
-		}
-
-		// Complete the cycle
-		ts.completeCycle(cycle)
-
-		// Reset sequence counter after reporting
-		ts.Mutex.Lock()
-		if ts.Sequence >= TrafficSim_ReportSeq {
-			log.Printf("TrafficSim: Resetting sequence from %d to 0 after cycle", ts.Sequence)
-			ts.Sequence = 0
-		}
-		ts.Mutex.Unlock()
-
-		// Update consecutive failures counter
-		if cycleFailures >= TrafficSim_ReportSeq/2 { // If more than half the packets failed
-			consecutiveFailures++
-			log.Printf("TrafficSim: Cycle had %d/%d failures, consecutive failure count: %d",
-				cycleFailures, TrafficSim_ReportSeq, consecutiveFailures)
-		} else if cycleFailures == 0 {
-			consecutiveFailures = 0
-		}
-
-		// Wait for responses to all packets in this cycle
-		log.Printf("TrafficSim: Waiting for responses to packets in cycle (sequences: %v)...",
-			cycle.PacketSeqs)
-		ts.waitForCycleResponses(ctx, cycle)
-
-		// Calculate and report stats for this cycle
-		ts.reportCycleStats(mtrProbe, cycle)
-
-		// Clean up old packet times (keep last 2 cycles worth)
-		ts.cleanupOldPacketTimes(cycle.StartSeq)
-
-		ts.setInTestCycle(false)
-
-		// Check if we should stop after this cycle
-		if ts.isStopping() {
-			log.Print("TrafficSim: Completed final test cycle before shutdown")
-			return
-		}
-
-		log.Printf("TrafficSim: Test cycle completed in %v (connection state: %v, packets sent: %d)",
-			time.Since(testStartTime), connectionState, len(cycle.PacketSeqs))
-
-		// Small delay before next cycle - but check for shutdown during delay
-		select {
-		case <-time.After(1 * time.Second):
-			// Continue to next cycle
-		case <-ctx.Done():
-			log.Printf("TrafficSim: Context cancelled during cycle delay")
-			return
-		case <-ts.stopChan:
-			log.Printf("TrafficSim: Stop signal during cycle delay")
-			return
-		}
-
-		// Loop will continue to next cycle automatically
-	}
+// SetAllProbes stores all probes for this agent, enabling bidirectional detection
+// When a client connects, the server can check if it has a client probe for that agent
+func (ts *TrafficSim) SetAllProbes(probes []Probe) {
+	ts.allProbesMu.Lock()
+	defer ts.allProbesMu.Unlock()
+	ts.allProbes = probes
+	log.Printf("[trafficsim] Server loaded %d probes for bidirectional detection", len(probes))
 }
 
-// getInterfaceByIP finds the interface that has the given IP
-func (ts *TrafficSim) getInterfaceByIP(ip string) (*net.Interface, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, iface := range interfaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok {
-				if ipnet.IP.String() == ip {
-					return &iface, nil
-				}
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("interface with IP %s not found", ip)
-}
-
-// New method to send a data packet with proper error handling
-// Modified sendDataPacket to handle interface changes
-func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker, flow *FlowStats) bool {
-	ts.Mutex.Lock()
-	ts.Sequence++
-	currentSeq := ts.Sequence
-	ts.Mutex.Unlock()
-
-	// Add this sequence to the current cycle
-	ts.addSequenceToCycle(cycle, currentSeq)
-
-	sentTime := time.Now().UnixMilli()
-	data := TrafficSimData{Sent: sentTime, Seq: currentSeq}
-
-	// Track packet in cycle-specific stats
-	cycle.mu.Lock()
-	cycle.PacketTimes[currentSeq] = PacketTime{
-		Sent: sentTime,
-		Size: 0,
-	}
-	cycle.mu.Unlock()
-
-	// Also track in ClientStats for backward compatibility
-	ts.ClientStats.mu.Lock()
-	ts.ClientStats.PacketTimes[currentSeq] = PacketTime{
-		Sent: sentTime,
-		Size: 0,
-	}
-	ts.ClientStats.mu.Unlock()
-
-	// Try to send packet
-	dataMsg, err := ts.buildMessage(TrafficSim_DATA, data)
-	if err != nil {
-		log.Printf("TrafficSim: Error building data message: %v", err)
-		ts.markPacketAsFailed(currentSeq, cycle)
-		ts.incrementPacketsInCycle()
-		return false
-	}
-
-	msgSize := len(dataMsg)
-
-	// Update packet size in both trackers
-	cycle.mu.Lock()
-	if pt, ok := cycle.PacketTimes[currentSeq]; ok {
-		pt.Size = msgSize
-		cycle.PacketTimes[currentSeq] = pt
-	}
-	cycle.mu.Unlock()
-
-	ts.ClientStats.mu.Lock()
-	if pt, ok := ts.ClientStats.PacketTimes[currentSeq]; ok {
-		pt.Size = msgSize
-		ts.ClientStats.PacketTimes[currentSeq] = pt
-	}
-	ts.ClientStats.mu.Unlock()
-
-	// Get current connection
-	conn := ts.getConnection()
-	if conn == nil {
-		log.Printf("TrafficSim: No connection available for packet %d", currentSeq)
-		ts.markPacketAsFailed(currentSeq, cycle)
-		ts.incrementPacketsInCycle()
-		return false
-	}
-
-	// Set write deadline to detect connection issues quickly
-	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	_, sendErr := conn.Write([]byte(dataMsg))
-	conn.SetWriteDeadline(time.Time{}) // Clear deadline
-
-	// Record packet sent
-	ts.recordPacketSent(flow, currentSeq, msgSize)
-
-	if sendErr != nil {
-		log.Printf("TrafficSim: Failed to send packet %d: %v", currentSeq, sendErr)
-		ts.markPacketAsFailed(currentSeq, cycle)
-
-		// Check if this is a connection-related error
-		if ts.isConnectionError(sendErr) {
-			log.Printf("TrafficSim: Connection error detected, marking connection as invalid")
-			ts.setConnectionValid(false)
-
-			// If it's an address-related error, force interface reselection
-			if strings.Contains(sendErr.Error(), "can't assign requested address") {
-				ts.localIPMu.Lock()
-				ts.localIP = ""
-				ts.lastInterfaceCheck = time.Time{}
-				ts.localIPMu.Unlock()
-			}
-		}
-
-		ts.incrementPacketsInCycle()
-		return false
-	}
-
-	// Increment packets in cycle counter
-	ts.incrementPacketsInCycle()
-	return true
-}
-
-// New method to record a failed packet
-func (ts *TrafficSim) recordFailedPacket(cycle *CycleTracker, flow *FlowStats) {
-	ts.Mutex.Lock()
-	ts.Sequence++
-	currentSeq := ts.Sequence
-	ts.Mutex.Unlock()
-
-	ts.addSequenceToCycle(cycle, currentSeq)
-
-	// Track failed packet
-	sentTime := time.Now().UnixMilli()
-	cycle.mu.Lock()
-	cycle.PacketTimes[currentSeq] = PacketTime{
-		Sent:     sentTime,
-		Size:     0,
-		TimedOut: true,
-	}
-	cycle.mu.Unlock()
-
-	ts.ClientStats.mu.Lock()
-	ts.ClientStats.PacketTimes[currentSeq] = PacketTime{
-		Sent:     sentTime,
-		Size:     0,
-		TimedOut: true,
-	}
-	ts.ClientStats.mu.Unlock()
-
-	ts.incrementPacketsInCycle()
-}
-
-// Fixed reestablishConnection to handle connection reopening properly
-func (ts *TrafficSim) reestablishConnection() bool {
-	// Close existing connection if any
-	ts.closeConnection()
-
-	// Try to establish new connection
-	return ts.establishUDPConnection()
-}
-
-// Fixed receiveDataLoop to handle connection errors gracefully
-func (ts *TrafficSim) receiveDataLoop(ctx context.Context, errChan chan<- error) {
-	reconnectDelay := 100 * time.Millisecond
-	maxReconnectDelay := 5 * time.Second
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			if !ts.isRunning() && !ts.isStopping() {
-				return
-			}
-
-			// Get current connection
-			conn := ts.getConnection()
-			if conn == nil {
-				// No connection, wait a bit and check again
-				select {
-				case <-time.After(reconnectDelay):
-					if reconnectDelay < maxReconnectDelay {
-						reconnectDelay *= 2
-					}
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			msgBuf := make([]byte, 2048)
-			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			msgLen, _, err := conn.ReadFromUDP(msgBuf)
-
-			if err != nil {
-				// Handle timeout separately - it's expected
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-
-				// Handle temporary errors
-				if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-					log.Printf("TrafficSim: Temporary error reading from UDP: %v", err)
-					continue
-				}
-
-				// Check for "use of closed network connection" error
-				if strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("TrafficSim: Detected closed connection in receive loop, marking as invalid")
-					ts.setConnectionValid(false)
-					reconnectDelay = 100 * time.Millisecond // Reset delay
-					continue
-				}
-
-				// Check if this is a connection error that should invalidate the connection
-				if ts.isConnectionError(err) {
-					log.Printf("TrafficSim: Connection error in receive loop: %v", err)
-					ts.setConnectionValid(false)
-					reconnectDelay = 100 * time.Millisecond // Reset delay
-					continue
-				}
-
-				// Other errors might be fatal
-				select {
-				case errChan <- fmt.Errorf("error reading from UDP: %w", err):
-				default:
-				}
-				return
-			}
-
-			// Successfully received data, reset reconnect delay
-			reconnectDelay = 100 * time.Millisecond
-
-			var tsMsg TrafficSimMsg
-			if err := json.Unmarshal(msgBuf[:msgLen], &tsMsg); err != nil {
-				log.Printf("TrafficSim: Error unmarshalling message: %v", err)
-				continue
-			}
-
-			switch tsMsg.Type {
-			case TrafficSim_ACK:
-				ts.handleACK(tsMsg.Data)
-			case TrafficSim_REPORT:
-				ts.handleServerReport(tsMsg.Data)
-			case TrafficSim_PONG:
-				ts.handlePong(tsMsg.Data)
-			case TrafficSim_HELLO:
-				// Handle hello response during handshake
-				if tsMsg.Data.Seq > 0 {
-					ts.handleACK(tsMsg.Data)
-				}
-			}
-		}
-	}
-}
-
-// Modified establishUDPConnection with better error handling and retries
-func (ts *TrafficSim) establishUDPConnection() bool {
-	// Get current local IP - this will select the best interface
-	localIP, err := ts.getLocalIP()
-	if err != nil {
-		log.Printf("TrafficSim: Failed to get local IP: %v", err)
-		return false
-	}
-
-	toAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ts.IPAddress, ts.Port))
-	if err != nil {
-		log.Printf("TrafficSim: Could not resolve %s:%d: %v", ts.IPAddress, ts.Port, err)
-		return false
-	}
-
-	// Try to establish connection with retries on different interfaces if needed
-	maxRetries := 3
-	for retry := 0; retry < maxRetries; retry++ {
-		localAddr, err := net.ResolveUDPAddr("udp4", localIP+":0")
-		if err != nil {
-			log.Printf("TrafficSim: Could not resolve local address %s: %v", localIP, err)
-			// Try to get a new IP
-			localIP, err = ts.getLocalIP()
-			if err != nil {
-				return false
-			}
-			continue
-		}
-
-		conn, err := net.DialUDP("udp4", localAddr, toAddr)
-		if err != nil {
-			log.Printf("TrafficSim: Unable to connect from %s to %s:%d: %v", localIP, ts.IPAddress, ts.Port, err)
-
-			// If it's a network-related error, try to get a new interface
-			if strings.Contains(err.Error(), "can't assign requested address") ||
-				strings.Contains(err.Error(), "network is unreachable") {
-				// Force interface reselection
-				ts.localIPMu.Lock()
-				ts.localIP = ""
-				ts.lastInterfaceCheck = time.Time{}
-				ts.localIPMu.Unlock()
-
-				// Get a new IP
-				localIP, err = ts.getLocalIP()
-				if err != nil {
-					return false
-				}
-
-				// Small delay before retry
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-
-			return false
-		}
-
-		// Connection successful - save the interface name for future preference
-		if iface, err := ts.getInterfaceByIP(localIP); err == nil {
-			ts.preferredInterface = iface.Name
-		}
-
-		// Set the new connection
-		ts.setConnection(conn)
-		log.Printf("TrafficSim: UDP connection established from %s to %s:%d", localIP, ts.IPAddress, ts.Port)
-		return true
-	}
-
-	return false
-}
-
-// isIPStillValid checks if an IP address is still valid on the system
-func (ts *TrafficSim) isIPStillValid(ip string) bool {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return false
-	}
-
-	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok {
-				if ipnet.IP.String() == ip {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
-}
-
-// testInterfaceConnectivity tests if an interface can actually send packets
-func (ts *TrafficSim) testInterfaceConnectivity(localIP string) bool {
-	// Try to create a UDP socket bound to this IP
-	localAddr, err := net.ResolveUDPAddr("udp4", localIP+":0")
-	if err != nil {
-		return false
-	}
-
-	// Try to dial a well-known public DNS server
-	// Using 8.8.8.8:53 (Google DNS) as it's generally accessible
-	remoteAddr, err := net.ResolveUDPAddr("udp4", "8.8.8.8:53")
-	if err != nil {
-		return false
-	}
-
-	conn, err := net.DialUDP("udp4", localAddr, remoteAddr)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-
-	// Set a short deadline
-	conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
-
-	// Try to send a small packet
-	_, err = conn.Write([]byte{0x00})
-	if err != nil {
-		return false
-	}
-
-	// If we can bind and send, consider it valid
-	// We don't wait for a response as we just want to test binding
-	return true
-}
-
-// NetworkInterface represents a network interface with scoring for selection
-type NetworkInterface struct {
-	Name      string
-	IP        net.IP
-	Interface net.Interface
-	Score     int
-}
-
-// selectBestInterface selects the most suitable network interface for outbound traffic
-func (ts *TrafficSim) selectBestInterface() (net.Interface, string, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return net.Interface{}, "", fmt.Errorf("failed to list interfaces: %w", err)
-	}
-
-	var candidates []NetworkInterface
-
-	for _, iface := range interfaces {
-		// Skip down interfaces
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-
-		// Skip loopback interfaces
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		// Get addresses for this interface
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			ipnet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-
-			// Only consider IPv4 addresses
-			ip := ipnet.IP.To4()
-			if ip == nil {
-				continue
-			}
-
-			// Skip link-local addresses
-			if ip.IsLinkLocalUnicast() {
-				continue
-			}
-
-			// Calculate score for this interface
-			score := ts.scoreInterface(iface, ip)
-
-			candidates = append(candidates, NetworkInterface{
-				Name:      iface.Name,
-				IP:        ip,
-				Interface: iface,
-				Score:     score,
-			})
-		}
-	}
-
-	if len(candidates) == 0 {
-		return net.Interface{}, "", fmt.Errorf("no suitable network interfaces found")
-	}
-
-	// Sort by score (highest first)
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Score > candidates[j].Score
-	})
-
-	// Test connectivity for top candidates
-	for _, candidate := range candidates {
-		if ts.testInterfaceConnectivity(candidate.IP.String()) {
-			return candidate.Interface, candidate.IP.String(), nil
-		}
-	}
-
-	// If no interface passed connectivity test, return the highest scored one
-	best := candidates[0]
-	return best.Interface, best.IP.String(), nil
-}
-
-// scoreInterface assigns a score to an interface based on various criteria
-func (ts *TrafficSim) scoreInterface(iface net.Interface, ip net.IP) int {
-	score := 0
-
-	// Prefer running interfaces
-	if iface.Flags&net.FlagRunning != 0 {
-		score += 20
-	}
-
-	// Prefer multicast capable interfaces
-	if iface.Flags&net.FlagMulticast != 0 {
-		score += 5
-	}
-
-	// Prefer broadcast capable interfaces
-	if iface.Flags&net.FlagBroadcast != 0 {
-		score += 5
-	}
-
-	// Prefer interfaces with standard names
-	name := strings.ToLower(iface.Name)
-	if strings.HasPrefix(name, "en") || strings.HasPrefix(name, "eth") {
-		score += 15
-	} else if strings.HasPrefix(name, "wlan") || strings.HasPrefix(name, "wi") {
-		score += 10
-	}
-
-	// Prefer previously used interface
-	if ts.preferredInterface != "" && iface.Name == ts.preferredInterface {
-		score += 25
-	}
-
-	// Prefer private network ranges (more likely to be primary interfaces)
-	if ip.IsPrivate() {
-		score += 10
-
-		// Prefer common private ranges
-		if ip[0] == 192 && ip[1] == 168 {
-			score += 5 // Home/small office networks
-		} else if ip[0] == 10 {
-			score += 3 // Corporate networks
-		}
-	}
-
-	// Avoid virtual interfaces
-	if strings.Contains(name, "veth") || strings.Contains(name, "docker") ||
-		strings.Contains(name, "br-") || strings.Contains(name, "virbr") {
-		score -= 20
-	}
-
-	// Avoid VPN interfaces
-	if strings.Contains(name, "tun") || strings.Contains(name, "tap") ||
-		strings.Contains(name, "utun") || strings.Contains(name, "ppp") {
-		score -= 15
-	}
-
-	// Avoid VMware interfaces
-	if strings.Contains(name, "vmnet") {
-		score -= 20
-	}
-
-	return score
-}
-
-// Fixed runClientSession to handle connection failures better
-func (ts *TrafficSim) runClientSession(ctx context.Context, mtrProbe *Probe, isConnected bool) error {
-	errChan := make(chan error, 3)
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Start test cycles - this runs forever until stopped
-	ts.wg.Add(1)
-	go func() {
-		defer ts.wg.Done()
-		ts.runTestCycles(sessionCtx, errChan, mtrProbe, isConnected)
-		// If runTestCycles returns, send a signal that it's done
-		select {
-		case errChan <- fmt.Errorf("test cycles stopped"):
-		default:
-		}
-	}()
-
-	// Always start receive loop - it will handle connection state
-	ts.wg.Add(1)
-	go func() {
-		defer ts.wg.Done()
-		ts.receiveDataLoop(sessionCtx, errChan)
-	}()
-
-	// Only run ping loop if initially connected
-	if isConnected && ts.getConnection() != nil {
-		ts.wg.Add(1)
-		go func() {
-			defer ts.wg.Done()
-			ts.runPingLoop(sessionCtx, errChan)
-		}()
-	}
-
-	// Wait for session to complete
-	select {
-	case err := <-errChan:
-		cancel()
-		ts.wg.Wait()
-
-		// Don't treat connection errors as fatal - just log them
-		if err != nil && strings.Contains(err.Error(), "test cycles stopped") {
-			return nil
-		}
-		return err
-	case <-sessionCtx.Done():
-		ts.wg.Wait()
-		return sessionCtx.Err()
-	case <-ts.stopChan:
-		cancel()
-		ts.wg.Wait()
-		return nil
-	}
-}
-
-// Fixed runPingLoop to handle connection state changes
-func (ts *TrafficSim) runPingLoop(ctx context.Context, errChan chan<- error) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !ts.isRunning() {
-				continue
-			}
-
-			conn := ts.getConnection()
-			if conn == nil || !ts.isConnectionValid() {
-				continue
-			}
-
-			pingData := TrafficSimData{
-				Sent: time.Now().UnixMilli(),
-				Seq:  -1, // Special sequence for ping
-			}
-
-			pingMsg, err := ts.buildMessage(TrafficSim_PING, pingData)
-			if err != nil {
-				continue
-			}
-
-			conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-			_, err = conn.Write([]byte(pingMsg))
-			conn.SetWriteDeadline(time.Time{}) // Clear deadline
-
-			if err != nil {
-				log.Printf("TrafficSim: Failed to send ping: %v", err)
-				if ts.isConnectionError(err) {
-					ts.setConnectionValid(false)
-				}
-			}
-		}
-	}
-}
-
-// Keep all the existing helper methods and other functions from the original code...
-// (Include all the other methods from the original file that weren't modified)
-
-// New helper methods for cycle management
-func (ts *TrafficSim) startNewCycle() *CycleTracker {
-	ts.cycleMu.Lock()
-	defer ts.cycleMu.Unlock()
-
-	ts.Mutex.Lock()
-	startSeq := ts.Sequence + 1
-	ts.Mutex.Unlock()
-
-	cycle := &CycleTracker{
-		StartSeq:    startSeq,
-		StartTime:   time.Now(),
-		PacketSeqs:  make([]int, 0, TrafficSim_ReportSeq),
-		PacketTimes: make(map[int]PacketTime),
-	}
-
-	ts.currentCycle = cycle
-	ts.packetsInCycle = 0
-
-	return cycle
-}
-
-func (ts *TrafficSim) addSequenceToCycle(cycle *CycleTracker, seq int) {
-	cycle.mu.Lock()
-	defer cycle.mu.Unlock()
-	cycle.PacketSeqs = append(cycle.PacketSeqs, seq)
-}
-
-func (ts *TrafficSim) completeCycle(cycle *CycleTracker) {
-	cycle.mu.Lock()
-	defer cycle.mu.Unlock()
-
-	if len(cycle.PacketSeqs) > 0 {
-		cycle.EndSeq = cycle.PacketSeqs[len(cycle.PacketSeqs)-1]
+// GetClientProbeForAgent finds a TRAFFICSIM probe targeting the given agent for bidirectional testing.
+// The controller creates TRAFFICSIM probes when:
+// 1. Target agent has a server (client mode)
+// 2. Owner agent has a server (bidirectional mode - target marked with ":bidir")
+// Returns the probe if found, nil otherwise
+func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
+	// First try using dynamic probe retrieval if available (preferred for freshest data)
+	var probesToCheck []Probe
+	if ts.GetProbesFunc != nil {
+		probesToCheck = ts.GetProbesFunc()
 	} else {
-		cycle.EndSeq = cycle.StartSeq
+		// Fallback to stored probe list
+		ts.allProbesMu.RLock()
+		probesToCheck = ts.allProbes
+		ts.allProbesMu.RUnlock()
 	}
-}
 
-func (ts *TrafficSim) getPacketsInCurrentCycle() int {
-	ts.cycleMu.RLock()
-	defer ts.cycleMu.RUnlock()
-	return ts.packetsInCycle
-}
+	for i := range probesToCheck {
+		p := &probesToCheck[i]
 
-func (ts *TrafficSim) incrementPacketsInCycle() {
-	ts.cycleMu.Lock()
-	defer ts.cycleMu.Unlock()
-	ts.packetsInCycle++
-}
-
-// Modified waitForCycleResponses to work with CycleTracker
-func (ts *TrafficSim) waitForCycleResponses(ctx context.Context, cycle *CycleTracker) {
-	waitStart := time.Now()
-	maxWaitTime := PacketTimeout + (500 * time.Millisecond)
-	checkInterval := 50 * time.Millisecond
-
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for time.Since(waitStart) < maxWaitTime {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !ts.isRunning() && !ts.isStopping() {
-				return
-			}
-
-			cycle.mu.Lock()
-			allComplete := true
-			now := time.Now().UnixMilli()
-
-			// Check only packets in this cycle
-			for _, seq := range cycle.PacketSeqs {
-				if pTime, ok := cycle.PacketTimes[seq]; ok {
-					if pTime.Received == 0 && !pTime.TimedOut {
-						if now-pTime.Sent > int64(PacketTimeout.Milliseconds()) {
-							pTime.TimedOut = true
-							cycle.PacketTimes[seq] = pTime
-
-							// Also update in ClientStats
-							ts.ClientStats.mu.Lock()
-							if pt, ok := ts.ClientStats.PacketTimes[seq]; ok {
-								pt.TimedOut = true
-								ts.ClientStats.PacketTimes[seq] = pt
-							}
-							ts.ClientStats.mu.Unlock()
-
-							// Mark packet as timed out in flow
-							flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
-							flow.mu.Lock()
-							if detail, exists := flow.PacketDetails[seq]; exists {
-								detail.TimedOut = true
-							}
-							flow.mu.Unlock()
-
-							log.Printf("TrafficSim: Packet %d timed out", seq)
-						} else {
-							allComplete = false
-						}
-					}
+		// Check for TRAFFICSIM client probes (not server) targeting the connected agent
+		if p.Type == ProbeType_TRAFFICSIM && !p.Server {
+			for _, t := range p.Targets {
+				if t.AgentID != nil && *t.AgentID == targetAgentID {
+					log.Debugf("[trafficsim] Found TRAFFICSIM probe %d for connected agent %d (bidirectional enabled)", p.ID, targetAgentID)
+					return p
 				}
 			}
-			cycle.mu.Unlock()
-
-			if allComplete {
-				log.Printf("TrafficSim: All packets in cycle complete or timed out")
-				return
-			}
 		}
 	}
-}
-
-// Modified reportCycleStats to work with CycleTracker
-func (ts *TrafficSim) reportCycleStats(mtrProbe *Probe, cycle *CycleTracker) {
-	// Calculate stats based on this cycle's packets
-	stats := ts.calculateCycleStatsFromTracker(mtrProbe, cycle)
-
-	// Add flow statistics
-	flowStats := make(map[string]interface{})
-	ts.flowStatsMu.RLock()
-	for flowKey, flow := range ts.flowStats {
-		flowStats[flowKey] = ts.calculateFlowStats(flow)
-	}
-	ts.flowStatsMu.RUnlock()
-
-	stats["flows"] = flowStats
-	stats["timestamp"] = time.Now()
-	stats["cycleRange"] = map[string]int{
-		"startSeq": cycle.StartSeq,
-		"endSeq":   cycle.EndSeq,
-	}
-
-	if ts.DataChan != nil && ts.isRunning() {
-		if ts.Probe.ID == primitive.NilObjectID {
-			log.Warn("TrafficSim: Skipping reportStats due to empty ProbeID")
-			return
-		}
-
-		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
-		if err != nil {
-			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
-			return
-		}
-
-		select {
-		case ts.DataChan <- ProbeData{
-			ProbeID:   ts.Probe.ID,
-			Triggered: false,
-			CreatedAt: time.Now(),
-			Data:      stats,
-			Target: ProbeTarget{
-				Target: string(ProbeType_TRAFFICSIM) + "%%%" + ts.IPAddress + ":" + strconv.FormatInt(ts.Port, 10),
-				Agent:  ts.Probe.Config.Target[0].Agent,
-				Group:  reportingAgent,
-			},
-		}:
-		default:
-			log.Print("TrafficSim: DataChan full, dropping stats report")
-		}
-	}
-}
-
-// Include all the remaining methods from the original file...
-// (All the type definitions, constants, and other methods remain the same)
-
-// New method to calculate stats from CycleTracker
-func (ts *TrafficSim) calculateCycleStatsFromTracker(mtrProbe *Probe, cycle *CycleTracker) map[string]interface{} {
-	cycle.mu.RLock()
-	defer cycle.mu.RUnlock()
-
-	var totalRTT, minRTT, maxRTT int64
-	var rtts []float64
-	lostPackets := 0
-	outOfOrder := 0
-	duplicatePackets := 0
-	receivedSequences := []int{}
-	totalPackets := len(cycle.PacketSeqs)
-
-	// Analyze all packets in this cycle (including HELLO packets)
-	for _, seq := range cycle.PacketSeqs {
-		if pTime, ok := cycle.PacketTimes[seq]; ok {
-			if pTime.Received == 0 || pTime.TimedOut {
-				lostPackets++
-				continue
-			}
-
-			receivedSequences = append(receivedSequences, seq)
-			rtt := pTime.Received - pTime.Sent
-			rtts = append(rtts, float64(rtt))
-			totalRTT += rtt
-
-			if minRTT == 0 || rtt < minRTT {
-				minRTT = rtt
-			}
-			if rtt > maxRTT {
-				maxRTT = rtt
-			}
-		} else {
-			// This packet sequence is in the cycle but not in PacketTimes - shouldn't happen
-			log.Printf("TrafficSim: Warning - packet %d in cycle but not in PacketTimes", seq)
-			lostPackets++
-		}
-	}
-
-	// Check for out of order packets
-	for i := 1; i < len(receivedSequences); i++ {
-		if receivedSequences[i] < receivedSequences[i-1] {
-			outOfOrder++
-		}
-	}
-
-	// Calculate statistics
-	avgRTT := float64(0)
-	stdDevRTT := float64(0)
-	if len(rtts) > 0 {
-		avgRTT = float64(totalRTT) / float64(len(rtts))
-		for _, rtt := range rtts {
-			stdDevRTT += math.Pow(rtt-avgRTT, 2)
-		}
-		stdDevRTT = math.Sqrt(stdDevRTT / float64(len(rtts)))
-	}
-
-	lossPercentage := float64(0)
-	if totalPackets > 0 {
-		lossPercentage = (float64(lostPackets) / float64(totalPackets)) * 100
-	}
-
-	// Create sequence range string showing all sequences
-	seqRangeStr := ""
-	if len(cycle.PacketSeqs) > 0 {
-		seqRangeStr = fmt.Sprintf("%d-%d", cycle.PacketSeqs[0], cycle.PacketSeqs[len(cycle.PacketSeqs)-1])
-	}
-
-	log.Printf("TrafficSim: Cycle Stats - Total: %d packets (sequences: %v), Lost: %d (%.2f%%), Out of Order: %d, Avg RTT: %.2fms",
-		totalPackets, cycle.PacketSeqs, lostPackets, lossPercentage, outOfOrder, avgRTT)
-
-	// Trigger MTR if packet loss exceeds threshold
-	if totalPackets > 0 && lossPercentage > 5.0 && ts.isRunning() && !ts.isStopping() {
-		ts.triggerMTR(mtrProbe, lossPercentage)
-	}
-
-	return map[string]interface{}{
-		"lostPackets":      lostPackets,
-		"lossPercentage":   lossPercentage,
-		"outOfSequence":    outOfOrder,
-		"duplicatePackets": duplicatePackets,
-		"averageRTT":       avgRTT,
-		"minRTT":           minRTT,
-		"maxRTT":           maxRTT,
-		"stdDevRTT":        stdDevRTT,
-		"totalPackets":     totalPackets,
-		"sequenceRange":    seqRangeStr,
-		"allSequences":     cycle.PacketSeqs,
-		"reportTime":       time.Now(),
-	}
-}
-
-// Modified markPacketAsFailed to also update cycle tracker
-func (ts *TrafficSim) markPacketAsFailed(seq int, cycle *CycleTracker) {
-	// Ensure the packet exists in cycle tracker before marking as failed
-	cycle.mu.Lock()
-	if _, ok := cycle.PacketTimes[seq]; !ok {
-		// If it doesn't exist, create it with the current time as sent time
-		cycle.PacketTimes[seq] = PacketTime{
-			Sent:     time.Now().UnixMilli(),
-			TimedOut: true,
-			Size:     0,
-		}
-	} else {
-		// If it exists, just mark as timed out
-		if pt, ok := cycle.PacketTimes[seq]; ok {
-			pt.TimedOut = true
-			cycle.PacketTimes[seq] = pt
-		}
-	}
-	cycle.mu.Unlock()
-
-	// Update in ClientStats
-	ts.ClientStats.mu.Lock()
-	if pt, ok := ts.ClientStats.PacketTimes[seq]; ok {
-		pt.TimedOut = true
-		ts.ClientStats.PacketTimes[seq] = pt
-	}
-	ts.ClientStats.mu.Unlock()
-
-	// Mark in flow stats
-	flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
-	flow.mu.Lock()
-	if detail, exists := flow.PacketDetails[seq]; exists {
-		detail.TimedOut = true
-	}
-	flow.mu.Unlock()
-}
-
-// Modified continuousHandshakeAttempts to properly count handshake packets
-func (ts *TrafficSim) continuousHandshakeAttempts(ctx context.Context, flow *FlowStats, cycle *CycleTracker) bool {
-	maxHandshakeTime := 10 * time.Second
-	handshakeStart := time.Now()
-
-	log.Printf("TrafficSim: Starting continuous handshake attempts...")
-
-	for time.Since(handshakeStart) < maxHandshakeTime {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-ts.stopChan:
-			return false
-		default:
-			if !ts.isRunning() || ts.isStopping() {
-				return false
-			}
-
-			// Check if we've already used up our packet budget with failed handshakes
-			if ts.getPacketsInCurrentCycle() >= TrafficSim_ReportSeq {
-				log.Printf("TrafficSim: Reached packet limit during handshake attempts")
-				return false
-			}
-
-			// Always try to establish fresh connection for handshake
-			ts.closeConnection()
-
-			if !ts.establishUDPConnection() {
-				// Wait a bit before trying again
-				select {
-				case <-time.After(1 * time.Second):
-				case <-ctx.Done():
-					return false
-				case <-ts.stopChan:
-					return false
-				}
-				continue
-			}
-
-			// Attempt handshake (this will increment packetsInCycle)
-			if ts.attemptSingleHandshake(flow, cycle) {
-				log.Printf("TrafficSim: Handshake successful after %v", time.Since(handshakeStart))
-				return true
-			}
-
-			// Wait before next handshake attempt
-			select {
-			case <-time.After(2 * time.Second):
-			case <-ctx.Done():
-				return false
-			case <-ts.stopChan:
-				return false
-			}
-		}
-	}
-
-	log.Printf("TrafficSim: Handshake attempts timed out after %v", time.Since(handshakeStart))
-	return false
-}
-
-// Modified attemptSingleHandshake to properly count as a packet in the cycle
-func (ts *TrafficSim) attemptSingleHandshake(flow *FlowStats, cycle *CycleTracker) bool {
-	// Increment sequence for this handshake attempt
-	ts.Mutex.Lock()
-	ts.Sequence++
-	helloSeq := ts.Sequence
-	ts.Mutex.Unlock()
-
-	// Add to current cycle
-	ts.addSequenceToCycle(cycle, helloSeq)
-	// Increment packetsInCycle - handshakes DO count towards the 60 packets per cycle
-	ts.incrementPacketsInCycle()
-
-	sentTime := time.Now().UnixMilli()
-
-	// Track handshake packet in both trackers
-	cycle.mu.Lock()
-	cycle.PacketTimes[helloSeq] = PacketTime{
-		Sent: sentTime,
-		Size: 0,
-	}
-	cycle.mu.Unlock()
-
-	ts.ClientStats.mu.Lock()
-	ts.ClientStats.PacketTimes[helloSeq] = PacketTime{
-		Sent: sentTime,
-		Size: 0,
-	}
-	ts.ClientStats.mu.Unlock()
-
-	helloData := TrafficSimData{
-		Sent: sentTime,
-		Seq:  helloSeq,
-	}
-
-	helloMsg, err := ts.buildMessage(TrafficSim_HELLO, helloData)
-	if err != nil {
-		log.Printf("TrafficSim: Error building HELLO message: %v", err)
-		ts.markPacketAsFailed(helloSeq, cycle)
-		return false
-	}
-
-	msgSize := len(helloMsg)
-
-	// Update packet size in both trackers
-	cycle.mu.Lock()
-	if pt, ok := cycle.PacketTimes[helloSeq]; ok {
-		pt.Size = msgSize
-		cycle.PacketTimes[helloSeq] = pt
-	}
-	cycle.mu.Unlock()
-
-	ts.ClientStats.mu.Lock()
-	if pt, ok := ts.ClientStats.PacketTimes[helloSeq]; ok {
-		pt.Size = msgSize
-		ts.ClientStats.PacketTimes[helloSeq] = pt
-	}
-	ts.ClientStats.mu.Unlock()
-
-	// Record packet sent
-	ts.recordPacketSent(flow, helloSeq, msgSize)
-
-	// Send handshake with timeout
-	ts.Conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err = ts.Conn.Write([]byte(helloMsg))
-	ts.Conn.SetWriteDeadline(time.Time{}) // Clear deadline
-
-	if err != nil {
-		log.Printf("TrafficSim: Failed to send HELLO packet %d: %v", helloSeq, err)
-		ts.markPacketAsFailed(helloSeq, cycle)
-		return false
-	}
-
-	log.Printf("TrafficSim: Sent HELLO packet %d, waiting for response...", helloSeq)
-
-	// Wait for response with timeout
-	msgBuf := make([]byte, 1024)
-	ts.Conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	_, _, err = ts.Conn.ReadFromUDP(msgBuf)
-	ts.Conn.SetReadDeadline(time.Time{}) // Clear deadline
-
-	if err != nil {
-		log.Printf("TrafficSim: No hello response received: %v", err)
-		ts.markPacketAsFailed(helloSeq, cycle)
-		return false
-	}
-
-	// Mark handshake as successful in both trackers
-	receivedTime := time.Now().UnixMilli()
-
-	cycle.mu.Lock()
-	if pt, ok := cycle.PacketTimes[helloSeq]; ok {
-		pt.Received = receivedTime
-		cycle.PacketTimes[helloSeq] = pt
-	}
-	cycle.mu.Unlock()
-
-	ts.ClientStats.mu.Lock()
-	if pt, ok := ts.ClientStats.PacketTimes[helloSeq]; ok {
-		pt.Received = receivedTime
-		ts.ClientStats.PacketTimes[helloSeq] = pt
-	}
-	ts.ClientStats.mu.Unlock()
-
-	// Update flow stats
-	ts.recordPacketReceived(flow, helloSeq, sentTime)
-
-	log.Printf("TrafficSim: Received HELLO response for packet %d, RTT: %dms", helloSeq, receivedTime-sentTime)
-	return true
-}
-
-// Modified handleACK to update cycle tracker if applicable
-func (ts *TrafficSim) handleACK(data TrafficSimData) {
-	seq := data.Seq
-	receivedTime := time.Now().UnixMilli()
-
-	// Update in current cycle if it contains this sequence
-	ts.cycleMu.RLock()
-	if ts.currentCycle != nil {
-		ts.currentCycle.mu.Lock()
-		if pTime, ok := ts.currentCycle.PacketTimes[seq]; ok {
-			if pTime.Received == 0 && !pTime.TimedOut {
-				pTime.Received = receivedTime
-				ts.currentCycle.PacketTimes[seq] = pTime
-			}
-		}
-		ts.currentCycle.mu.Unlock()
-	}
-	ts.cycleMu.RUnlock()
-
-	// Also update ClientStats for compatibility
-	ts.ClientStats.mu.Lock()
-	defer ts.ClientStats.mu.Unlock()
-
-	if pTime, ok := ts.ClientStats.PacketTimes[seq]; ok {
-		if pTime.Received == 0 && !pTime.TimedOut {
-			pTime.Received = receivedTime
-			ts.ClientStats.PacketTimes[seq] = pTime
-
-			// Update flow stats
-			flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
-			ts.recordPacketReceived(flow, seq, pTime.Sent)
-
-			log.Printf("TrafficSim: Received ACK for packet %d, RTT: %dms", seq, receivedTime-pTime.Sent)
-		} else if pTime.TimedOut {
-			log.Printf("TrafficSim: Received late ACK for packet %d (already marked as timed out)", seq)
-		}
-	}
-
-	ts.LastResponse = time.Now()
-}
-
-// Keep all the existing type definitions and other methods from the original code...
-
-// Modified calculateStats to work with specific sequence range
-func (ts *TrafficSim) calculateCycleStats(mtrProbe *Probe, startSeq, endSeq int) map[string]interface{} {
-	var totalRTT, minRTT, maxRTT int64
-	var rtts []float64
-	lostPackets := 0
-	outOfOrder := 0
-	duplicatePackets := 0
-	receivedSequences := []int{}
-	totalPackets := 0
-
-	// Analyze packets only in this cycle's range
-	for seq := startSeq; seq <= endSeq; seq++ {
-		if pTime, ok := ts.ClientStats.PacketTimes[seq]; ok {
-			totalPackets++
-
-			if pTime.Received == 0 || pTime.TimedOut {
-				lostPackets++
-				continue
-			}
-
-			receivedSequences = append(receivedSequences, seq)
-			rtt := pTime.Received - pTime.Sent
-			rtts = append(rtts, float64(rtt))
-			totalRTT += rtt
-
-			if minRTT == 0 || rtt < minRTT {
-				minRTT = rtt
-			}
-			if rtt > maxRTT {
-				maxRTT = rtt
-			}
-		}
-	}
-
-	// Check for out of order packets
-	for i := 1; i < len(receivedSequences); i++ {
-		if receivedSequences[i] < receivedSequences[i-1] {
-			outOfOrder++
-		}
-	}
-
-	// Calculate statistics
-	avgRTT := float64(0)
-	stdDevRTT := float64(0)
-	if len(rtts) > 0 {
-		avgRTT = float64(totalRTT) / float64(len(rtts))
-		for _, rtt := range rtts {
-			stdDevRTT += math.Pow(rtt-avgRTT, 2)
-		}
-		stdDevRTT = math.Sqrt(stdDevRTT / float64(len(rtts)))
-	}
-
-	lossPercentage := float64(0)
-	if totalPackets > 0 {
-		lossPercentage = (float64(lostPackets) / float64(totalPackets)) * 100
-	}
-
-	log.Printf("TrafficSim: Cycle Stats - Seq Range: %d-%d, Total: %d, Lost: %d (%.2f%%), Out of Order: %d, Avg RTT: %.2fms",
-		startSeq, endSeq, totalPackets, lostPackets, lossPercentage, outOfOrder, avgRTT)
-
-	// Trigger MTR if packet loss exceeds threshold
-	if totalPackets > 0 && lossPercentage > 5.0 && ts.isRunning() && !ts.isStopping() {
-		ts.triggerMTR(mtrProbe, lossPercentage)
-	}
-
-	return map[string]interface{}{
-		"lostPackets":      lostPackets,
-		"lossPercentage":   lossPercentage,
-		"outOfSequence":    outOfOrder,
-		"duplicatePackets": duplicatePackets,
-		"averageRTT":       avgRTT,
-		"minRTT":           minRTT,
-		"maxRTT":           maxRTT,
-		"stdDevRTT":        stdDevRTT,
-		"totalPackets":     totalPackets,
-		"sequenceRange":    fmt.Sprintf("%d-%d", startSeq, endSeq),
-		"reportTime":       time.Now(),
-	}
-}
-
-// New method to clean up old packet times while keeping recent history
-func (ts *TrafficSim) cleanupOldPacketTimes(currentCycleStart int) {
-	ts.ClientStats.mu.Lock()
-	defer ts.ClientStats.mu.Unlock()
-
-	// Since sequences reset every TrafficSim_ReportSeq (30), we need to be smarter about cleanup
-	// Keep packets from the last 2 cycles worth (60 sequences)
-	// But handle the wraparound case when sequences reset
-
-	toDelete := []int{}
-	for seq := range ts.ClientStats.PacketTimes {
-		// If this is an old sequence from before the current cycle
-		// (considering wraparound at TrafficSim_ReportSeq)
-		if currentCycleStart > TrafficSim_ReportSeq {
-			// We've wrapped around, so old sequences are those > TrafficSim_ReportSeq
-			if seq > TrafficSim_ReportSeq && seq < currentCycleStart {
-				toDelete = append(toDelete, seq)
-			}
-		} else {
-			// Normal case: delete sequences that are too old
-			// Keep last 60 sequences worth of data
-			if seq < currentCycleStart-60 && seq < currentCycleStart {
-				toDelete = append(toDelete, seq)
-			}
-		}
-	}
-
-	for _, seq := range toDelete {
-		delete(ts.ClientStats.PacketTimes, seq)
-	}
-
-	if len(toDelete) > 0 {
-		log.Printf("TrafficSim: Cleaned up %d old packet times", len(toDelete))
-	}
-}
-
-// Add a periodic interface check to detect network changes proactively
-func (ts *TrafficSim) runInterfaceMonitor(ctx context.Context) {
-	ticker := time.NewTicker(ts.InterfaceCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !ts.isRunning() {
-				return
-			}
-
-			// Check if current IP is still valid
-			ts.localIPMu.RLock()
-			currentIP := ts.localIP
-			ts.localIPMu.RUnlock()
-
-			if currentIP != "" && !ts.isIPStillValid(currentIP) {
-				log.Printf("TrafficSim: Current IP %s is no longer valid, forcing interface reselection", currentIP)
-
-				// Force reselection
-				ts.localIPMu.Lock()
-				ts.localIP = ""
-				ts.lastInterfaceCheck = time.Time{}
-				ts.localIPMu.Unlock()
-
-				// Mark connection as invalid to force reconnection
-				ts.setConnectionValid(false)
-			}
-		}
-	}
-}
-
-// Modified runClient to handle session restarts properly
-func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
-	ts.Probe = mtrProbe
-	ts.initFlowTracking()
-
-	// Initialize client stats once
-	if ts.ClientStats == nil {
-		ts.ClientStats = &ClientStats{
-			LastReportTime: time.Now(),
-			ReportInterval: 15 * time.Second,
-			PacketTimes:    make(map[int]PacketTime),
-		}
-		ts.testComplete = make(chan bool, 1)
-	}
-
-	// Start interface monitor
-	monitorCtx, cancelMonitor := context.WithCancel(ctx)
-	defer cancelMonitor()
-
-	go ts.runInterfaceMonitor(monitorCtx)
-
-	// Main client loop
-	for ts.isRunning() && !ts.isStopping() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ts.stopChan:
-			return nil
-		default:
-		}
-
-		// Get current IP (this will handle interface selection)
-		currentIP, err := ts.getLocalIP()
-		if err != nil {
-			log.Printf("TrafficSim: Failed to get local IP: %v", err)
-			if !ts.waitOrStop(RetryInterval) {
-				return nil
-			}
-			continue
-		}
-
-		log.Printf("TrafficSim: Using local IP %s", currentIP)
-
-		// Try to establish connection but don't block on failure
-		connectionEstablished := ts.tryEstablishConnection()
-
-		// Run client session - this should run indefinitely until stopped
-		log.Printf("TrafficSim: Starting client session (connection: %v)", connectionEstablished)
-		if err := ts.runClientSession(ctx, mtrProbe, connectionEstablished); err != nil {
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				log.Printf("TrafficSim: Context cancelled, stopping client")
-				return err
-			}
-
-			log.Printf("TrafficSim: Client session error: %v, will restart session", err)
-
-			// Force interface recheck on session error
-			ts.localIPMu.Lock()
-			ts.lastInterfaceCheck = time.Time{}
-			ts.localIPMu.Unlock()
-
-			// Wait a bit before restarting the session
-			select {
-			case <-time.After(5 * time.Second):
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-ts.stopChan:
-				return nil
-			}
-		}
-	}
-
-	log.Print("TrafficSim: Client stopped")
 	return nil
 }
 
-// getLocalIP - Improved version with better interface selection
-func (ts *TrafficSim) getLocalIP() (string, error) {
-	ts.localIPMu.Lock()
-	defer ts.localIPMu.Unlock()
-
-	// Check if we need to refresh the interface selection
-	if time.Since(ts.lastInterfaceCheck) < ts.InterfaceCheckInterval && ts.localIP != "" {
-		// Verify the cached IP is still valid
-		if ts.isIPStillValid(ts.localIP) {
-			return ts.localIP, nil
-		}
-	}
-
-	// Get the best interface
-	iface, ip, err := ts.selectBestInterface()
-	if err != nil {
-		return "", err
-	}
-
-	ts.localIP = ip
-	ts.lastInterfaceCheck = time.Now()
-	log.Printf("TrafficSim: Selected interface %s with IP %s", iface.Name, ip)
-
-	return ip, nil
+// nextReverseSequence returns the next sequence number for reverse direction
+func (ts *TrafficSim) nextReverseSequence() int {
+	ts.reverseSequenceMu.Lock()
+	defer ts.reverseSequenceMu.Unlock()
+	ts.reverseSequence++
+	return ts.reverseSequence
 }
 
-const (
-	TrafficSim_ReportSeq    = 60
-	TrafficSim_DataInterval = 1
-	RetryInterval           = 5 * time.Second
-	PacketTimeout           = 2 * time.Second
-	GracefulShutdownTimeout = 70 * time.Second
-	ServerReportInterval    = 15 * time.Second
-)
-
-type Connection struct {
-	Addr         *net.UDPAddr
-	LastResponse time.Time
-	ExpectedSeq  int
-	AgentID      primitive.ObjectID
-	ClientStats  *ClientStats
-	FlowKey      string // "src-dst" identifier
-}
-
-type ClientStats struct {
-	DuplicatePackets int                `json:"duplicatePackets"`
-	OutOfSequence    int                `json:"outOfSequence"`
-	PacketTimes      map[int]PacketTime `json:"-"`
-	LastReportTime   time.Time          `json:"lastReportTime"`
-	ReportInterval   time.Duration      `json:"reportInterval"`
-	mu               sync.RWMutex
-}
-
-type ServerStats struct {
-	ConnectionCount  int                         `json:"connectionCount"`
-	TotalPacketsRecv int64                       `json:"totalPacketsReceived"`
-	TotalPacketsSent int64                       `json:"totalPacketsSent"`
-	ActiveFlows      map[string]*FlowServerStats `json:"activeFlows"`
-	LastCleanup      time.Time                   `json:"lastCleanup"`
-	mu               sync.RWMutex
-}
-
-type FlowServerStats struct {
-	FirstSeen    time.Time `json:"firstSeen"`
-	LastSeen     time.Time `json:"lastSeen"`
-	PacketsRecv  int64     `json:"packetsReceived"`
-	PacketsSent  int64     `json:"packetsSent"`
-	BytesRecv    int64     `json:"bytesReceived"`
-	BytesSent    int64     `json:"bytesSent"`
-	LastSequence int       `json:"lastSequence"`
-	ExpectedSeq  int       `json:"expectedSequence"`
-	OutOfOrder   int       `json:"outOfOrder"`
-	Duplicates   int       `json:"duplicates"`
-}
-
-type FlowStats struct {
-	Direction     string                `json:"direction"` // "client-server" or "server-client"
-	StartTime     time.Time             `json:"startTime"`
-	EndTime       time.Time             `json:"endTime"`
-	PacketsSent   int                   `json:"packetsSent"`
-	PacketsRecv   int                   `json:"packetsReceived"`
-	PacketsLost   int                   `json:"packetsLost"`
-	BytesSent     int64                 `json:"bytesSent"`
-	BytesRecv     int64                 `json:"bytesReceived"`
-	RTTStats      RTTStatistics         `json:"rttStats"`
-	JitterStats   JitterStatistics      `json:"jitterStats"`
-	PacketDetails map[int]*PacketDetail `json:"-"`
-	mu            sync.RWMutex
-}
-
-type PacketDetail struct {
-	Sequence   int           `json:"sequence"`
-	SentTime   time.Time     `json:"sentTime"`
-	RecvTime   time.Time     `json:"recvTime,omitempty"`
-	RTT        time.Duration `json:"rtt,omitempty"`
-	Size       int           `json:"size"`
-	TimedOut   bool          `json:"timedOut"`
-	Duplicate  bool          `json:"duplicate"`
-	OutOfOrder bool          `json:"outOfOrder"`
-}
-
-type RTTStatistics struct {
-	Min    time.Duration `json:"min"`
-	Max    time.Duration `json:"max"`
-	Avg    time.Duration `json:"avg"`
-	StdDev time.Duration `json:"stdDev"`
-	P50    time.Duration `json:"p50"`
-	P95    time.Duration `json:"p95"`
-	P99    time.Duration `json:"p99"`
-}
-
-type JitterStatistics struct {
-	Min    time.Duration `json:"min"`
-	Max    time.Duration `json:"max"`
-	Avg    time.Duration `json:"avg"`
-	StdDev time.Duration `json:"stdDev"`
-}
-
-type PacketTime struct {
-	Sent     int64
-	Received int64
-	TimedOut bool
-	Size     int
-}
-
-const (
-	TrafficSim_HELLO  TrafficSimMsgType = "HELLO"
-	TrafficSim_ACK    TrafficSimMsgType = "ACK"
-	TrafficSim_DATA   TrafficSimMsgType = "DATA"
-	TrafficSim_REPORT TrafficSimMsgType = "REPORT" // Server reports to client
-	TrafficSim_PING   TrafficSimMsgType = "PING"   // Bidirectional keepalive
-	TrafficSim_PONG   TrafficSimMsgType = "PONG"
-)
-
-type TrafficSimMsgType string
-
-type TrafficSimMsg struct {
-	Type      TrafficSimMsgType  `json:"type"`
-	Data      TrafficSimData     `json:"data"`
-	Src       primitive.ObjectID `json:"src"`
-	Dst       primitive.ObjectID `json:"dst"`
-	Timestamp int64              `json:"timestamp"`
-	Size      int                `json:"size"`
-}
-
-type TrafficSimData struct {
-	Sent     int64                  `json:"sent"`
-	Received int64                  `json:"received"`
-	Seq      int                    `json:"seq"`
-	Report   map[string]interface{} `json:"report,omitempty"`
-}
-
-// Initialize flow tracking
-func (ts *TrafficSim) initFlowTracking() {
-	ts.flowStats = make(map[string]*FlowStats)
-	if ts.IsServer {
-		ts.serverStats = &ServerStats{
-			ActiveFlows: make(map[string]*FlowServerStats),
-			LastCleanup: time.Now(),
-		}
-	}
-}
-
-// Get or create flow stats
-func (ts *TrafficSim) getOrCreateFlow(src, dst primitive.ObjectID, direction string) *FlowStats {
-	flowKey := fmt.Sprintf("%s-%s", src.Hex(), dst.Hex())
-
-	ts.flowStatsMu.Lock()
-	defer ts.flowStatsMu.Unlock()
-
-	if flow, exists := ts.flowStats[flowKey]; exists {
-		return flow
-	}
-
-	flow := &FlowStats{
-		Direction:     direction,
-		StartTime:     time.Now(),
-		PacketDetails: make(map[int]*PacketDetail),
-	}
-	ts.flowStats[flowKey] = flow
-	return flow
-}
-
-// Record packet sent
-func (ts *TrafficSim) recordPacketSent(flow *FlowStats, seq int, size int) {
-	flow.mu.Lock()
-	defer flow.mu.Unlock()
-
-	flow.PacketsSent++
-	flow.BytesSent += int64(size)
-	flow.PacketDetails[seq] = &PacketDetail{
-		Sequence: seq,
-		SentTime: time.Now(),
-		Size:     size,
-	}
-}
-
-// Record packet received
-func (ts *TrafficSim) recordPacketReceived(flow *FlowStats, seq int, sentTime int64) {
-	flow.mu.Lock()
-	defer flow.mu.Unlock()
-
-	now := time.Now()
-	flow.PacketsRecv++
-	flow.EndTime = now
-
-	if detail, exists := flow.PacketDetails[seq]; exists {
-		detail.RecvTime = now
-		detail.RTT = now.Sub(detail.SentTime)
-		flow.BytesRecv += int64(detail.Size)
-	}
-}
-
-// Calculate comprehensive flow statistics
-func (ts *TrafficSim) calculateFlowStats(flow *FlowStats) map[string]interface{} {
-	flow.mu.RLock()
-	defer flow.mu.RUnlock()
-
-	var rtts []time.Duration
-	var jitters []time.Duration
-	var lastRTT time.Duration
-
-	// Sort packets by sequence
-	var sequences []int
-	for seq := range flow.PacketDetails {
-		sequences = append(sequences, seq)
-	}
-	sort.Ints(sequences)
-
-	// Collect RTT data and calculate jitter
-	for _, seq := range sequences {
-		detail := flow.PacketDetails[seq]
-		if !detail.RecvTime.IsZero() && detail.RTT > 0 {
-			rtts = append(rtts, detail.RTT)
-			if lastRTT > 0 {
-				jitter := detail.RTT - lastRTT
-				if jitter < 0 {
-					jitter = -jitter
-				}
-				jitters = append(jitters, jitter)
-			}
-			lastRTT = detail.RTT
-		} else if detail.TimedOut {
-			flow.PacketsLost++
-		}
-	}
-
-	// Calculate RTT statistics
-	rttStats := calculateRTTStats(rtts)
-	jitterStats := calculateJitterStats(jitters)
-
-	// Update flow stats
-	flow.RTTStats = rttStats
-	flow.JitterStats = jitterStats
-
-	// Calculate loss percentage
-	totalPackets := flow.PacketsSent
-	lossPercentage := float64(0)
-	if totalPackets > 0 {
-		lossPercentage = (float64(flow.PacketsLost) / float64(totalPackets)) * 100
-	}
-
-	// Calculate throughput
-	duration := flow.EndTime.Sub(flow.StartTime).Seconds()
-	throughputSend := float64(0)
-	throughputRecv := float64(0)
-	if duration > 0 {
-		throughputSend = float64(flow.BytesSent*8) / duration / 1e6 // Mbps
-		throughputRecv = float64(flow.BytesRecv*8) / duration / 1e6 // Mbps
-	}
-
-	return map[string]interface{}{
-		"direction":       flow.Direction,
-		"duration":        flow.EndTime.Sub(flow.StartTime).Seconds(),
-		"packetsSent":     flow.PacketsSent,
-		"packetsReceived": flow.PacketsRecv,
-		"packetsLost":     flow.PacketsLost,
-		"lossPercentage":  lossPercentage,
-		"bytesSent":       flow.BytesSent,
-		"bytesReceived":   flow.BytesRecv,
-		"throughputSend":  throughputSend,
-		"throughputRecv":  throughputRecv,
-		"rttStats":        rttStats,
-		"jitterStats":     jitterStats,
-	}
-}
-
-func calculateRTTStats(rtts []time.Duration) RTTStatistics {
-	if len(rtts) == 0 {
-		return RTTStatistics{}
-	}
-
-	// Sort RTTs for percentile calculations
-	sort.Slice(rtts, func(i, j int) bool {
-		return rtts[i] < rtts[j]
-	})
-
-	// Calculate basic stats
-	var sum time.Duration
-	min := rtts[0]
-	max := rtts[len(rtts)-1]
-
-	for _, rtt := range rtts {
-		sum += rtt
-	}
-	avg := sum / time.Duration(len(rtts))
-
-	// Calculate standard deviation
-	var variance float64
-	avgFloat := float64(avg)
-	for _, rtt := range rtts {
-		diff := float64(rtt) - avgFloat
-		variance += diff * diff
-	}
-	stdDev := time.Duration(math.Sqrt(variance / float64(len(rtts))))
-
-	// Calculate percentiles
-	p50 := rtts[len(rtts)*50/100]
-	p95 := rtts[len(rtts)*95/100]
-	p99 := rtts[len(rtts)*99/100]
-
-	return RTTStatistics{
-		Min:    min,
-		Max:    max,
-		Avg:    avg,
-		StdDev: stdDev,
-		P50:    p50,
-		P95:    p95,
-		P99:    p99,
-	}
-}
-
-func calculateJitterStats(jitters []time.Duration) JitterStatistics {
-	if len(jitters) == 0 {
-		return JitterStatistics{}
-	}
-
-	var sum time.Duration
-	min := jitters[0]
-	max := jitters[0]
-
-	for _, jitter := range jitters {
-		sum += jitter
-		if jitter < min {
-			min = jitter
-		}
-		if jitter > max {
-			max = jitter
-		}
-	}
-	avg := sum / time.Duration(len(jitters))
-
-	// Calculate standard deviation
-	var variance float64
-	avgFloat := float64(avg)
-	for _, jitter := range jitters {
-		diff := float64(jitter) - avgFloat
-		variance += diff * diff
-	}
-	stdDev := time.Duration(math.Sqrt(variance / float64(len(jitters))))
-
-	return JitterStatistics{
-		Min:    min,
-		Max:    max,
-		Avg:    avg,
-		StdDev: stdDev,
-	}
-}
-
-// Server-side flow tracking
-func (ts *TrafficSim) updateServerFlowStats(agentID primitive.ObjectID, msgType TrafficSimMsgType, size int, seq int) {
-	if ts.serverStats == nil {
-		return
-	}
-
-	flowKey := agentID.Hex()
-
-	ts.serverStats.mu.Lock()
-	defer ts.serverStats.mu.Unlock()
-
-	flow, exists := ts.serverStats.ActiveFlows[flowKey]
-	if !exists {
-		flow = &FlowServerStats{
-			FirstSeen:   time.Now(),
-			ExpectedSeq: 1,
-		}
-		ts.serverStats.ActiveFlows[flowKey] = flow
-	}
-
-	flow.LastSeen = time.Now()
-
-	switch msgType {
-	case TrafficSim_DATA:
-		flow.PacketsRecv++
-		flow.BytesRecv += int64(size)
-		ts.serverStats.TotalPacketsRecv++
-
-		// Check sequence ordering
-		if seq < flow.LastSequence {
-			flow.OutOfOrder++
-		} else if seq == flow.LastSequence {
-			flow.Duplicates++
-		}
-		flow.LastSequence = seq
-
-	case TrafficSim_ACK, TrafficSim_PONG, TrafficSim_REPORT:
-		flow.PacketsSent++
-		flow.BytesSent += int64(size)
-		ts.serverStats.TotalPacketsSent++
-	}
-
-	// Cleanup old flows periodically
-	if time.Since(ts.serverStats.LastCleanup) > 5*time.Minute {
-		ts.cleanupOldFlows()
-		ts.serverStats.LastCleanup = time.Now()
-	}
-}
-
-func (ts *TrafficSim) cleanupOldFlows() {
-	cutoff := time.Now().Add(-10 * time.Minute)
-	for key, flow := range ts.serverStats.ActiveFlows {
-		if flow.LastSeen.Before(cutoff) {
-			delete(ts.serverStats.ActiveFlows, key)
-		}
-	}
-}
-
-// Generate server report for client
-func (ts *TrafficSim) generateServerReport() map[string]interface{} {
-	if ts.serverStats == nil {
-		return nil
-	}
-
-	ts.serverStats.mu.RLock()
-	defer ts.serverStats.mu.RUnlock()
-
-	flows := make(map[string]interface{})
-	for agentID, flow := range ts.serverStats.ActiveFlows {
-		flows[agentID] = map[string]interface{}{
-			"packetsReceived": flow.PacketsRecv,
-			"packetsSent":     flow.PacketsSent,
-			"bytesReceived":   flow.BytesRecv,
-			"bytesSent":       flow.BytesSent,
-			"outOfOrder":      flow.OutOfOrder,
-			"duplicates":      flow.Duplicates,
-			"lastSeen":        flow.LastSeen,
-			"uptime":          time.Since(flow.FirstSeen).Seconds(),
-		}
-	}
-
-	return map[string]interface{}{
-		"totalConnections": len(ts.serverStats.ActiveFlows),
-		"totalPacketsRecv": ts.serverStats.TotalPacketsRecv,
-		"totalPacketsSent": ts.serverStats.TotalPacketsSent,
-		"activeFlows":      flows,
-		"reportTime":       time.Now(),
-	}
-}
-
-// isRunning returns true if the TrafficSim is Running
-func (ts *TrafficSim) isRunning() bool {
-	return atomic.LoadInt32(&ts.Running) == 1
-}
-
-// isStopping returns true if the TrafficSim is in the process of stopping
-func (ts *TrafficSim) isStopping() bool {
-	return atomic.LoadInt32(&ts.stopping) == 1
-}
-
-// setInTestCycle safely sets the test cycle state
-func (ts *TrafficSim) setInTestCycle(state bool) {
-	ts.currentTestMu.Lock()
-	ts.inTestCycle = state
-	ts.currentTestMu.Unlock()
-}
-
-// isInTestCycle safely checks if we're in a test cycle
-func (ts *TrafficSim) isInTestCycle() bool {
-	ts.currentTestMu.RLock()
-	defer ts.currentTestMu.RUnlock()
-	return ts.inTestCycle
-}
-
-func (ts *TrafficSim) buildMessage(msgType TrafficSimMsgType, data TrafficSimData) (string, error) {
-	msg := TrafficSimMsg{
-		Type:      msgType,
-		Data:      data,
-		Src:       ts.ThisAgent,
-		Dst:       ts.OtherAgent,
-		Timestamp: time.Now().UnixMilli(),
-	}
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal message: %w", err)
-	}
-	msg.Size = len(msgBytes)
-
-	// Re-marshal with size included
-	msgBytes, err = json.Marshal(msg)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal message with size: %w", err)
-	}
-
-	return string(msgBytes), nil
-}
-
-func (ts *TrafficSim) sendHelloNonBlocking() bool {
-	// Increment sequence for HELLO packet
-	ts.Mutex.Lock()
-	ts.Sequence++
-	helloSeq := ts.Sequence
-	ts.Mutex.Unlock()
-
-	// Track HELLO packet as sent
-	flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
-	sentTime := time.Now().UnixMilli()
-
-	ts.ClientStats.mu.Lock()
-	ts.ClientStats.PacketTimes[helloSeq] = PacketTime{
-		Sent: sentTime,
-		Size: 0, // Will be updated after building message
-	}
-	ts.ClientStats.mu.Unlock()
-
-	helloData := TrafficSimData{
-		Sent: sentTime,
-		Seq:  helloSeq,
-	}
-
-	helloMsg, err := ts.buildMessage(TrafficSim_HELLO, helloData)
-	if err != nil {
-		return false
-	}
-
-	msgSize := len(helloMsg)
-
-	// Update packet size
-	ts.ClientStats.mu.Lock()
-	if pt, ok := ts.ClientStats.PacketTimes[helloSeq]; ok {
-		pt.Size = msgSize
-		ts.ClientStats.PacketTimes[helloSeq] = pt
-	}
-	ts.ClientStats.mu.Unlock()
-
-	// Record packet sent
-	ts.recordPacketSent(flow, helloSeq, msgSize)
-
-	if _, err := ts.Conn.Write([]byte(helloMsg)); err != nil {
-		// Mark as timed out immediately
-		ts.ClientStats.mu.Lock()
-		if pt, ok := ts.ClientStats.PacketTimes[helloSeq]; ok {
-			pt.TimedOut = true
-			ts.ClientStats.PacketTimes[helloSeq] = pt
-		}
-		ts.ClientStats.mu.Unlock()
-
-		flow.mu.Lock()
-		if detail, exists := flow.PacketDetails[helloSeq]; exists {
-			detail.TimedOut = true
-		}
-		flow.mu.Unlock()
-
-		return false
-	}
-
-	// Use a shorter timeout and track response
-	msgBuf := make([]byte, 1024)
-	ts.Conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, _, err := ts.Conn.ReadFromUDP(msgBuf); err != nil {
-		log.Printf("TrafficSim: No hello response received: %v", err)
-
-		// Mark HELLO packet as timed out
-		ts.ClientStats.mu.Lock()
-		if pt, ok := ts.ClientStats.PacketTimes[helloSeq]; ok {
-			pt.TimedOut = true
-			ts.ClientStats.PacketTimes[helloSeq] = pt
-		}
-		ts.ClientStats.mu.Unlock()
-
-		flow.mu.Lock()
-		if detail, exists := flow.PacketDetails[helloSeq]; exists {
-			detail.TimedOut = true
-		}
-		flow.mu.Unlock()
-
-		return false
-	}
-
-	// Mark HELLO packet as received
-	receivedTime := time.Now().UnixMilli()
-	ts.ClientStats.mu.Lock()
-	if pt, ok := ts.ClientStats.PacketTimes[helloSeq]; ok {
-		pt.Received = receivedTime
-		ts.ClientStats.PacketTimes[helloSeq] = pt
-	}
-	ts.ClientStats.mu.Unlock()
-
-	// Update flow stats for successful handshake
-	ts.recordPacketReceived(flow, helloSeq, sentTime)
-
-	return true
-}
-
-// 2. Helper method to check if error is connection-related
-func (ts *TrafficSim) isConnectionError(err error) bool {
+// isNetworkChangeError detects errors indicating the local IP is no longer valid
+func isNetworkChangeError(err error) bool {
 	if err == nil {
 		return false
 	}
-
 	errStr := err.Error()
-	return strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "i/o timeout") ||
-		strings.Contains(errStr, "connection reset") ||
+	return strings.Contains(errStr, "can't assign requested address") ||
 		strings.Contains(errStr, "network is unreachable") ||
-		strings.Contains(errStr, "host is unreachable")
+		strings.Contains(errStr, "no route to host")
 }
 
-func (ts *TrafficSim) closeConnection() {
+// reconnectUDP closes the existing connection and establishes a new one
+func (ts *TrafficSim) reconnectUDP() error {
+	log.Printf("[trafficsim] Reconnecting due to network change...")
+
+	// Close old connection
 	ts.connMu.Lock()
-	defer ts.connMu.Unlock()
-
-	if ts.Conn != nil {
-		ts.Conn.Close()
-		ts.Conn = nil
-		log.Printf("TrafficSim: Connection closed")
+	if ts.conn != nil {
+		ts.conn.Close()
+		ts.conn = nil
 	}
-	ts.connectionValidMu.Lock()
-	ts.connectionValid = false
-	ts.connectionValidMu.Unlock()
-}
+	ts.connMu.Unlock()
 
-// 6. Modified waitForAllResponses to handle all packets in cycle
-func (ts *TrafficSim) waitForAllResponses(ctx context.Context) {
-	waitStart := time.Now()
-	maxWaitTime := PacketTimeout + (500 * time.Millisecond)
-	checkInterval := 50 * time.Millisecond
-
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for time.Since(waitStart) < maxWaitTime {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !ts.isRunning() && !ts.isStopping() {
-				return
-			}
-
-			ts.ClientStats.mu.Lock()
-			allComplete := true
-			now := time.Now().UnixMilli()
-
-			// Check all packets in this cycle
-			for seq, pTime := range ts.ClientStats.PacketTimes {
-				if pTime.Received == 0 && !pTime.TimedOut {
-					if now-pTime.Sent > int64(PacketTimeout.Milliseconds()) {
-						pTime.TimedOut = true
-						ts.ClientStats.PacketTimes[seq] = pTime
-
-						// Mark packet as timed out in flow
-						flow := ts.getOrCreateFlow(ts.ThisAgent, ts.OtherAgent, "client-server")
-						flow.mu.Lock()
-						if detail, exists := flow.PacketDetails[seq]; exists {
-							detail.TimedOut = true
-						}
-						flow.mu.Unlock()
-
-						log.Printf("TrafficSim: Packet %d timed out", seq)
-					} else {
-						allComplete = false
-					}
-				}
-			}
-			ts.ClientStats.mu.Unlock()
-
-			if allComplete {
-				log.Print("TrafficSim: All packets in cycle complete or timed out")
-				return
-			}
-		}
-	}
-}
-
-// 7. Modified tryEstablishConnection to be simpler
-func (ts *TrafficSim) tryEstablishConnection() bool {
-	if ts.Conn == nil {
-		return ts.establishUDPConnection()
-	}
-
-	// If we have a connection, do a quick test
-	return ts.testExistingConnection()
-}
-
-// 8. Test existing connection with a simple ping
-func (ts *TrafficSim) testExistingConnection() bool {
-	if ts.Conn == nil {
-		return false
-	}
-
-	// Send a quick ping to test connection
-	pingData := TrafficSimData{
-		Sent: time.Now().UnixMilli(),
-		Seq:  -1, // Special sequence for connection test
-	}
-
-	pingMsg, err := ts.buildMessage(TrafficSim_PING, pingData)
-	if err != nil {
-		return false
-	}
-
-	// Test with short timeout
-	ts.Conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-	_, err = ts.Conn.Write([]byte(pingMsg))
-	ts.Conn.SetWriteDeadline(time.Time{}) // Clear deadline
-
-	if err != nil {
-		log.Printf("TrafficSim: Connection test failed: %v", err)
-		ts.closeConnection()
-		return false
-	}
-
-	return true
-}
-
-func (ts *TrafficSim) waitOrStop(duration time.Duration) bool {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C:
-		return ts.isRunning() && !ts.isStopping()
-	case <-ts.stopChan:
-		return false
-	}
-}
-
-func (ts *TrafficSim) establishConnection() error {
-	toAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ts.IPAddress, ts.Port))
-	if err != nil {
-		return fmt.Errorf("could not resolve %s:%d: %w", ts.IPAddress, ts.Port, err)
-	}
-
-	localAddr, err := net.ResolveUDPAddr("udp4", ts.localIP+":0")
-	if err != nil {
-		return fmt.Errorf("could not resolve local address: %w", err)
-	}
-
-	conn, err := net.DialUDP("udp4", localAddr, toAddr)
-	if err != nil {
-		return fmt.Errorf("unable to connect to %s:%d: %w", ts.IPAddress, ts.Port, err)
-	}
-
-	ts.Conn = conn
-	ts.ClientStats = &ClientStats{
-		LastReportTime: time.Now(),
-		ReportInterval: 15 * time.Second,
-		PacketTimes:    make(map[int]PacketTime),
-	}
-	ts.testComplete = make(chan bool, 1)
-
-	if err := ts.sendHello(); err != nil {
-		conn.Close()
-		return fmt.Errorf("failed to establish connection: %w", err)
-	}
-
-	log.Printf("TrafficSim: Connection established successfully to %v", ts.OtherAgent.Hex())
-	return nil
-}
-
-func (ts *TrafficSim) sendHello() error {
-	if !ts.isRunning() {
-		return fmt.Errorf("trafficSim is not Running")
-	}
-
-	helloMsg, err := ts.buildMessage(TrafficSim_HELLO, TrafficSimData{Sent: time.Now().UnixMilli()})
-	if err != nil {
+	// Establish new connection
+	if err := ts.dialUDP(); err != nil {
+		log.Printf("[trafficsim] Reconnection failed: %v", err)
 		return err
 	}
 
-	if _, err := ts.Conn.Write([]byte(helloMsg)); err != nil {
-		return fmt.Errorf("error sending hello message: %w", err)
-	}
-
-	msgBuf := make([]byte, 1024) // Increased buffer size
-	ts.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, _, err := ts.Conn.ReadFromUDP(msgBuf); err != nil {
-		return fmt.Errorf("error reading hello response: %w", err)
-	}
-
+	log.Debugf("[trafficsim] Reconnected to %s:%d", ts.IPAddress, ts.Port)
 	return nil
 }
 
-func (ts *TrafficSim) reportEnhancedStats(probe *Probe) {
-	// Report traditional stats
-	ts.ClientStats.mu.RLock()
-	stats := ts.calculateStats(probe)
-	ts.ClientStats.mu.RUnlock()
-
-	// Add flow statistics
-	flowStats := make(map[string]interface{})
-	ts.flowStatsMu.RLock()
-	for flowKey, flow := range ts.flowStats {
-		flowStats[flowKey] = ts.calculateFlowStats(flow)
-	}
-	ts.flowStatsMu.RUnlock()
-
-	stats["flows"] = flowStats
-	stats["timestamp"] = time.Now()
-
-	if ts.DataChan != nil && ts.isRunning() {
-		if ts.Probe.ID == primitive.NilObjectID {
-			log.Warn("TrafficSim: Skipping reportStats due to empty ProbeID")
-			return
-		}
-
-		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
-		if err != nil {
-			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
-			return
-		}
-
-		select {
-		case ts.DataChan <- ProbeData{
-			ProbeID:   ts.Probe.ID,
-			Triggered: false,
-			CreatedAt: time.Now(),
-			Data:      stats,
-			Target: ProbeTarget{
-				Target: string(ProbeType_TRAFFICSIM) + "%%%" + ts.IPAddress + ":" + strconv.FormatInt(ts.Port, 10),
-				Agent:  ts.Probe.Config.Target[0].Agent,
-				Group:  reportingAgent,
-			},
-		}:
-		default:
-			log.Print("TrafficSim: DataChan full, dropping stats report")
-		}
-	}
+func (ts *TrafficSim) nextSequence() int {
+	ts.sequenceMu.Lock()
+	defer ts.sequenceMu.Unlock()
+	ts.sequence++
+	return ts.sequence
 }
 
-func (ts *TrafficSim) handleServerReport(data TrafficSimData) {
-	if data.Report != nil {
-		log.Printf("TrafficSim: Received server report: %+v", data.Report)
-		// Process server report data as needed
+func (ts *TrafficSim) resetSequence() {
+	ts.sequenceMu.Lock()
+	defer ts.sequenceMu.Unlock()
+	ts.sequence = 0
+}
+
+// -------------------- Message Building --------------------
+
+func (ts *TrafficSim) buildMessage(msgType TrafficSimMsgType, data TrafficSimData) ([]byte, error) {
+	msg := TrafficSimMsg{
+		Type:      msgType,
+		Data:      data,
+		SrcAgent:  ts.ThisAgent,
+		DstAgent:  ts.OtherAgent,
+		Timestamp: time.Now().UnixMilli(),
 	}
-}
 
-func (ts *TrafficSim) handlePong(data TrafficSimData) {
-	rtt := time.Now().UnixMilli() - data.Sent
-	log.Printf("TrafficSim: Received PONG, RTT: %dms", rtt)
-	ts.LastResponse = time.Now()
-}
-
-func getLocalIP() (string, error) {
-	addrs, err := net.InterfaceAddrs()
+	// Marshal once to get size
+	msgBytes, err := json.Marshal(msg)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("marshal message: %w", err)
 	}
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP.String(), nil
-			}
-		}
-	}
-	return "", fmt.Errorf("no suitable local IP address found")
-}
+	msg.Size = len(msgBytes)
 
-// 9. Modified calculateStats to work with per-cycle reset
-func (ts *TrafficSim) calculateStats(mtrProbe *Probe) map[string]interface{} {
-	ts.ClientStats.mu.RLock()
-	defer ts.ClientStats.mu.RUnlock()
-
-	var totalRTT, minRTT, maxRTT int64
-	var rtts []float64
-	lostPackets := 0
-	outOfOrder := 0
-	duplicatePackets := 0
-	receivedSequences := []int{}
-
-	// Get all packets from this cycle
-	var keys []int
-	for k := range ts.ClientStats.PacketTimes {
-		keys = append(keys, k)
-	}
-	sort.Ints(keys)
-
-	// Analyze packets
-	for _, seq := range keys {
-		pTime := ts.ClientStats.PacketTimes[seq]
-		if pTime.Received == 0 || pTime.TimedOut {
-			lostPackets++
-			continue
-		}
-
-		receivedSequences = append(receivedSequences, seq)
-		rtt := pTime.Received - pTime.Sent
-		rtts = append(rtts, float64(rtt))
-		totalRTT += rtt
-
-		if minRTT == 0 || rtt < minRTT {
-			minRTT = rtt
-		}
-		if rtt > maxRTT {
-			maxRTT = rtt
-		}
-	}
-
-	// Check for out of order packets
-	for i := 1; i < len(receivedSequences); i++ {
-		if receivedSequences[i] < receivedSequences[i-1] {
-			outOfOrder++
-		}
-	}
-
-	// Calculate statistics
-	avgRTT := float64(0)
-	stdDevRTT := float64(0)
-	if len(rtts) > 0 {
-		avgRTT = float64(totalRTT) / float64(len(rtts))
-		for _, rtt := range rtts {
-			stdDevRTT += math.Pow(rtt-avgRTT, 2)
-		}
-		stdDevRTT = math.Sqrt(stdDevRTT / float64(len(rtts)))
-	}
-
-	totalPackets := len(keys)
-	lossPercentage := float64(0)
-	if totalPackets > 0 {
-		lossPercentage = (float64(lostPackets) / float64(totalPackets)) * 100
-	}
-
-	log.Printf("TrafficSim: Cycle Stats - Total: %d, Lost: %d (%.2f%%), Out of Order: %d, Avg RTT: %.2fms",
-		totalPackets, lostPackets, lossPercentage, outOfOrder, avgRTT)
-
-	// Trigger MTR if packet loss exceeds threshold
-	if totalPackets > 0 && lossPercentage > 5.0 && ts.isRunning() && !ts.isStopping() {
-		ts.triggerMTR(mtrProbe, lossPercentage)
-	}
-
-	return map[string]interface{}{
-		"lostPackets":      lostPackets,
-		"lossPercentage":   lossPercentage,
-		"outOfSequence":    outOfOrder,
-		"duplicatePackets": duplicatePackets,
-		"averageRTT":       avgRTT,
-		"minRTT":           minRTT,
-		"maxRTT":           maxRTT,
-		"stdDevRTT":        stdDevRTT,
-		"totalPackets":     totalPackets,
-		"cycleMaxSeq":      ts.Sequence,
-		"reportTime":       time.Now(),
-	}
-}
-
-func (ts *TrafficSim) triggerMTR(mtrProbe *Probe, lossPercentage float64) {
-	if mtrProbe == nil || len(mtrProbe.Config.Target) == 0 {
-		return
-	}
-
-	mtr, err := Mtr(mtrProbe, true)
+	// Re-marshal with size
+	msgBytes, err = json.Marshal(msg)
 	if err != nil {
-		log.Printf("TrafficSim: MTR error: %v", err)
-		return
+		return nil, fmt.Errorf("marshal message with size: %w", err)
 	}
 
-	if ts.DataChan != nil && ts.isRunning() {
-		reportingAgent, err := primitive.ObjectIDFromHex(os.Getenv("ID"))
-		if err != nil {
-			log.Printf("TrafficSim: Failed to get reporting agent ID: %v", err)
-			return
-		}
-
-		select {
-		case ts.DataChan <- ProbeData{
-			ProbeID:   mtrProbe.ID,
-			Triggered: true,
-			Data:      mtr,
-			Target: ProbeTarget{
-				Target: string(ProbeType_MTR) + "%%%" + mtrProbe.Config.Target[0].Target,
-				Agent:  mtrProbe.Config.Target[0].Agent,
-				Group:  reportingAgent,
-			},
-		}:
-			log.Printf("TrafficSim: Triggered MTR for %s due to %.2f%% packet loss",
-				mtrProbe.Config.Target[0].Target, lossPercentage)
-		default:
-			log.Print("TrafficSim: DataChan full, dropping MTR trigger")
-		}
-	}
+	return msgBytes, nil
 }
 
-func (ts *TrafficSim) runServer() error {
-	ts.initFlowTracking()
+// -------------------- Client Mode --------------------
 
-	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ts.localIP, ts.Port))
-	if err != nil {
-		return fmt.Errorf("unable to resolve address: %w", err)
-	}
-
-	ln, err := net.ListenUDP("udp4", addr)
-	if err != nil {
-		return fmt.Errorf("unable to listen on %s:%d: %w", ts.localIP, ts.Port, err)
-	}
-	defer ln.Close()
-
-	log.Printf("TrafficSim: Server listening on %s:%d", ts.localIP, ts.Port)
-
-	ts.Connections = make(map[primitive.ObjectID]*Connection)
-	ts.lastServerReport = time.Now()
-
-	// Start server report ticker
-	reportTicker := time.NewTicker(ServerReportInterval)
-	defer reportTicker.Stop()
-
-	// Set read timeout to check status periodically
-	for ts.isRunning() {
-		select {
-		case <-reportTicker.C:
-			ts.sendServerReports(ln)
-		default:
-			msgBuf := make([]byte, 2048)
-			ln.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			msgLen, remoteAddr, err := ln.ReadFromUDP(msgBuf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-					log.Printf("TrafficSim: Temporary error reading from UDP: %v", err)
-					continue
-				}
-				return fmt.Errorf("error reading from UDP: %w", err)
-			}
-
-			ts.wg.Add(1)
-			go func() {
-				defer ts.wg.Done()
-				ts.handleConnection(ln, remoteAddr, msgBuf[:msgLen])
-			}()
-		}
-	}
-
-	log.Print("TrafficSim: Server stopped")
-	return nil
-}
-
-func (ts *TrafficSim) sendServerReports(conn *net.UDPConn) {
-	report := ts.generateServerReport()
-	if report == nil {
-		return
-	}
-
-	ts.ConnectionsMu.RLock()
-	connections := make([]*Connection, 0, len(ts.Connections))
-	for _, conn := range ts.Connections {
-		connections = append(connections, conn)
-	}
-	ts.ConnectionsMu.RUnlock()
-
-	for _, connection := range connections {
-		reportData := TrafficSimData{
-			Sent:   time.Now().UnixMilli(),
-			Report: report,
-		}
-
-		reportMsg, err := ts.buildMessage(TrafficSim_REPORT, reportData)
-		if err != nil {
-			continue
-		}
-
-		if _, err := conn.WriteToUDP([]byte(reportMsg), connection.Addr); err != nil {
-			log.Printf("TrafficSim: Failed to send report to %s: %v", connection.AgentID.Hex(), err)
-		}
-	}
-}
-
-func (ts *TrafficSim) handleConnection(conn *net.UDPConn, addr *net.UDPAddr, msg []byte) {
-	if !ts.isRunning() {
-		return
-	}
-
-	var tsMsg TrafficSimMsg
-	if err := json.Unmarshal(msg, &tsMsg); err != nil {
-		log.Printf("TrafficSim: Error unmarshalling message: %v", err)
-		return
-	}
-
-	if !ts.isAgentAllowed(tsMsg.Src) {
-		log.Printf("TrafficSim: Ignoring message from unknown agent: %v", tsMsg.Src)
-		return
-	}
-
-	// Update server flow stats
-	ts.updateServerFlowStats(tsMsg.Src, tsMsg.Type, tsMsg.Size, tsMsg.Data.Seq)
-
-	ts.ConnectionsMu.Lock()
-	connection, exists := ts.Connections[tsMsg.Src]
-	if !exists {
-		flowKey := fmt.Sprintf("%s-%s", tsMsg.Src.Hex(), ts.ThisAgent.Hex())
-		connection = &Connection{
-			Addr:         addr,
-			LastResponse: time.Now(),
-			AgentID:      tsMsg.Src,
-			FlowKey:      flowKey,
-		}
-		ts.Connections[tsMsg.Src] = connection
-	}
-	ts.ConnectionsMu.Unlock()
-
-	switch tsMsg.Type {
-	case TrafficSim_HELLO:
-		ts.sendACK(conn, addr, TrafficSimData{Sent: time.Now().UnixMilli()})
-	case TrafficSim_DATA:
-		ts.handleData(conn, addr, tsMsg.Data, connection)
-	case TrafficSim_PING:
-		ts.handlePing(conn, addr, tsMsg.Data)
-	}
-}
-
-func (ts *TrafficSim) handlePing(conn *net.UDPConn, addr *net.UDPAddr, data TrafficSimData) {
-	pongData := TrafficSimData{
-		Sent:     data.Sent,
-		Received: time.Now().UnixMilli(),
-	}
-
-	pongMsg, err := ts.buildMessage(TrafficSim_PONG, pongData)
-	if err != nil {
-		log.Printf("TrafficSim: Error building pong message: %v", err)
-		return
-	}
-
-	if _, err := conn.WriteToUDP([]byte(pongMsg), addr); err != nil {
-		log.Printf("TrafficSim: Error sending PONG: %v", err)
-	}
-}
-
-func (ts *TrafficSim) sendACK(conn *net.UDPConn, addr *net.UDPAddr, data TrafficSimData) {
-	if !ts.isRunning() {
-		return
-	}
-
-	replyMsg, err := ts.buildMessage(TrafficSim_ACK, data)
-	if err != nil {
-		log.Printf("TrafficSim: Error building reply message: %v", err)
-		return
-	}
-
-	if _, err := conn.WriteToUDP([]byte(replyMsg), addr); err != nil {
-		log.Printf("TrafficSim: Error sending ACK: %v", err)
-	}
-}
-
-func (ts *TrafficSim) handleData(conn *net.UDPConn, addr *net.UDPAddr, data TrafficSimData, connection *Connection) {
-	connection.LastResponse = time.Now()
-
-	log.Printf("TrafficSim: Received data from %s: Seq %d", addr.String(), data.Seq)
-
-	ackData := TrafficSimData{
-		Sent:     data.Sent,
-		Received: time.Now().UnixMilli(),
-		Seq:      data.Seq,
-	}
-	ts.sendACK(conn, addr, ackData)
-}
-
-func (ts *TrafficSim) isAgentAllowed(agentID primitive.ObjectID) bool {
-	ts.Mutex.Lock()
-	defer ts.Mutex.Unlock()
-
-	for _, allowedAgent := range ts.AllowedAgents {
-		if allowedAgent == agentID {
-			return true
-		}
-	}
-	return false
-}
-
+// Start begins the TrafficSim in client or server mode
 func (ts *TrafficSim) Start(mtrProbe *Probe) {
-	// Set Running state
-	atomic.StoreInt32(&ts.Running, 1)
+	atomic.StoreInt32(&ts.running, 1)
 	atomic.StoreInt32(&ts.stopping, 0)
 	ts.stopChan = make(chan struct{})
 
 	defer func() {
-		log.Printf("TrafficSim: Start() exiting for probe %s", ts.Probe.ID.Hex())
-		atomic.StoreInt32(&ts.Running, 0)
-		if ts.Conn != nil {
-			ts.Conn.Close()
+		log.Printf("[trafficsim] Start() exiting for probe %d", ts.Probe.ID)
+		atomic.StoreInt32(&ts.running, 0)
+		if ts.conn != nil {
+			ts.conn.Close()
 		}
 	}()
 
 	ctx := context.Background()
 
-	for ts.isRunning() {
+	for ts.isRunning() && !ts.isStopping() {
 		var err error
-		ts.localIP, err = getLocalIP()
-		if err != nil {
-			log.Printf("TrafficSim: Failed to get local IP: %v", err)
-			if !ts.waitOrStop(RetryInterval) {
-				return
-			}
-			continue
-		}
-
 		if ts.IsServer {
 			err = ts.runServer()
 		} else {
@@ -2886,60 +402,753 @@ func (ts *TrafficSim) Start(mtrProbe *Probe) {
 		}
 
 		if err != nil {
-			log.Printf("TrafficSim: Error occurred: %v. Retrying in %v...", err, RetryInterval)
-			if !ts.waitOrStop(RetryInterval) {
+			log.Printf("[trafficsim] Error: %v. Retrying in %v...", err, TrafficSimRetryInterval)
+			select {
+			case <-time.After(TrafficSimRetryInterval):
+			case <-ts.stopChan:
 				return
 			}
 		}
 	}
 }
 
-// Stop gracefully stops the TrafficSim instance
-func (ts *TrafficSim) Stop() {
-	log.Printf("TrafficSim: Stop requested for probe %s", ts.Probe.ID.Hex())
+func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
+	// Establish UDP connection
+	if err := ts.dialUDP(); err != nil {
+		return fmt.Errorf("dial UDP: %w", err)
+	}
+	defer ts.conn.Close()
 
-	// Mark that we're stopping
-	atomic.StoreInt32(&ts.stopping, 1)
+	// Attempt handshake
+	if !ts.handshake() {
+		return fmt.Errorf("handshake failed")
+	}
 
-	// If we're in a test cycle, wait for it to complete
-	if ts.isInTestCycle() {
-		log.Print("TrafficSim: Waiting for current test cycle to complete...")
+	log.Debugf("[trafficsim] Connected to %s:%d", ts.IPAddress, ts.Port)
 
-		gracefulCtx, cancel := context.WithTimeout(context.Background(), GracefulShutdownTimeout)
-		defer cancel()
+	// Start receive loop
+	ts.wg.Add(1)
+	go func() {
+		defer ts.wg.Done()
+		ts.receiveLoop(ctx)
+	}()
 
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
+	// Run test cycles
+	ts.runTestCycles(ctx, mtrProbe)
 
-		for {
+	return nil
+}
+
+func (ts *TrafficSim) dialUDP() error {
+	addr := fmt.Sprintf("%s:%d", ts.IPAddress, ts.Port)
+	raddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		return err
+	}
+
+	ts.setConn(conn)
+	return nil
+}
+
+func (ts *TrafficSim) handshake() bool {
+	seq := ts.nextSequence()
+	sentTime := time.Now().UnixMilli()
+
+	msg, err := ts.buildMessage(MsgHello, TrafficSimData{
+		Sent: sentTime,
+		Seq:  seq,
+	})
+	if err != nil {
+		log.Printf("[trafficsim] Error building HELLO: %v", err)
+		return false
+	}
+
+	conn := ts.getConn()
+	if conn == nil {
+		return false
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(TrafficSimTimeout))
+	if _, err := conn.Write(msg); err != nil {
+		log.Printf("[trafficsim] Failed to send HELLO: %v", err)
+		return false
+	}
+
+	// Wait for response
+	buf := make([]byte, 2048)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		log.Printf("[trafficsim] No HELLO response: %v", err)
+		return false
+	}
+
+	var resp TrafficSimMsg
+	if err := json.Unmarshal(buf[:n], &resp); err != nil {
+		log.Printf("[trafficsim] Invalid HELLO response: %v", err)
+		return false
+	}
+
+	if resp.Type == MsgAck || resp.Type == MsgHello {
+		log.Debugf("[trafficsim] Handshake successful, RTT: %dms", time.Now().UnixMilli()-sentTime)
+		ts.lastResponse = time.Now()
+		return true
+	}
+
+	return false
+}
+
+func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
+	for ts.isRunning() && !ts.isStopping() {
+		// Start new cycle
+		cycle := ts.startCycle()
+
+		log.Debugf("[trafficsim] Starting cycle, %d packets", TrafficSimReportSeq)
+
+		// Send packets
+		for i := 0; i < TrafficSimReportSeq && ts.isRunning() && !ts.isStopping(); i++ {
 			select {
-			case <-gracefulCtx.Done():
-				log.Print("TrafficSim: Graceful shutdown timeout reached, forcing stop")
-				goto shutdown
-			case <-ticker.C:
-				if !ts.isInTestCycle() {
-					log.Print("TrafficSim: Test cycle completed, proceeding with shutdown")
-					goto shutdown
+			case <-ctx.Done():
+				return
+			case <-ts.stopChan:
+				return
+			default:
+			}
+
+			// Check if we need to reconnect due to network change
+			if !ts.isConnectionValid() {
+				if err := ts.reconnectUDP(); err != nil {
+					// Still send packet (will fail, recording loss)
+					log.Printf("[trafficsim] Reconnection failed, packet %d will fail", i+1)
 				}
+			}
+
+			ts.sendDataPacket(cycle)
+
+			// Wait for interval
+			select {
+			case <-time.After(time.Duration(TrafficSimDataInterval) * time.Second):
+			case <-ctx.Done():
+				return
+			case <-ts.stopChan:
+				return
+			}
+		}
+
+		// Wait for responses
+		ts.waitForResponses(ctx, cycle)
+
+		// Calculate and report stats
+		stats := ts.calculateStats(cycle)
+		ts.reportStats(stats, mtrProbe)
+
+		// Reset sequence for next cycle
+		ts.resetSequence()
+
+		// Check for packet loss trigger
+		if loss, ok := stats["lossPercentage"].(float64); ok && loss > 5.0 {
+			ts.triggerMTR(mtrProbe, loss)
+		}
+
+		log.Infof("[trafficsim] probe=%d loss=%.1f%% avgRTT=%.1fms minRTT=%vms maxRTT=%vms",
+			ts.Probe.ID, stats["lossPercentage"], stats["averageRTT"], stats["minRTT"], stats["maxRTT"])
+	}
+}
+
+func (ts *TrafficSim) startCycle() *CycleTracker {
+	ts.cycleMu.Lock()
+	defer ts.cycleMu.Unlock()
+
+	cycle := &CycleTracker{
+		StartSeq:        ts.sequence + 1,
+		StartTime:       time.Now(),
+		PacketSeqs:      make([]int, 0, TrafficSimReportSeq),
+		PacketTimes:     make(map[int]PacketTime),
+		receivedSeqs:    make(map[int]int), // Track receive count per seq
+		lastReceivedSeq: 0,
+		outOfOrder:      0,
+		duplicates:      0,
+	}
+	ts.currentCycle = cycle
+	ts.packetsInCycle = 0
+
+	return cycle
+}
+
+func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker) bool {
+	seq := ts.nextSequence()
+	sentTime := time.Now().UnixMilli()
+
+	// Track in cycle
+	cycle.mu.Lock()
+	cycle.PacketSeqs = append(cycle.PacketSeqs, seq)
+	cycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	cycle.mu.Unlock()
+
+	// Also track in client stats
+	ts.clientStats.mu.Lock()
+	ts.clientStats.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	ts.clientStats.mu.Unlock()
+
+	msg, err := ts.buildMessage(MsgData, TrafficSimData{
+		Sent: sentTime,
+		Seq:  seq,
+	})
+	if err != nil {
+		log.Printf("[trafficsim] Error building DATA: %v", err)
+		return false
+	}
+
+	conn := ts.getConn()
+	if conn == nil {
+		return false
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Write(msg); err != nil {
+		log.Printf("[trafficsim] Send error for seq %d: %v", seq, err)
+		// Check if this is a network change error
+		if isNetworkChangeError(err) {
+			ts.setConnectionValid(false)
+		}
+		return false
+	}
+
+	return true
+}
+
+func (ts *TrafficSim) receiveLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ts.stopChan:
+			return
+		default:
+		}
+
+		if !ts.isRunning() {
+			return
+		}
+
+		conn := ts.getConn()
+		if conn == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		buf := make([]byte, 2048)
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			// Check for network change errors
+			if isNetworkChangeError(err) {
+				log.Printf("[trafficsim] Network change detected in receive loop: %v", err)
+				ts.setConnectionValid(false)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			log.Printf("[trafficsim] Read error: %v", err)
+			continue
+		}
+
+		var msg TrafficSimMsg
+		if err := json.Unmarshal(buf[:n], &msg); err != nil {
+			continue
+		}
+
+		switch msg.Type {
+		case MsgAck:
+			ts.handleAck(msg.Data)
+		case MsgPong:
+			ts.lastResponse = time.Now()
+		case MsgData:
+			// Server sent DATA (bidirectional mode) - send ACK back
+			ack, err := ts.buildAckMessage(msg.Data)
+			if err != nil {
+				continue
+			}
+			conn.Write(ack)
+			ts.lastResponse = time.Now()
+		case MsgReport:
+			// Server stats received
+		}
+	}
+}
+
+func (ts *TrafficSim) handleAck(data TrafficSimData) {
+	seq := data.Seq
+	recvTime := time.Now().UnixMilli()
+
+	// Update cycle tracker
+	ts.cycleMu.RLock()
+	if ts.currentCycle != nil {
+		ts.currentCycle.mu.Lock()
+
+		// Track duplicate detection: increment receive count for this seq
+		ts.currentCycle.receivedSeqs[seq]++
+		receiveCount := ts.currentCycle.receivedSeqs[seq]
+
+		if receiveCount > 1 {
+			// This is a duplicate packet
+			ts.currentCycle.duplicates++
+		} else {
+			// First time receiving this seq - check for out-of-order
+			if ts.currentCycle.lastReceivedSeq > 0 && seq < ts.currentCycle.lastReceivedSeq {
+				// Packet arrived out of order (lower seq after higher seq)
+				ts.currentCycle.outOfOrder++
+			}
+			ts.currentCycle.lastReceivedSeq = seq
+		}
+
+		// Update packet timing (only first receipt)
+		if pt, ok := ts.currentCycle.PacketTimes[seq]; ok && pt.Received == 0 {
+			pt.Received = recvTime
+			ts.currentCycle.PacketTimes[seq] = pt
+		}
+		ts.currentCycle.mu.Unlock()
+	}
+	ts.cycleMu.RUnlock()
+
+	// Update client stats
+	ts.clientStats.mu.Lock()
+	if pt, ok := ts.clientStats.PacketTimes[seq]; ok && pt.Received == 0 {
+		pt.Received = recvTime
+		ts.clientStats.PacketTimes[seq] = pt
+	}
+	ts.clientStats.mu.Unlock()
+
+	ts.lastResponse = time.Now()
+}
+
+func (ts *TrafficSim) waitForResponses(ctx context.Context, cycle *CycleTracker) {
+	deadline := time.Now().Add(TrafficSimTimeout + 500*time.Millisecond)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ts.stopChan:
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// Check if all packets are complete
+		allDone := true
+		now := time.Now().UnixMilli()
+
+		cycle.mu.Lock()
+		for _, seq := range cycle.PacketSeqs {
+			if pt, ok := cycle.PacketTimes[seq]; ok {
+				if pt.Received == 0 && !pt.TimedOut {
+					if now-pt.Sent > int64(TrafficSimTimeout.Milliseconds()) {
+						pt.TimedOut = true
+						cycle.PacketTimes[seq] = pt
+					} else {
+						allDone = false
+					}
+				}
+			}
+		}
+		cycle.mu.Unlock()
+
+		if allDone {
+			break
+		}
+	}
+}
+
+func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{} {
+	cycle.mu.RLock()
+	defer cycle.mu.RUnlock()
+
+	var rtts []float64
+	var totalRTT, minRTT, maxRTT int64
+	lost := 0
+	total := len(cycle.PacketSeqs)
+
+	for _, seq := range cycle.PacketSeqs {
+		if pt, ok := cycle.PacketTimes[seq]; ok {
+			if pt.Received == 0 || pt.TimedOut {
+				lost++
+				continue
+			}
+			rtt := pt.Received - pt.Sent
+			rtts = append(rtts, float64(rtt))
+			totalRTT += rtt
+			if minRTT == 0 || rtt < minRTT {
+				minRTT = rtt
+			}
+			if rtt > maxRTT {
+				maxRTT = rtt
 			}
 		}
 	}
 
-shutdown:
-	// Now stop Running
-	atomic.StoreInt32(&ts.Running, 0)
+	avgRTT := float64(0)
+	stdDev := float64(0)
+	if len(rtts) > 0 {
+		avgRTT = float64(totalRTT) / float64(len(rtts))
+		for _, rtt := range rtts {
+			stdDev += math.Pow(rtt-avgRTT, 2)
+		}
+		stdDev = math.Sqrt(stdDev / float64(len(rtts)))
+	}
 
-	// Signal stop to all goroutines
+	lossPercent := float64(0)
+	if total > 0 {
+		lossPercent = (float64(lost) / float64(total)) * 100
+	}
+
+	// Calculate percentages for out-of-order and duplicates
+	outOfOrderPercent := float64(0)
+	duplicatePercent := float64(0)
+	received := total - lost
+	if received > 0 {
+		outOfOrderPercent = (float64(cycle.outOfOrder) / float64(received)) * 100
+		duplicatePercent = (float64(cycle.duplicates) / float64(received)) * 100
+	}
+
+	return map[string]interface{}{
+		"lostPackets":       lost,
+		"lossPercentage":    lossPercent,
+		"totalPackets":      total,
+		"averageRTT":        avgRTT,
+		"minRTT":            minRTT,
+		"maxRTT":            maxRTT,
+		"stdDevRTT":         stdDev,
+		"outOfOrder":        cycle.outOfOrder,
+		"outOfOrderPercent": outOfOrderPercent,
+		"duplicates":        cycle.duplicates,
+		"duplicatePercent":  duplicatePercent,
+		"timestamp":         time.Now(),
+	}
+}
+
+func (ts *TrafficSim) reportStats(stats map[string]interface{}, mtrProbe *Probe) {
+	if ts.DataChan == nil || !ts.isRunning() {
+		return
+	}
+
+	payload, err := json.Marshal(stats)
+	if err != nil {
+		log.Printf("[trafficsim] Error marshaling stats: %v", err)
+		return
+	}
+
+	target := fmt.Sprintf("%s:%d", ts.IPAddress, ts.Port)
+
+	select {
+	case ts.DataChan <- ProbeData{
+		ProbeID:     ts.Probe.ID,
+		Triggered:   false,
+		CreatedAt:   time.Now(),
+		Type:        ProbeType_TRAFFICSIM,
+		Payload:     payload,
+		Target:      target,
+		TargetAgent: ts.OtherAgent,
+	}:
+	default:
+		log.Printf("[trafficsim] DataChan full, dropping stats")
+	}
+}
+
+func (ts *TrafficSim) triggerMTR(mtrProbe *Probe, lossPercent float64) {
+	if mtrProbe == nil {
+		return
+	}
+
+	log.Printf("[trafficsim] Triggering MTR due to %.1f%% packet loss", lossPercent)
+	// The actual MTR execution would be handled by the probe worker
+	// This just logs the trigger for now
+}
+
+// -------------------- Server Mode --------------------
+
+func (ts *TrafficSim) runServer() error {
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", ts.Port)
+	addr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return err
+	}
+	ts.setConn(conn)
+	defer conn.Close()
+
+	log.Debugf("[trafficsim] Server listening on %s", listenAddr)
+
+	for ts.isRunning() && !ts.isStopping() {
+		select {
+		case <-ts.stopChan:
+			return nil
+		default:
+		}
+
+		buf := make([]byte, 2048)
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			log.Printf("[trafficsim] Server read error: %v", err)
+			continue
+		}
+
+		var msg TrafficSimMsg
+		if err := json.Unmarshal(buf[:n], &msg); err != nil {
+			continue
+		}
+
+		// Check if agent is allowed
+		if !ts.isAgentAllowed(msg.SrcAgent) {
+			log.Printf("[trafficsim] Rejected packet from unauthorized agent %d", msg.SrcAgent)
+			continue
+		}
+
+		ts.handleServerMessage(conn, remoteAddr, msg)
+	}
+
+	return nil
+}
+
+func (ts *TrafficSim) isAgentAllowed(agentID uint) bool {
+	// If no allowed list, allow all
+	if len(ts.AllowedAgents) == 0 {
+		return true
+	}
+
+	for _, allowed := range ts.AllowedAgents {
+		if allowed == agentID {
+			return true
+		}
+	}
+	return false
+}
+
+func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, msg TrafficSimMsg) {
+	// Update or create connection tracking
+	ts.connectionsMu.Lock()
+	connection, exists := ts.connections[msg.SrcAgent]
+	if !exists {
+		connection = &AgentConnection{
+			AgentID:        msg.SrcAgent,
+			Addr:           addr,
+			FirstSeen:      time.Now(),
+			LastReportTime: time.Now(),
+		}
+		ts.connections[msg.SrcAgent] = connection
+		log.Debugf("[trafficsim] New connection from agent %d at %s", msg.SrcAgent, addr.String())
+
+		// Check if we have a client probe for this connected agent (enables bidirectional mode)
+		if clientProbe := ts.GetClientProbeForAgent(msg.SrcAgent); clientProbe != nil {
+			connection.ClientProbeID = clientProbe.ID
+			connection.ReverseCycle = &CycleTracker{
+				StartSeq:     1,
+				StartTime:    time.Now(),
+				PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+				PacketTimes:  make(map[int]PacketTime),
+				receivedSeqs: make(map[int]int),
+			}
+			log.Infof("[trafficsim] Bidirectional mode enabled for agent %d using client probe %d",
+				msg.SrcAgent, clientProbe.ID)
+		}
+	}
+	connection.LastSeen = time.Now()
+	connection.PacketsRecv++
+	ts.connectionsMu.Unlock()
+
+	// Handle different message types
+	switch msg.Type {
+	case MsgData, MsgHello:
+		// Client sent data, send ACK back
+		ack, err := ts.buildAckMessage(msg.Data)
+		if err != nil {
+			return
+		}
+
+		if _, err := conn.WriteToUDP(ack, addr); err != nil {
+			log.Printf("[trafficsim] Failed to send ACK: %v", err)
+		}
+
+		ts.connectionsMu.Lock()
+		connection.PacketsSent++
+		ts.connectionsMu.Unlock()
+
+		// If bidirectional (has client probe for this agent), send test data back
+		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
+			ts.sendReverseDataPacket(conn, addr, connection)
+		}
+
+	case MsgAck:
+		// Client ACK'd our reverse data packet - record the response time
+		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
+			ts.handleReverseAck(connection, msg.Data)
+		}
+	}
+}
+
+func (ts *TrafficSim) buildAckMessage(data TrafficSimData) ([]byte, error) {
+	ack := TrafficSimMsg{
+		Type: MsgAck,
+		Data: TrafficSimData{
+			Sent:     data.Sent,
+			Received: time.Now().UnixMilli(),
+			Seq:      data.Seq,
+		},
+		SrcAgent:  ts.ThisAgent,
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	return json.Marshal(ack)
+}
+
+// sendReverseDataPacket sends a test data packet from server to client for bidirectional measurement
+func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr, connection *AgentConnection) {
+	connection.ReverseSequence++
+	seq := connection.ReverseSequence
+	sentTime := time.Now().UnixMilli()
+
+	// Track in reverse cycle
+	connection.ReverseCycle.mu.Lock()
+	connection.ReverseCycle.PacketSeqs = append(connection.ReverseCycle.PacketSeqs, seq)
+	connection.ReverseCycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	connection.ReverseCycle.mu.Unlock()
+
+	// Build DATA message
+	msg := TrafficSimMsg{
+		Type: MsgData,
+		Data: TrafficSimData{
+			Sent: sentTime,
+			Seq:  seq,
+		},
+		SrcAgent:  ts.ThisAgent,
+		DstAgent:  connection.AgentID,
+		Timestamp: sentTime,
+	}
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("[trafficsim] Error building reverse DATA: %v", err)
+		return
+	}
+
+	if _, err := conn.WriteToUDP(msgBytes, addr); err != nil {
+		log.Printf("[trafficsim] Failed to send reverse DATA to agent %d: %v", connection.AgentID, err)
+	}
+
+	connection.PacketsSent++
+
+	// Check if cycle is complete
+	if len(connection.ReverseCycle.PacketSeqs) >= TrafficSimReportSeq {
+		// Report stats and start new cycle
+		go ts.reportReverseStats(connection)
+	}
+}
+
+// handleReverseAck processes ACK from client for server's reverse DATA packet
+func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data TrafficSimData) {
+	seq := data.Seq
+	recvTime := time.Now().UnixMilli()
+
+	connection.ReverseCycle.mu.Lock()
+	defer connection.ReverseCycle.mu.Unlock()
+
+	// Track duplicate/out-of-order
+	connection.ReverseCycle.receivedSeqs[seq]++
+	receiveCount := connection.ReverseCycle.receivedSeqs[seq]
+
+	if receiveCount > 1 {
+		connection.ReverseCycle.duplicates++
+	} else if connection.ReverseCycle.lastReceivedSeq > 0 && seq < connection.ReverseCycle.lastReceivedSeq {
+		connection.ReverseCycle.outOfOrder++
+	}
+	connection.ReverseCycle.lastReceivedSeq = seq
+
+	// Update packet timing
+	if pt, ok := connection.ReverseCycle.PacketTimes[seq]; ok && pt.Received == 0 {
+		pt.Received = recvTime
+		connection.ReverseCycle.PacketTimes[seq] = pt
+	}
+}
+
+// reportReverseStats calculates and reports stats for reverse direction
+func (ts *TrafficSim) reportReverseStats(connection *AgentConnection) {
+	if ts.DataChan == nil || !ts.isRunning() {
+		return
+	}
+
+	// Calculate stats using the same method as client
+	stats := ts.calculateStats(connection.ReverseCycle)
+
+	payload, err := json.Marshal(stats)
+	if err != nil {
+		log.Printf("[trafficsim] Error marshaling reverse stats: %v", err)
+		return
+	}
+
+	// Report with the client probe ID for this connection
+	select {
+	case ts.DataChan <- ProbeData{
+		ProbeID:     connection.ClientProbeID,
+		Triggered:   false,
+		CreatedAt:   time.Now(),
+		Type:        ProbeType_TRAFFICSIM,
+		Payload:     payload,
+		Target:      connection.Addr.String(),
+		TargetAgent: connection.AgentID,
+	}:
+		log.Infof("[trafficsim] probe=%d (reverse) agent=%d loss=%.1f%% avgRTT=%.1fms",
+			connection.ClientProbeID, connection.AgentID, stats["lossPercentage"], stats["averageRTT"])
+	default:
+		log.Printf("[trafficsim] DataChan full, dropping reverse stats")
+	}
+
+	// Reset cycle for next round
+	connection.ReverseCycle = &CycleTracker{
+		StartSeq:     connection.ReverseSequence + 1,
+		StartTime:    time.Now(),
+		PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+		PacketTimes:  make(map[int]PacketTime),
+		receivedSeqs: make(map[int]int),
+	}
+	connection.LastReportTime = time.Now()
+}
+
+// -------------------- Stop --------------------
+
+// Stop gracefully stops the TrafficSim
+func (ts *TrafficSim) Stop() {
+	log.Printf("[trafficsim] Stop requested for probe %d", ts.Probe.ID)
+
+	atomic.StoreInt32(&ts.stopping, 1)
+
+	// Wait briefly for current operations
+	time.Sleep(100 * time.Millisecond)
+
+	atomic.StoreInt32(&ts.running, 0)
+
 	if ts.stopChan != nil {
 		close(ts.stopChan)
 	}
 
-	// Close connection
-	if ts.Conn != nil {
-		ts.Conn.Close()
+	if ts.conn != nil {
+		ts.conn.Close()
 	}
 
-	// Wait for all goroutines to finish
+	// Wait for goroutines with timeout
 	done := make(chan struct{})
 	go func() {
 		ts.wg.Wait()
@@ -2948,10 +1157,53 @@ shutdown:
 
 	select {
 	case <-done:
-		log.Print("TrafficSim: All goroutines stopped")
+		log.Printf("[trafficsim] Stopped probe %d", ts.Probe.ID)
 	case <-time.After(5 * time.Second):
-		log.Print("TrafficSim: Timeout waiting for goroutines to stop")
+		log.Printf("[trafficsim] Timeout waiting for goroutines, probe %d", ts.Probe.ID)
+	}
+}
+
+// -------------------- Interface Helpers --------------------
+
+func getLocalIP() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
 	}
 
-	log.Printf("TrafficSim: Stopped probe %s", ts.Probe.ID.Hex())
+	// Score interfaces
+	type candidate struct {
+		ip    string
+		score int
+	}
+	var candidates []candidate
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok {
+			ip := ipnet.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+
+			score := 0
+			if ip.IsPrivate() {
+				score += 10
+				if ip[0] == 192 && ip[1] == 168 {
+					score += 5
+				}
+			}
+
+			candidates = append(candidates, candidate{ip: ip.String(), score: score})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no suitable interface found")
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	return candidates[0].ip, nil
 }

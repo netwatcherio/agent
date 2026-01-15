@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
 	"os"
@@ -15,6 +14,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // UpdaterConfig holds configuration for the auto-updater
@@ -257,7 +258,17 @@ func (u *AutoUpdater) downloadAndApplyUpdate(downloadURL, filename string) error
 		return fmt.Errorf("download failed with status %d", resp.StatusCode)
 	}
 
-	tempFile, err := os.CreateTemp("", "netwatcher-update-*")
+	// Create local tmp directory next to executable (avoids read-only /tmp issues)
+	execPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %w", err)
+	}
+	localTmpDir := filepath.Join(filepath.Dir(execPath), ".tmp")
+	if err := os.MkdirAll(localTmpDir, 0755); err != nil {
+		return fmt.Errorf("failed to create local tmp directory: %w", err)
+	}
+
+	tempFile, err := os.CreateTemp(localTmpDir, "netwatcher-update-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -339,7 +350,18 @@ func (u *AutoUpdater) extractTarGz(archivePath string) (string, error) {
 	defer gzr.Close()
 
 	tr := tar.NewReader(gzr)
-	tempDir, err := os.MkdirTemp("", "extract-*")
+
+	// Use local tmp directory next to executable
+	execPath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("failed to get executable path: %w", err)
+	}
+	localTmpDir := filepath.Join(filepath.Dir(execPath), ".tmp")
+	if err := os.MkdirAll(localTmpDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create local tmp directory: %w", err)
+	}
+
+	tempDir, err := os.MkdirTemp(localTmpDir, "extract-*")
 	if err != nil {
 		return "", err
 	}
@@ -384,7 +406,17 @@ func (u *AutoUpdater) extractZip(archivePath string) (string, error) {
 	}
 	defer r.Close()
 
-	tempDir, err := os.MkdirTemp("", "extract-*")
+	// Use local tmp directory next to executable
+	execPath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("failed to get executable path: %w", err)
+	}
+	localTmpDir := filepath.Join(filepath.Dir(execPath), ".tmp")
+	if err := os.MkdirAll(localTmpDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create local tmp directory: %w", err)
+	}
+
+	tempDir, err := os.MkdirTemp(localTmpDir, "extract-*")
 	if err != nil {
 		return "", err
 	}
