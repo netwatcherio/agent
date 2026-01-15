@@ -381,6 +381,13 @@ function Install-Agent {
 
     Write-Success "Binary installed to: $binaryPath"
 
+    # Remove stale auth file to force re-authentication with new PIN
+    $authFile = Join-Path $InstallDir "agent_auth.json"
+    if (Test-Path $authFile) {
+        Write-Info "Removing stale auth file to force re-authentication..."
+        Remove-Item -Path $authFile -Force -ErrorAction SilentlyContinue
+    }
+
     # Create configuration file
     $configPath = Join-Path $InstallDir $Script:ConfigFile
     Write-Info "Creating configuration file: $configPath"
