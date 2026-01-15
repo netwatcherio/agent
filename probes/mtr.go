@@ -106,7 +106,8 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 
 	var cmd *exec.Cmd
 	if platform.IsWindows() {
-		shellArgs := append([]string{"/c", trippyPath + " " +
+		// Quote the path to handle spaces in "Program Files"
+		shellArgs := append([]string{"/c", "\"" + trippyPath + "\" " +
 			"--udp " +
 			"--mode json " +
 			"--multipath-strategy paris " +
