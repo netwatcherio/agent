@@ -107,7 +107,7 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 		shellArgs := append([]string{"/c", trippyPath + " " +
 			"--icmp " +
 			"--mode json " +
-			"--multipath-strategy classic" +
+			"--multipath-strategy classic " +
 			"--dns-resolve-method cloudflare " +
 			"--report-cycles " + strconv.Itoa(triggeredCount) + " " +
 			"--dns-lookup-as-info " + cd.Targets[0].Target})
