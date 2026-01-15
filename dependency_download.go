@@ -552,23 +552,25 @@ func formatBytes(bytes int64) string {
 
 // DownloadTrippy downloads the Trippy dependency using the new flexible system
 func DownloadTrippy(version string) error {
-	// Get working directory
-	workDir, err := os.Getwd()
+	// Use executable directory instead of working directory
+	// This is critical for Windows services which run from System32
+	exePath, err := os.Executable()
 	if err != nil {
-		workDir = "."
+		return fmt.Errorf("failed to get executable path: %w", err)
 	}
+	baseDir := filepath.Dir(exePath)
 
 	config := &DependencyConfig{
 		Name:        "trippy",
 		Version:     version,
 		BaseURL:     "https://github.com/fujiapple852/trippy/releases/download/" + version + "/",
-		DestDir:     filepath.Join(workDir, "lib"),
-		TempDir:     filepath.Join(workDir, "temp"), // Use temp folder in working directory
+		DestDir:     filepath.Join(baseDir, "lib"),
+		TempDir:     filepath.Join(baseDir, "temp"),
 		Executable:  getTrippyExecutableName(),
 		MaxRetries:  3,
 		Timeout:     60 * time.Second,
 		ForceUpdate: false,
-		VerifyHash:  false, // Set to true if you have expected hashes
+		VerifyHash:  false,
 		Patterns: map[string]PlatformPattern{
 			"windows-amd64": {
 				URLTemplate:    "trippy-{version}-x86_64-pc-windows-msvc.zip",
