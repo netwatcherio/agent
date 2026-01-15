@@ -113,7 +113,7 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 			"--multipath-strategy", "paris",
 			"--dns-resolve-method", "system",
 			"--report-cycles", strconv.Itoa(triggeredCount),
-			"--dns-lookup-as-info",
+			/*"--dns-lookup-as-info",*/
 			cd.Targets[0].Target)
 	} else {
 		// For Linux and macOS, use exec.Command directly as well
@@ -123,7 +123,7 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 			"--multipath-strategy", "paris",
 			"--dns-resolve-method", "system",
 			"--report-cycles", strconv.Itoa(triggeredCount),
-			"--dns-lookup-as-info",
+			/*"--dns-lookup-as-info",*/
 			cd.Targets[0].Target)
 	}
 
