@@ -238,6 +238,10 @@ type WSClient struct {
 	SpeedtestQueueCh chan []probes.SpeedtestQueueItem
 	WsConn           *neffos.NSConn
 	AgentVersion     string
+	// Failure tracking for auto-reconnect
+	probeGetFailures    int
+	maxProbeGetFailures int // Max consecutive failures before reconnect (default 5)
+	reconnectInProgress bool
 }
 
 func (c *WSClient) namespaces() neffos.Namespaces {
@@ -286,10 +290,50 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			"probe_get": func(ns *neffos.NSConn, msg neffos.Message) error {
 				var p []probes.Probe
 
-				if err := json.Unmarshal(msg.Body, &p); err != nil {
-					log.Warnf("WS: probe_get unmarshal error: %v", err)
-					return err
+				// Set default max failures if not configured
+				if c.maxProbeGetFailures == 0 {
+					c.maxProbeGetFailures = 5
 				}
+
+				// Handle empty or malformed messages gracefully (common during reconnection)
+				if len(msg.Body) == 0 {
+					c.probeGetFailures++
+					log.Debugf("WS: probe_get received empty body (%d/%d failures)", c.probeGetFailures, c.maxProbeGetFailures)
+
+					// Trigger reconnect if too many consecutive failures
+					if c.probeGetFailures >= c.maxProbeGetFailures && !c.reconnectInProgress {
+						log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
+						c.probeGetFailures = 0
+						c.reconnectInProgress = true
+						go func() {
+							time.Sleep(2 * time.Second) // Brief pause before reconnecting
+							c.reconnectInProgress = false
+							c.ConnectWithRetry(context.Background())
+						}()
+					}
+					return nil
+				}
+
+				if err := json.Unmarshal(msg.Body, &p); err != nil {
+					c.probeGetFailures++
+					log.Debugf("WS: probe_get unmarshal error (%d/%d failures): %v", c.probeGetFailures, c.maxProbeGetFailures, err)
+
+					// Trigger reconnect if too many consecutive failures
+					if c.probeGetFailures >= c.maxProbeGetFailures && !c.reconnectInProgress {
+						log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
+						c.probeGetFailures = 0
+						c.reconnectInProgress = true
+						go func() {
+							time.Sleep(2 * time.Second)
+							c.reconnectInProgress = false
+							c.ConnectWithRetry(context.Background())
+						}()
+					}
+					return nil
+				}
+
+				// Success! Reset failure counter
+				c.probeGetFailures = 0
 
 				if len(p) > 0 {
 					// Log summary instead of full JSON
@@ -298,11 +342,11 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 						typeCounts[string(probe.Type)]++
 					}
 					log.Infof("WS: received %d probes: %v", len(p), typeCounts)
+					c.ProbeGetCh <- p
 				} else {
 					log.Debugf("WS: received empty probe list")
 				}
 
-				c.ProbeGetCh <- p
 				return nil
 			},
 			"speedtest_servers_ok": func(ns *neffos.NSConn, msg neffos.Message) error {
