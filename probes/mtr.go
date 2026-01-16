@@ -198,7 +198,7 @@ func transformHops(result *trace.Result, numMeasurements int) []struct {
 			bestRTT    = math.MaxFloat64
 			worstRTT   = 0.0
 			hostsMap   = make(map[string]string) // IP -> Hostname
-			extensions []string
+			extensions = make([]string, 0)       // Initialize to empty slice, not nil
 		)
 
 		for _, hop := range attempts {
@@ -278,15 +278,12 @@ func transformHops(result *trace.Result, numMeasurements int) []struct {
 			})
 		}
 
-		// If no hosts were found (all timeouts), add an empty entry
-		if len(hosts) == 0 {
-			hosts = append(hosts, struct {
+		// If no hosts were found (all timeouts), ensure hosts is empty array not nil
+		if hosts == nil {
+			hosts = make([]struct {
 				IP       string `json:"ip"`
 				Hostname string `json:"hostname"`
-			}{
-				IP:       "",
-				Hostname: "",
-			})
+			}, 0)
 		}
 
 		hopData := struct {
