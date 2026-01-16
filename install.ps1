@@ -278,8 +278,7 @@ function Stop-AgentService {
 
 function Configure-Firewall {
     param(
-        [string]$AgentPath,
-        [string]$TripPath
+        [string]$AgentPath
     )
     
     Write-Info "Configuring Windows Firewall rules..."
@@ -302,25 +301,73 @@ function Configure-Firewall {
         Write-Warning "Failed to create firewall rule for agent: $_"
     }
     
-    # Configure trip.exe firewall rules if it exists
-    if ($TripPath -and (Test-Path $TripPath)) {
-        try {
-            # Trip - allow all connections (program-based rule)
-            New-NetFirewallRule -DisplayName "NetWatcher Trip MTR" `
-                -Program $TripPath `
-                -Action Allow `
-                -Profile Any `
-                -Description "Allows all network connections for Trip (MTR/traceroute tool)" `
-                -ErrorAction Stop | Out-Null
-            
-            Write-Success "Firewall rule created for Trip (MTR tool)"
-        }
-        catch {
-            Write-Warning "Failed to create firewall rule for trip: $_"
-        }
+    # Add explicit ICMP rules for MTR/traceroute/ping functionality
+    try {
+        # ICMP Echo Request - Outbound (for ping/traceroute probes)
+        New-NetFirewallRule -DisplayName "NetWatcher ICMP Echo Request Out" `
+            -Protocol ICMPv4 `
+            -IcmpType 8 `
+            -Direction Outbound `
+            -Action Allow `
+            -Profile Any `
+            -Description "Allows outbound ICMP Echo Request for MTR/traceroute" `
+            -ErrorAction Stop | Out-Null
+        
+        Write-Success "Firewall rule created for ICMP Echo Request (outbound)"
     }
-    else {
-        Write-Info "Trip not yet installed - firewall rule will be created after first run"
+    catch {
+        Write-Warning "Failed to create ICMP outbound rule: $_"
+    }
+    
+    try {
+        # ICMP Echo Reply - Inbound (for receiving ping responses)
+        New-NetFirewallRule -DisplayName "NetWatcher ICMP Echo Reply In" `
+            -Protocol ICMPv4 `
+            -IcmpType 0 `
+            -Direction Inbound `
+            -Action Allow `
+            -Profile Any `
+            -Description "Allows inbound ICMP Echo Reply for MTR/traceroute" `
+            -ErrorAction Stop | Out-Null
+        
+        Write-Success "Firewall rule created for ICMP Echo Reply (inbound)"
+    }
+    catch {
+        Write-Warning "Failed to create ICMP inbound rule: $_"
+    }
+    
+    try {
+        # ICMP Time Exceeded - Inbound (for traceroute TTL responses)
+        New-NetFirewallRule -DisplayName "NetWatcher ICMP Time Exceeded In" `
+            -Protocol ICMPv4 `
+            -IcmpType 11 `
+            -Direction Inbound `
+            -Action Allow `
+            -Profile Any `
+            -Description "Allows inbound ICMP Time Exceeded for traceroute" `
+            -ErrorAction Stop | Out-Null
+        
+        Write-Success "Firewall rule created for ICMP Time Exceeded (inbound)"
+    }
+    catch {
+        Write-Warning "Failed to create ICMP Time Exceeded rule: $_"
+    }
+    
+    try {
+        # ICMP Destination Unreachable - Inbound (for traceroute endpoint detection)
+        New-NetFirewallRule -DisplayName "NetWatcher ICMP Dest Unreachable In" `
+            -Protocol ICMPv4 `
+            -IcmpType 3 `
+            -Direction Inbound `
+            -Action Allow `
+            -Profile Any `
+            -Description "Allows inbound ICMP Destination Unreachable for traceroute" `
+            -ErrorAction Stop | Out-Null
+        
+        Write-Success "Firewall rule created for ICMP Destination Unreachable (inbound)"
+    }
+    catch {
+        Write-Warning "Failed to create ICMP Dest Unreachable rule: $_"
     }
 }
 
@@ -532,8 +579,7 @@ AGENT_PIN=$Pin
     sc.exe failure $Script:ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
 
     # Configure Windows Firewall rules
-    $tripPath = Join-Path $InstallDir "lib\trip.exe"
-    Configure-Firewall -AgentPath $binaryPath -TripPath $tripPath
+    Configure-Firewall -AgentPath $binaryPath
 
     # Start the service
     if (-not $NoStart) {
@@ -784,8 +830,7 @@ function Update-Agent {
     }
 
     # Ensure firewall rules are configured
-    $tripPath = Join-Path $InstallDir "lib\trip.exe"
-    Configure-Firewall -AgentPath $binaryPath -TripPath $tripPath
+    Configure-Firewall -AgentPath $binaryPath
 
     # Start service (or create if missing)
     if (Test-ServiceExists -Name $Script:ServiceName) {
