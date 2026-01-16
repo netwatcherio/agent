@@ -1,7 +1,5 @@
 #!/bin/bash
 
-export CGO_ENABLED=0
-
 # Get version information
 VERSION="${VERSION:-dev}"
 BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -22,18 +20,22 @@ echo "Git Commit: $GIT_COMMIT"
 mkdir -p bin
 
 # Build for different platforms
+# Format: "os/arch:cgo_enabled"
+# darwin requires CGO_ENABLED=1 for pcap/libpcap support
 platforms=(
-    "linux/amd64"
-    "linux/arm64"
-    "linux/arm"
-    "darwin/amd64"
-    "darwin/arm64"
-    "windows/amd64"
-    "windows/arm64"
+    "linux/amd64:0"
+    "linux/arm64:0"
+    "linux/arm:0"
+    "darwin/amd64:1"
+    "darwin/arm64:1"
+    "windows/amd64:0"
+    "windows/arm64:0"
 )
 
 for platform in "${platforms[@]}"; do
-    platform_split=(${platform//\// })
+    # Split platform into os/arch and cgo setting
+    IFS=':' read -r osarch cgo <<< "$platform"
+    platform_split=(${osarch//\// })
     GOOS=${platform_split[0]}
     GOARCH=${platform_split[1]}
 
@@ -42,16 +44,34 @@ for platform in "${platforms[@]}"; do
         output_name+='.exe'
     fi
 
-    echo "Building for $GOOS/$GOARCH..."
+    echo "Building for $GOOS/$GOARCH (CGO_ENABLED=$cgo)..."
 
-    env GOOS=$GOOS GOARCH=$GOARCH go build \
+    # darwin builds with CGO require running on macOS or having cross-compile toolchain
+    if [ "$cgo" = "1" ] && [ "$(uname -s)" != "Darwin" ] && [ "$GOOS" = "darwin" ]; then
+        echo "  Skipping darwin build - requires macOS or cross-compile toolchain"
+        echo "  Build darwin binaries on a Mac or macOS CI runner"
+        continue
+    fi
+
+    env CGO_ENABLED=$cgo GOOS=$GOOS GOARCH=$GOARCH go build \
         -ldflags "$LDFLAGS" \
         -o "bin/${output_name}" \
         .
 
     if [ $? -ne 0 ]; then
         echo "Failed to build for $GOOS/$GOARCH"
+        # Don't exit on darwin failure when cross-compiling - just warn
+        if [ "$GOOS" = "darwin" ]; then
+            echo "  darwin build failed - this is expected when cross-compiling from Linux"
+            continue
+        fi
         exit 1
+    fi
+
+    # Sign darwin binaries (required for macOS to run them)
+    if [ "$GOOS" = "darwin" ]; then
+        echo "Code signing darwin binary..."
+        codesign -s - -f "bin/${output_name}" 2>/dev/null || echo "  Warning: codesign not available (run on macOS to sign)"
     fi
 
     # Create zip file for this platform
@@ -68,7 +88,9 @@ echo "Build complete! All binaries are in the bin/ directory"
 # Create a checksums file
 cd bin
 echo "Generating checksums..."
-sha256sum *.zip > "netwatcher-${VERSION}-checksums.txt"
+if ls *.zip 1> /dev/null 2>&1; then
+    sha256sum *.zip > "netwatcher-${VERSION}-checksums.txt" 2>/dev/null || shasum -a 256 *.zip > "netwatcher-${VERSION}-checksums.txt"
+fi
 cd ..
 
 echo "Done!"
