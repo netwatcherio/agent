@@ -6,22 +6,26 @@ on:
       - master
 
 jobs:
-  build-and-release:
+  # Build Linux and Windows on Ubuntu (no CGO needed)
+  build-linux-windows:
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      date: ${{ steps.version.outputs.date }}
+      hash: ${{ steps.version.outputs.hash }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Need full history for git commit info
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.23'
 
       - name: Install zip
         run: sudo apt-get install zip -y
@@ -36,27 +40,121 @@ jobs:
           echo "date=$DATE" >> $GITHUB_OUTPUT
           echo "hash=$HASH" >> $GITHUB_OUTPUT
 
-      - name: Run build script with version
+      - name: Clone NTrace-core
+        run: |
+          rm -rf lib/NTrace-core
+          git clone --depth 1 https://github.com/netwatcherio/NTrace-core.git lib/NTrace-core
+
+      - name: Build Linux and Windows
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          chmod +x ./build.sh
-          ./build.sh
+          LDFLAGS="-s -w -X 'main.VERSION=$VERSION' -X 'main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)' -X 'main.gitCommit=$(git rev-parse --short HEAD)'"
+          mkdir -p bin
+          
+          # Linux builds
+          for arch in amd64 arm64 arm; do
+            echo "Building linux/$arch..."
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-linux-$arch .
+            cd bin && zip netwatcher-${VERSION}-linux-$arch.zip netwatcher-linux-$arch && rm netwatcher-linux-$arch && cd ..
+          done
+          
+          # Windows builds
+          for arch in amd64 arm64; do
+            echo "Building windows/$arch..."
+            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-windows-$arch.exe .
+            cd bin && zip netwatcher-${VERSION}-windows-$arch.zip netwatcher-windows-$arch.exe && rm netwatcher-windows-$arch.exe && cd ..
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-windows-builds
+          path: bin/*.zip
+
+  # Build Darwin on macOS (CGO required for pcap)
+  build-darwin:
+    runs-on: macos-latest
+    needs: build-linux-windows
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Clone NTrace-core
+        run: |
+          rm -rf lib/NTrace-core
+          git clone --depth 1 https://github.com/netwatcherio/NTrace-core.git lib/NTrace-core
+
+      - name: Build Darwin
+        env:
+          VERSION: ${{ needs.build-linux-windows.outputs.version }}
+        run: |
+          LDFLAGS="-s -w -X 'main.VERSION=$VERSION' -X 'main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)' -X 'main.gitCommit=$(git rev-parse --short HEAD)'"
+          mkdir -p bin
+          
+          # Darwin builds with CGO (required for pcap)
+          for arch in amd64 arm64; do
+            echo "Building darwin/$arch..."
+            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-darwin-$arch .
+            codesign -s - -f bin/netwatcher-darwin-$arch
+            cd bin && zip netwatcher-${VERSION}-darwin-$arch.zip netwatcher-darwin-$arch && rm netwatcher-darwin-$arch && cd ..
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-builds
+          path: bin/*.zip
+
+  # Create release with all artifacts
+  release:
+    runs-on: ubuntu-latest
+    needs: [build-linux-windows, build-darwin]
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Linux/Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-windows-builds
+          path: bin
+
+      - name: Download Darwin artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-builds
+          path: bin
+
+      - name: Generate checksums
+        run: |
+          cd bin
+          sha256sum *.zip > netwatcher-${{ needs.build-linux-windows.outputs.version }}-checksums.txt
 
       - name: Create Release and Upload Files
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: bin/*.zip
-          tag: ${{ steps.version.outputs.version }}
+          tag: ${{ needs.build-linux-windows.outputs.version }}
           overwrite: true
           file_glob: true
-          release_name: "Release ${{ steps.version.outputs.version }}"
+          release_name: "Release ${{ needs.build-linux-windows.outputs.version }}"
           body: |
-            ## NetWatcher Release ${{ steps.version.outputs.version }}
+            ## NetWatcher Release ${{ needs.build-linux-windows.outputs.version }}
             
-            **Build Date:** ${{ steps.version.outputs.date }}
-            **Commit:** ${{ github.sha }} (${{ steps.version.outputs.hash }})
+            **Build Date:** ${{ needs.build-linux-windows.outputs.date }}
+            **Commit:** ${{ github.sha }} (${{ needs.build-linux-windows.outputs.hash }})
             **Branch:** master
             
             ### Installation
@@ -67,13 +165,12 @@ jobs:
             
             ### Checksums
             
-            See `netwatcher-${{ steps.version.outputs.version }}-checksums.txt` for file checksums.
+            See `netwatcher-${{ needs.build-linux-windows.outputs.version }}-checksums.txt` for file checksums.
 
-      # Also upload the checksums file
       - name: Upload checksums
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: bin/netwatcher-${{ steps.version.outputs.version }}-checksums.txt
-          tag: ${{ steps.version.outputs.version }}
+          file: bin/netwatcher-${{ needs.build-linux-windows.outputs.version }}-checksums.txt
+          tag: ${{ needs.build-linux-windows.outputs.version }}
           overwrite: true

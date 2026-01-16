@@ -6,3 +6,4 @@ config.conf
 *.o
 .DS_Store
 agent_auth.json
+lib/NTrace-core
