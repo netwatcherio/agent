@@ -142,9 +142,9 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	if platform.IsWindows() {
 		// Use exec.Command directly - no shell needed, handles paths with spaces correctly
 		cmd = exec.CommandContext(ctx, trippyPath,
-			"--udp",
+			"--icmp",
 			"--mode", "json",
-			"--multipath-strategy", "paris",
+			"--multipath-strategy", "classic",
 			"--dns-resolve-method", "system",
 			"--report-cycles", strconv.Itoa(triggeredCount),
 			/*"--dns-lookup-as-info",*/
@@ -152,9 +152,9 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	} else {
 		// For Linux and macOS, use exec.Command directly as well
 		cmd = exec.CommandContext(ctx, trippyPath,
-			"--udp",
+			"--icmp",
 			"--mode", "json",
-			"--multipath-strategy", "paris",
+			"--multipath-strategy", "classic",
 			"--dns-resolve-method", "system",
 			"--report-cycles", strconv.Itoa(triggeredCount),
 			/*"--dns-lookup-as-info",*/
