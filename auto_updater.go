@@ -480,7 +480,10 @@ func (u *AutoUpdater) copyFile(src, dst string) error {
 }
 
 // restart exits the program to trigger a restart by the service manager
+// Note: We use exit code 1 (not 0) because Windows SCM only triggers
+// recovery actions (like restart) on non-zero exit codes. Exit code 0
+// is treated as a clean stop with no recovery needed.
 func (u *AutoUpdater) restart() {
 	log.Info("Exiting for restart...")
-	os.Exit(0)
+	os.Exit(1)
 }
