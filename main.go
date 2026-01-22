@@ -111,7 +111,7 @@ func runAgent(ctx context.Context) error {
 
 	// ---------- Wire websocket handler ----------
 	probeGetCh := make(chan []probes.Probe)
-	probeDataCh := make(chan probes.ProbeData)
+	probeDataCh := make(chan probes.ProbeData, 2048)
 	speedtestQueueCh := make(chan []probes.SpeedtestQueueItem)
 
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})

@@ -2,10 +2,11 @@ package workers
 
 import (
 	"encoding/json"
+	"time"
+
 	"github.com/netwatcherio/netwatcher-agent/probes"
 	"github.com/netwatcherio/netwatcher-agent/web"
 	log "github.com/sirupsen/logrus"
-	"time"
 )
 
 func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
