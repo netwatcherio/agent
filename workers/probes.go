@@ -32,6 +32,10 @@ type ProbeWorkerS struct {
 var currentProbeList []probes.Probe
 var currentProbeListMu sync.RWMutex
 
+// controllerConfig stores the controller connection info for network probes
+var controllerConfig *probes.ControllerConfig
+var controllerConfigMu sync.RWMutex
+
 func getCurrentProbes() []probes.Probe {
 	currentProbeListMu.RLock()
 	defer currentProbeListMu.RUnlock()
@@ -42,6 +46,26 @@ func setCurrentProbes(probes []probes.Probe) {
 	currentProbeListMu.Lock()
 	defer currentProbeListMu.Unlock()
 	currentProbeList = probes
+}
+
+// SetControllerConfig stores the controller config for use by network probes
+func SetControllerConfig(host string, ssl bool, workspaceID, agentID uint, psk string) {
+	controllerConfigMu.Lock()
+	defer controllerConfigMu.Unlock()
+	controllerConfig = &probes.ControllerConfig{
+		Host:        host,
+		SSL:         ssl,
+		WorkspaceID: workspaceID,
+		AgentID:     agentID,
+		PSK:         psk,
+	}
+	log.Infof("Controller config set for network probes: %s (SSL: %v)", host, ssl)
+}
+
+func getControllerConfig() *probes.ControllerConfig {
+	controllerConfigMu.RLock()
+	defer controllerConfigMu.RUnlock()
+	return controllerConfig
 }
 
 func makeProbeKey(probe probes.Probe) string {
@@ -1004,7 +1028,9 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 	// Ensure we always sleep to prevent tight loops on any error path
 	defer time.Sleep(10 * time.Minute)
 
-	data, err := probes.NetworkInfo()
+	// Use controller config if available for public IP discovery
+	cfg := getControllerConfig()
+	data, err := probes.NetworkInfoWithController(context.Background(), cfg)
 	if err != nil {
 		log.Errorf("NetworkInfo error: %v", err)
 		return

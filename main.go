@@ -198,6 +198,7 @@ func runAgent(ctx context.Context) error {
 	}
 
 	// If your workers expect a uint agent ID now:
+	workers.SetControllerConfig(cfg.ControllerHost, cfg.SSL, cfg.WorkspaceID, cfg.AgentID, psk)
 	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
 	workers.ProbeDataWorker(wsClient, probeDataCh)
 
