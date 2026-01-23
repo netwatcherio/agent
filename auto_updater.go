@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/netwatcherio/netwatcher-agent/lib/platform"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -479,11 +480,30 @@ func (u *AutoUpdater) copyFile(src, dst string) error {
 	return err
 }
 
-// restart exits the program to trigger a restart by the service manager
-// Note: We use exit code 1 (not 0) because Windows SCM only triggers
-// recovery actions (like restart) on non-zero exit codes. Exit code 0
-// is treated as a clean stop with no recovery needed.
+// restart exits the program to trigger a restart by the service manager.
+// On Windows, this uses the proper Windows service restart mechanism.
+// On Unix, it exits with code 0 to let systemd/launchd restart the process.
 func (u *AutoUpdater) restart() {
+	log.Info("Initiating restart for update...")
+
+	// On Windows, try to use the proper service restart mechanism
+	if runtime.GOOS == "windows" {
+		if platform.RequestServiceRestart() {
+			// Successfully requested service restart
+			// The service handler will spawn a process to restart us
+			// and then gracefully shut down
+			log.Info("Service restart requested, waiting for graceful shutdown...")
+			// Give the service handler time to process the request
+			time.Sleep(5 * time.Second)
+			// If we get here, the service handler didn't exit us yet
+			// Fall through to os.Exit as backup
+			log.Warn("Service restart did not complete, falling back to exit")
+		}
+	}
+
+	// Unix systems (or Windows console mode): exit and let init system restart
+	// Exit with code 0 for clean exit - systemd Restart=always handles this
+	// Windows SCM recovery actions will also trigger on exit
 	log.Info("Exiting for restart...")
-	os.Exit(1)
+	os.Exit(0)
 }

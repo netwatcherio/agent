@@ -23,3 +23,11 @@ func RunService(name string, runner AgentRunner) error {
 	// Just run the agent directly with a background context.
 	return runner(context.Background())
 }
+
+// RequestServiceRestart on Unix returns false.
+// Unix systems (Linux with systemd, macOS with launchd) handle restarts
+// automatically when the process exits via their native restart mechanisms.
+func RequestServiceRestart() bool {
+	// On Unix, we just exit and let the init system restart us
+	return false
+}
