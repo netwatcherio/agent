@@ -3,7 +3,6 @@ package probes
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -251,18 +250,20 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 		}
 	}
 
-	// Discover local network info
+	// Discover local network info (non-fatal - some Windows configurations have issues)
 	defaultGateway, err := gateway.DiscoverGateway()
 	if err != nil {
-		return n, errors.New("could not discover local gateway address")
+		log.Warnf("Could not discover default gateway: %v", err)
+	} else {
+		n.DefaultGateway = defaultGateway.String()
 	}
-	n.DefaultGateway = defaultGateway.String()
 
 	localInterface, err := gateway.DiscoverInterface()
 	if err != nil {
-		return n, errors.New("could not discover local interface address")
+		log.Warnf("Could not discover local interface: %v", err)
+	} else {
+		n.LocalAddress = localInterface.String()
 	}
-	n.LocalAddress = localInterface.String()
 
 	return n, nil
 }
@@ -271,7 +272,7 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 func fetchFromSpeedtest(n *NetworkInfoResult) error {
 	user, err := speedtest.FetchUserInfo()
 	if err != nil {
-		return errors.New("unable to fetch general public network information")
+		return fmt.Errorf("unable to fetch general public network information: %w", err)
 	}
 
 	applySpeedtestResponse(n, user)
