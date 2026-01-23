@@ -44,6 +44,9 @@ const (
 	AuthFileName          = "agent_auth.json"
 )
 
+// ErrAgentDeleted indicates the agent was deleted from the panel and should deactivate
+var ErrAgentDeleted = errors.New("agent has been deleted from workspace")
+
 type Agent struct {
 	ID        uint      `gorm:"primaryKey;autoIncrement" json:"id"`
 	CreatedAt time.Time `gorm:"index" json:"created_at"`
@@ -207,6 +210,11 @@ func DoLogin(ctx context.Context, cfg Config) (*LoginResponse, error) {
 		return nil, fmt.Errorf("login decode: %w\n%s", err, raw)
 	}
 
+	// Check for 410 Gone - agent was deleted from panel
+	if resp.StatusCode == http.StatusGone {
+		return &out, ErrAgentDeleted
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		if out.Error == "" {
 			out.Error = fmt.Sprintf("http_%d", resp.StatusCode)
@@ -215,6 +223,26 @@ func DoLogin(ctx context.Context, cfg Config) (*LoginResponse, error) {
 	}
 
 	return &out, nil
+}
+
+// DeleteAuthFile removes the agent authentication file, preventing future reconnection attempts.
+// This should be called when the agent is deactivated/deleted from the panel.
+func DeleteAuthFile() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(exe)
+	authPath := filepath.Join(dir, AuthFileName)
+
+	if err := os.Remove(authPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil // Already deleted, not an error
+		}
+		return fmt.Errorf("failed to delete auth file: %w", err)
+	}
+	log.Infof("Deleted auth file: %s", authPath)
+	return nil
 }
 
 func SaveRawAuthJSON(raw []byte) error {
@@ -236,6 +264,7 @@ type WSClient struct {
 	PSK              string
 	ProbeGetCh       chan []probes.Probe
 	SpeedtestQueueCh chan []probes.SpeedtestQueueItem
+	DeactivateCh     chan string // Receives reason when agent should deactivate
 	WsConn           *neffos.NSConn
 	AgentVersion     string
 	// Failure tracking for auto-reconnect
@@ -367,6 +396,32 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			},
 			"speedtest_result_ok": func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Debugf("WS: speedtest_result acknowledged")
+				return nil
+			},
+			// Deactivate handler - received when agent is deleted from panel
+			"deactivate": func(ns *neffos.NSConn, msg neffos.Message) error {
+				var deactivateMsg struct {
+					Reason string `json:"reason"`
+				}
+				_ = json.Unmarshal(msg.Body, &deactivateMsg)
+
+				reason := deactivateMsg.Reason
+				if reason == "" {
+					reason = "deleted"
+				}
+
+				log.Warnf("WS: Received deactivation signal from controller (reason: %s)", reason)
+				log.Warnf("WS: Agent has been removed from workspace - shutting down")
+
+				// Signal deactivation to main loop if channel is set
+				if c.DeactivateCh != nil {
+					select {
+					case c.DeactivateCh <- reason:
+					default:
+						// Channel full or not listening, proceed anyway
+					}
+				}
+
 				return nil
 			},
 		},

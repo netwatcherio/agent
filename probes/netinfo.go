@@ -51,6 +51,10 @@ type NetworkInfoResult struct {
 	// Public network info (from controller or fallback)
 	PublicAddress string `json:"public_address" bson:"public_address"`
 
+	// P1.1: Rich interface and route data
+	Interfaces []InterfaceInfo `json:"interfaces,omitempty" bson:"interfaces,omitempty"`
+	Routes     []RouteEntry    `json:"routes,omitempty" bson:"routes,omitempty"`
+
 	// Geographic and network info (normalized from any source)
 	Geo *GeoInfo `json:"geo,omitempty" bson:"geo,omitempty"`
 
@@ -213,6 +217,14 @@ func parseFloat(s string) (float64, error) {
 	return f, err
 }
 
+// extractIP extracts the IP address from a CIDR string (e.g., "10.0.0.2/24" -> "10.0.0.2").
+func extractIP(cidr string) string {
+	if idx := strings.Index(cidr, "/"); idx != -1 {
+		return cidr[:idx]
+	}
+	return cidr
+}
+
 // NetworkInfoWithController fetches network info, preferring the controller for public IP.
 // Falls back to speedtest.FetchUserInfo() if controller is unavailable.
 func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (NetworkInfoResult, error) {
@@ -250,19 +262,56 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 		}
 	}
 
-	// Discover local network info (non-fatal - some Windows configurations have issues)
-	defaultGateway, err := gateway.DiscoverGateway()
+	// P1.1: Discover interfaces and routes
+	interfaces, err := DiscoverInterfaces()
 	if err != nil {
-		log.Warnf("Could not discover default gateway: %v", err)
+		log.Warnf("Could not discover interfaces: %v", err)
 	} else {
-		n.DefaultGateway = defaultGateway.String()
+		n.Interfaces = interfaces
 	}
 
-	localInterface, err := gateway.DiscoverInterface()
+	routes, err := DiscoverRoutes()
 	if err != nil {
-		log.Warnf("Could not discover local interface: %v", err)
+		log.Warnf("Could not discover routes: %v", err)
 	} else {
-		n.LocalAddress = localInterface.String()
+		n.Routes = routes
+		// Enrich interfaces with gateway info from routes
+		EnrichInterfacesWithRoutes(n.Interfaces, routes)
+	}
+
+	// Populate legacy fields from discovered data
+	if len(n.Routes) > 0 {
+		n.DefaultGateway = FindDefaultGateway(n.Routes)
+	}
+
+	if defaultIface := FindDefaultInterface(n.Interfaces); defaultIface != nil {
+		if len(defaultIface.IPv4) > 0 {
+			// Extract IP without CIDR prefix
+			n.LocalAddress = extractIP(defaultIface.IPv4[0])
+		}
+		// Use interface gateway if route-based gateway not found
+		if n.DefaultGateway == "" && defaultIface.Gateway != "" {
+			n.DefaultGateway = defaultIface.Gateway
+		}
+	}
+
+	// Fallback: try jackpal/gateway if we still don't have gateway info
+	if n.DefaultGateway == "" {
+		if gw, err := gateway.DiscoverGateway(); err == nil {
+			n.DefaultGateway = gw.String()
+		} else {
+			// Windows PowerShell fallback
+			if gw, wErr := DiscoverDefaultGatewayWindows(); wErr == nil {
+				n.DefaultGateway = gw.String()
+			}
+		}
+	}
+
+	// Fallback: try jackpal/gateway for local interface if not found
+	if n.LocalAddress == "" {
+		if iface, err := gateway.DiscoverInterface(); err == nil {
+			n.LocalAddress = iface.String()
+		}
 	}
 
 	return n, nil

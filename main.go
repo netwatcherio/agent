@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"path/filepath"
@@ -136,6 +137,13 @@ func runAgent(ctx context.Context) error {
 		loginResp, err := web.DoLogin(webCtx, cfg)
 		cancel()
 		if err != nil {
+			// Check if agent was deleted - clean up and exit gracefully
+			if errors.Is(err, web.ErrAgentDeleted) {
+				log.Warn("Agent has been deleted from workspace - cannot authenticate")
+				log.Info("Cleaning up and exiting...")
+				_ = web.DeleteAuthFile()
+				return nil // Exit gracefully, not an error
+			}
 			return fmt.Errorf("login error: %v (server said: %s)", err, web.SafeErr(loginResp))
 		}
 
@@ -177,6 +185,7 @@ func runAgent(ctx context.Context) error {
 	}
 
 	// 2) WS client with gobwas + headers
+	deactivateCh := make(chan string, 1) // Channel for deactivation signals
 	wsClient := &web.WSClient{
 		URL:              cfg.WSURL,       // e.g. ws://host:8080/ws
 		WorkspaceID:      cfg.WorkspaceID, // header: X-Workspace-ID
@@ -184,6 +193,7 @@ func runAgent(ctx context.Context) error {
 		PSK:              psk,             // header: X-Agent-PSK
 		ProbeGetCh:       probeGetCh,
 		SpeedtestQueueCh: speedtestQueueCh,
+		DeactivateCh:     deactivateCh, // For receiving deactivation signals
 		AgentVersion:     VERSION,
 	}
 
@@ -246,9 +256,18 @@ func runAgent(ctx context.Context) error {
 		}
 	}(wsClient, speedtestQueueCh, ctx)
 
-	// Wait for context cancellation (shutdown signal)
-	<-ctx.Done()
-	log.Info("shutting down")
+	// Wait for context cancellation (shutdown signal) or deactivation
+	select {
+	case <-ctx.Done():
+		log.Info("shutting down")
+	case reason := <-deactivateCh:
+		log.Warnf("Agent deactivated (reason: %s) - cleaning up and exiting", reason)
+		// Delete auth file to prevent future reconnection attempts
+		if err := web.DeleteAuthFile(); err != nil {
+			log.Warnf("Failed to delete auth file: %v", err)
+		}
+		log.Info("Agent will not attempt to reconnect. To reinstall, obtain a new PIN from the panel.")
+	}
 
 	// Give goroutines a moment to clean up
 	time.Sleep(500 * time.Millisecond)
