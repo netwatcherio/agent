@@ -6,13 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackpal/gateway"
 	"github.com/showwin/speedtest-go/speedtest"
 	log "github.com/sirupsen/logrus"
 )
+
+// lookupReverseDNS performs a PTR record lookup for the given IP.
+// Returns empty string if lookup fails or no PTR record exists.
+func lookupReverseDNS(ip string) string {
+	names, err := net.LookupAddr(ip)
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	// Return first PTR record, strip trailing dot
+	return strings.TrimSuffix(names[0], ".")
+}
 
 // GeoInfo contains geographic and network information.
 // This structure is used consistently regardless of the data source (controller or fallback).
@@ -224,6 +237,17 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 		// No controller config, use speedtest directly
 		if err := fetchFromSpeedtest(&n); err != nil {
 			return n, err
+		}
+	}
+
+	// If we have a public IP but no reverse DNS, try to look it up locally
+	if n.PublicAddress != "" && (n.Geo == nil || n.Geo.ReverseDNS == "") {
+		if rdns := lookupReverseDNS(n.PublicAddress); rdns != "" {
+			if n.Geo == nil {
+				n.Geo = &GeoInfo{}
+			}
+			n.Geo.ReverseDNS = rdns
+			log.Debugf("Reverse DNS for %s: %s", n.PublicAddress, rdns)
 		}
 	}
 
