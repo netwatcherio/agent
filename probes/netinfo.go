@@ -267,6 +267,7 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 	if err != nil {
 		log.Warnf("Could not discover interfaces: %v", err)
 	} else {
+		log.Infof("Discovered %d network interfaces", len(interfaces))
 		n.Interfaces = interfaces
 	}
 
@@ -274,6 +275,7 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 	if err != nil {
 		log.Warnf("Could not discover routes: %v", err)
 	} else {
+		log.Infof("Discovered %d routes", len(routes))
 		n.Routes = routes
 		// Enrich interfaces with gateway info from routes
 		EnrichInterfacesWithRoutes(n.Interfaces, routes)
