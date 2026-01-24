@@ -136,6 +136,17 @@ jobs:
           name: darwin-builds
           path: bin
 
+      - name: Verify artifacts exist
+        run: |
+          echo "Listing downloaded artifacts:"
+          ls -la bin/
+          ZIP_COUNT=$(ls bin/*.zip 2>/dev/null | wc -l)
+          echo "Found $ZIP_COUNT zip files"
+          if [ "$ZIP_COUNT" -lt 7 ]; then
+            echo "ERROR: Expected 7 zip files (3 linux + 2 windows + 2 darwin), but found $ZIP_COUNT"
+            exit 1
+          fi
+
       - name: Generate checksums
         run: |
           cd bin
