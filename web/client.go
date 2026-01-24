@@ -502,13 +502,17 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		c.heartbeatCancel = nil
 	}
 
-	// Close any existing client connection
-	if c.currentClient != nil {
-		log.Info("WS: closing existing connection before reconnecting")
-		c.currentClient.Close()
-		c.currentClient = nil
-	}
+	// Get reference to client to close (we'll close outside the lock to avoid deadlock)
+	clientToClose := c.currentClient
+	c.currentClient = nil
 	c.mu.Unlock()
+
+	// Close outside the lock - Close() may trigger OnNamespaceDisconnect synchronously
+	// which also tries to acquire the mutex, causing deadlock if we hold it
+	if clientToClose != nil {
+		log.Info("WS: closing existing connection before reconnecting")
+		clientToClose.Close()
+	}
 
 	// Ensure we reset isConnecting when we return
 	defer func() {
@@ -523,9 +527,12 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 	for {
 		select {
 		case <-parent.Done():
+			log.Info("WS: ConnectWithRetry exiting - parent context cancelled")
 			return
 		default:
 		}
+
+		log.Debugf("WS: attempting dial to %s", c.URL)
 
 		// Dial
 		ctx, cancel := context.WithTimeout(parent, dialAndConnectTimeout)
@@ -539,6 +546,8 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 			}
 			continue
 		}
+
+		log.Debug("WS: dial successful, joining namespace")
 
 		// Join namespace
 		ctx2, cancel2 := context.WithTimeout(parent, dialAndConnectTimeout)

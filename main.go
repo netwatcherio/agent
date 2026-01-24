@@ -210,8 +210,16 @@ func runAgent(ctx context.Context) error {
 
 	// Set reconnect callback after wsClient is created (avoids closure reference issue)
 	wsClient.OnReconnect = func() {
-		log.Info("OnReconnect: flushing retry queue")
-		workers.FlushRetryQueue(wsClient)
+		queueSize := workers.GetRetryQueue().Size()
+		log.Infof("OnReconnect: retry queue has %d items", queueSize)
+
+		// Brief delay to ensure connection is stable before flushing
+		time.Sleep(500 * time.Millisecond)
+
+		if queueSize > 0 {
+			sent := workers.FlushRetryQueue(wsClient)
+			log.Infof("OnReconnect: flushed %d/%d queued items", sent, queueSize)
+		}
 		updateActivity()
 	}
 
