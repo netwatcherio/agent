@@ -235,8 +235,20 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 	if cfg != nil && cfg.Host != "" && cfg.PSK != "" {
 		whoami, err := FetchPublicIPFromController(ctx, *cfg)
 		if err == nil && whoami.IP != "" {
+			// Log what we received from controller
+			hasGeoIP := whoami.GeoIP != nil
+			var hasCity, hasCountry, hasASN bool
+			if hasGeoIP {
+				hasCity = whoami.GeoIP.City != nil
+				hasCountry = whoami.GeoIP.Country != nil
+				hasASN = whoami.GeoIP.ASN != nil
+			}
+			log.Infof("Controller whoami response: ip=%s hasGeoIP=%v hasCity=%v hasCountry=%v hasASN=%v reverseDNS=%s",
+				whoami.IP, hasGeoIP, hasCity, hasCountry, hasASN, whoami.ReverseDNS)
+
 			applyControllerResponse(&n, whoami)
-			log.Debugf("Public IP from controller: %s", n.PublicAddress)
+			log.Infof("Public IP from controller: %s (geo.country=%s geo.city=%s geo.isp=%s)",
+				n.PublicAddress, n.Geo.Country, n.Geo.City, n.Geo.ISP)
 		} else {
 			log.Warnf("Controller whoami failed, falling back to external service: %v", err)
 			// Fallback to speedtest
