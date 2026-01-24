@@ -3,8 +3,11 @@ package main
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -127,8 +130,15 @@ func (u *AutoUpdater) checkForUpdate() {
 		return
 	}
 
+	// Try to fetch checksum for verification (optional - proceed with warning if not available)
+	expectedChecksum, err := u.fetchChecksumFromRelease(latestRelease, asset.Name)
+	if err != nil {
+		log.WithError(err).Warn("Could not fetch checksum, proceeding without verification")
+		expectedChecksum = "" // Empty means skip verification
+	}
+
 	log.WithField("asset", asset.Name).Info("Downloading update")
-	if err := u.downloadAndApplyUpdate(asset.BrowserDownloadURL, asset.Name); err != nil {
+	if err := u.downloadAndApplyUpdate(asset.BrowserDownloadURL, asset.Name, expectedChecksum); err != nil {
 		log.WithError(err).Error("Failed to apply update")
 		return
 	}
@@ -182,6 +192,87 @@ func (u *AutoUpdater) isNewerVersion(newVersion, currentVersion string) bool {
 	newVersion = strings.TrimPrefix(newVersion, "v")
 	currentVersion = strings.TrimPrefix(currentVersion, "v")
 	return newVersion != currentVersion
+}
+
+// verifyChecksum verifies the SHA256 checksum of a file
+func (u *AutoUpdater) verifyChecksum(filePath, expectedHash string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file for checksum: %w", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("failed to hash file: %w", err)
+	}
+
+	actualHash := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(actualHash, expectedHash) {
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, actualHash)
+	}
+
+	log.WithField("hash", actualHash[:16]+"...").Debug("Checksum verified")
+	return nil
+}
+
+// fetchChecksumFromRelease fetches the checksum for a specific asset from the release's checksum file
+// Expects a file named *checksums.txt in release assets with format: "<hash>  <filename>" per line
+func (u *AutoUpdater) fetchChecksumFromRelease(release *GitHubRelease, assetName string) (string, error) {
+	// Find checksums file in release assets
+	var checksumURL string
+	for _, asset := range release.Assets {
+		if strings.Contains(strings.ToLower(asset.Name), "checksum") && strings.HasSuffix(asset.Name, ".txt") {
+			checksumURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+
+	if checksumURL == "" {
+		return "", fmt.Errorf("no checksums file found in release assets")
+	}
+
+	log.WithField("url", checksumURL).Debug("Fetching checksums file")
+
+	resp, err := u.client.Get(checksumURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch checksums: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("checksums fetch failed with status %d", resp.StatusCode)
+	}
+
+	// Parse checksums file: "hash  filename" or "hash filename" per line
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Split by whitespace (supports both "hash  file" and "hash file")
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			hash := parts[0]
+			filename := parts[len(parts)-1] // Take last part as filename
+
+			if strings.EqualFold(filename, assetName) {
+				log.WithFields(log.Fields{
+					"asset": assetName,
+					"hash":  hash[:16] + "...",
+				}).Debug("Found checksum for asset")
+				return hash, nil
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("error reading checksums: %w", err)
+	}
+
+	return "", fmt.Errorf("checksum for %s not found in checksums file", assetName)
 }
 
 // findAssetForPlatform finds the appropriate release asset for current platform
@@ -254,7 +345,8 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 }
 
 // downloadAndApplyUpdate downloads and applies the update
-func (u *AutoUpdater) downloadAndApplyUpdate(downloadURL, filename string) error {
+// If expectedChecksum is non-empty, verifies the download before applying
+func (u *AutoUpdater) downloadAndApplyUpdate(downloadURL, filename, expectedChecksum string) error {
 	resp, err := u.client.Get(downloadURL)
 	if err != nil {
 		return fmt.Errorf("failed to download update: %w", err)
@@ -286,7 +378,16 @@ func (u *AutoUpdater) downloadAndApplyUpdate(downloadURL, filename string) error
 		return fmt.Errorf("failed to save update: %w", err)
 	}
 
+	// Verify checksum if provided
+	if expectedChecksum != "" {
+		if err := u.verifyChecksum(tempFile.Name(), expectedChecksum); err != nil {
+			return fmt.Errorf("checksum verification failed: %w", err)
+		}
+		log.Info("Update checksum verified successfully")
+	}
+
 	return u.extractAndReplace(tempFile.Name(), filename)
+
 }
 
 // extractAndReplace extracts the binary and replaces the current executable

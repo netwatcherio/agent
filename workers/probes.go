@@ -98,11 +98,11 @@ func makeProbeKey(probe probes.Probe) string {
 
 		configBytes, err := json.Marshal(normalizedConfig)
 		if err != nil {
-			return fmt.Sprintf("%s_%s_error", probe.ID, probe.Type)
+			return fmt.Sprintf("%d_%s_error", probe.ID, probe.Type)
 		}
 
 		hash := sha256.Sum256(configBytes)
-		return fmt.Sprintf("%s_%s_%x", probe.ID, probe.Type, hash[:8])
+		return fmt.Sprintf("%d_%s_%x", probe.ID, probe.Type, hash[:8])
 	}
 
 	// For all other probes (including TrafficSim clients), use the original logic
@@ -132,11 +132,11 @@ func makeProbeKey(probe probes.Probe) string {
 
 	configBytes, err := json.Marshal(normalizedConfig)
 	if err != nil {
-		return fmt.Sprintf("%s_%s_error", probe.ID, probe.Type)
+		return fmt.Sprintf("%d_%s_error", probe.ID, probe.Type)
 	}
 
 	hash := sha256.Sum256(configBytes)
-	return fmt.Sprintf("%s_%s_%x", probe.ID, probe.Type, hash[:8])
+	return fmt.Sprintf("%d_%s_%x", probe.ID, probe.Type, hash[:8])
 }
 
 // Alternative approach: specialized comparison for TrafficSim probes
@@ -606,7 +606,7 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 		// Get the worker
 		workerInterface, exists := checkWorkers.Load(probeKey)
 		if !exists {
-			log.Warnf("Probe %s (type: %s) not found when starting worker", probe.ID, probe.Type)
+			log.Warnf("Probe %d (type: %s) not found when starting worker", probe.ID, probe.Type)
 			return
 		}
 
@@ -622,22 +622,22 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 		for {
 			select {
 			case <-worker.Ctx.Done():
-				log.Infof("Worker for probe %s (type: %s) stopped by context", probe.ID, probe.Type)
+				log.Infof("Worker for probe %d (type: %s) stopped by context", probe.ID, probe.Type)
 				return
 			case <-worker.StopChan:
-				log.Infof("Worker for probe %s (type: %s) stopped by StopChan", probe.ID, probe.Type)
+				log.Infof("Worker for probe %d (type: %s) stopped by StopChan", probe.ID, probe.Type)
 				return
 			default:
 				// Get current probe data
 				workerInterface, exists := checkWorkers.Load(probeKey)
 				if !exists {
-					log.Warnf("Probe %s (type: %s) no longer exists", probe.ID, probe.Type)
+					log.Warnf("Probe %d (type: %s) no longer exists", probe.ID, probe.Type)
 					return
 				}
 
 				currentWorker := workerInterface.(ProbeWorkerS)
 				if currentWorker.ToRemove {
-					log.Infof("Probe %s (type: %s) marked for removal", probe.ID, probe.Type)
+					log.Infof("Probe %d (type: %s) marked for removal", probe.ID, probe.Type)
 					return
 				}
 
@@ -669,7 +669,7 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 
 				case "AGENT":
 					// Agent probe type - skip for now as it's likely metadata
-					log.Debugf("Skipping AGENT probe type for probe %s", probe.ID)
+					log.Debugf("Skipping AGENT probe type for probe %d", probe.ID)
 					time.Sleep(30 * time.Second)
 
 				default:

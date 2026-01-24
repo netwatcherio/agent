@@ -13,8 +13,8 @@ import (
 )
 
 type MtrPayload struct {
-	StartTimestamp time.Time `json:"start_timestamp"bson:"start_timestamp"`
-	StopTimestamp  time.Time `json:"stop_timestamp"bson:"stop_timestamp"`
+	StartTimestamp time.Time `json:"start_timestamp" bson:"start_timestamp"`
+	StopTimestamp  time.Time `json:"stop_timestamp" bson:"stop_timestamp"`
 	Report         struct {
 		Info struct {
 			Target struct {
@@ -38,7 +38,7 @@ type MtrPayload struct {
 			Worst      string   `json:"worst"`
 			StdDev     string   `json:"stddev"`
 		} `json:"hops"`
-	} `json:"report"bson:"report"`
+	} `json:"report" bson:"report"`
 }
 
 // Mtr runs MTR-style traceroute using NTrace-core

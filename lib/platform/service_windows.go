@@ -206,11 +206,11 @@ func spawnRestartProcess() error {
 	}
 
 	// Batch script content:
-	// - Wait 3 seconds (using ping as a delay mechanism)
+	// - Wait 5 seconds (using ping as a delay mechanism)
 	// - Start the service
 	// - Delete the script file
 	scriptContent := `@echo off
-ping -n 4 127.0.0.1 > nul
+ping -n 6 127.0.0.1 > nul
 net start NetWatcherAgent
 del "%~f0"
 `

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	"github.com/netwatcherio/netwatcher-agent/lib/platform"
 	"github.com/netwatcherio/netwatcher-agent/probes"
@@ -186,6 +187,16 @@ func runAgent(ctx context.Context) error {
 
 	// 2) WS client with gobwas + headers
 	deactivateCh := make(chan string, 1) // Channel for deactivation signals
+
+	// Watchdog: track last successful activity
+	var lastSuccessfulActivity = time.Now()
+	var activityMu sync.Mutex
+	updateActivity := func() {
+		activityMu.Lock()
+		lastSuccessfulActivity = time.Now()
+		activityMu.Unlock()
+	}
+
 	wsClient := &web.WSClient{
 		URL:              cfg.WSURL,       // e.g. ws://host:8080/ws
 		WorkspaceID:      cfg.WorkspaceID, // header: X-Workspace-ID
@@ -197,12 +208,43 @@ func runAgent(ctx context.Context) error {
 		AgentVersion:     VERSION,
 	}
 
+	// Set reconnect callback after wsClient is created (avoids closure reference issue)
+	wsClient.OnReconnect = func() {
+		log.Info("OnReconnect: flushing retry queue")
+		workers.FlushRetryQueue(wsClient)
+		updateActivity()
+	}
+
 	// If your workers expect a uint agent ID now:
 	workers.SetControllerConfig(cfg.ControllerHost, cfg.SSL, cfg.WorkspaceID, cfg.AgentID, psk)
 	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
 	workers.ProbeDataWorker(wsClient, probeDataCh)
 
 	go wsClient.ConnectWithRetry(ctx)
+
+	// Watchdog: restart if no activity for 10 minutes
+	const watchdogTimeout = 10 * time.Minute
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				activityMu.Lock()
+				elapsed := time.Since(lastSuccessfulActivity)
+				activityMu.Unlock()
+
+				log.Debugf("Watchdog: last activity %v ago", elapsed.Round(time.Second))
+
+				if elapsed > watchdogTimeout {
+					log.Errorf("Watchdog: no successful activity for %v, forcing restart", elapsed.Round(time.Second))
+					os.Exit(1) // systemd/SCM will restart us
+				}
+			}
+		}
+	}()
 
 	go func(ws *web.WSClient, ctx context.Context) {
 		for {

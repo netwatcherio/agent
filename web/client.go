@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kataras/iris/v12/websocket"
@@ -42,6 +43,7 @@ const (
 	namespace             = "agent"
 	dialAndConnectTimeout = 5 * time.Second
 	AuthFileName          = "agent_auth.json"
+	heartbeatInterval     = 30 * time.Second // WebSocket keepalive interval
 )
 
 // ErrAgentDeleted indicates the agent was deleted from the panel and should deactivate
@@ -267,10 +269,19 @@ type WSClient struct {
 	DeactivateCh     chan string // Receives reason when agent should deactivate
 	WsConn           *neffos.NSConn
 	AgentVersion     string
+
+	// Callback called on successful (re)connection - use for retry queue flushing
+	OnReconnect func()
+
+	// Connection state management (protected by mu)
+	mu              sync.Mutex
+	currentClient   *neffos.Client     // Current active client for cleanup
+	isConnecting    bool               // Prevents overlapping reconnection attempts
+	heartbeatCancel context.CancelFunc // Cancels the heartbeat goroutine
+
 	// Failure tracking for auto-reconnect
 	probeGetFailures    int
 	maxProbeGetFailures int // Max consecutive failures before reconnect (default 5)
-	reconnectInProgress bool
 }
 
 func (c *WSClient) namespaces() neffos.Namespaces {
@@ -309,13 +320,30 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Infof("WS: sent %d speedtest servers to controller", len(servers))
 				}()
 
+				// Trigger reconnect callback (e.g., for flushing retry queue)
+				if c.OnReconnect != nil {
+					go c.OnReconnect()
+				}
+
 				return nil
 			},
+
 			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Infof("WS: disconnected from namespace [%s]", msg.Namespace)
-				c.ConnectWithRetry(context.Background())
+
+				// Cancel heartbeat if running
+				c.mu.Lock()
+				if c.heartbeatCancel != nil {
+					c.heartbeatCancel()
+					c.heartbeatCancel = nil
+				}
+				c.mu.Unlock()
+
+				// Trigger reconnection asynchronously (will respect isConnecting lock)
+				go c.ConnectWithRetry(context.Background())
 				return nil
 			},
+
 			"probe_get": func(ns *neffos.NSConn, msg neffos.Message) error {
 				var p []probes.Probe
 
@@ -330,15 +358,19 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Debugf("WS: probe_get received empty body (%d/%d failures)", c.probeGetFailures, c.maxProbeGetFailures)
 
 					// Trigger reconnect if too many consecutive failures
-					if c.probeGetFailures >= c.maxProbeGetFailures && !c.reconnectInProgress {
-						log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
-						c.probeGetFailures = 0
-						c.reconnectInProgress = true
-						go func() {
-							time.Sleep(2 * time.Second) // Brief pause before reconnecting
-							c.reconnectInProgress = false
-							c.ConnectWithRetry(context.Background())
-						}()
+					if c.probeGetFailures >= c.maxProbeGetFailures {
+						c.mu.Lock()
+						shouldReconnect := !c.isConnecting
+						c.mu.Unlock()
+
+						if shouldReconnect {
+							log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
+							c.probeGetFailures = 0
+							go func() {
+								time.Sleep(2 * time.Second) // Brief pause before reconnecting
+								c.ConnectWithRetry(context.Background())
+							}()
+						}
 					}
 					return nil
 				}
@@ -348,15 +380,19 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Debugf("WS: probe_get unmarshal error (%d/%d failures): %v", c.probeGetFailures, c.maxProbeGetFailures, err)
 
 					// Trigger reconnect if too many consecutive failures
-					if c.probeGetFailures >= c.maxProbeGetFailures && !c.reconnectInProgress {
-						log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
-						c.probeGetFailures = 0
-						c.reconnectInProgress = true
-						go func() {
-							time.Sleep(2 * time.Second)
-							c.reconnectInProgress = false
-							c.ConnectWithRetry(context.Background())
-						}()
+					if c.probeGetFailures >= c.maxProbeGetFailures {
+						c.mu.Lock()
+						shouldReconnect := !c.isConnecting
+						c.mu.Unlock()
+
+						if shouldReconnect {
+							log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
+							c.probeGetFailures = 0
+							go func() {
+								time.Sleep(2 * time.Second)
+								c.ConnectWithRetry(context.Background())
+							}()
+						}
 					}
 					return nil
 				}
@@ -398,6 +434,12 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 				log.Debugf("WS: speedtest_result acknowledged")
 				return nil
 			},
+			// Pong handler - received from controller in response to heartbeat ping
+			"pong": func(ns *neffos.NSConn, msg neffos.Message) error {
+				log.Debug("WS: heartbeat pong received")
+				return nil
+			},
+
 			// Deactivate handler - received when agent is deleted from panel
 			"deactivate": func(ns *neffos.NSConn, msg neffos.Message) error {
 				var deactivateMsg struct {
@@ -445,6 +487,36 @@ func (c *WSClient) dialOnce(ctx context.Context) (*neffos.Client, error) {
 }
 
 func (c *WSClient) ConnectWithRetry(parent context.Context) {
+	// Check if already connecting (prevent overlapping reconnection attempts)
+	c.mu.Lock()
+	if c.isConnecting {
+		c.mu.Unlock()
+		log.Debug("WS: reconnection already in progress, skipping")
+		return
+	}
+	c.isConnecting = true
+
+	// Cancel any existing heartbeat
+	if c.heartbeatCancel != nil {
+		c.heartbeatCancel()
+		c.heartbeatCancel = nil
+	}
+
+	// Close any existing client connection
+	if c.currentClient != nil {
+		log.Info("WS: closing existing connection before reconnecting")
+		c.currentClient.Close()
+		c.currentClient = nil
+	}
+	c.mu.Unlock()
+
+	// Ensure we reset isConnecting when we return
+	defer func() {
+		c.mu.Lock()
+		c.isConnecting = false
+		c.mu.Unlock()
+	}()
+
 	delay := 1 * time.Second
 	maxDelay := 2 * time.Minute
 
@@ -482,18 +554,52 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 			continue
 		}
 
-		// Connected: hold until parent cancels
+		// Successfully connected - update state
+		c.mu.Lock()
 		c.WsConn = ns
+		c.currentClient = client
+		c.isConnecting = false  // Mark as connected, not connecting
 		delay = 1 * time.Second // reset backoff
 
-		<-parent.Done()
+		// Start heartbeat goroutine
+		heartbeatCtx, heartbeatCancelFunc := context.WithCancel(context.Background())
+		c.heartbeatCancel = heartbeatCancelFunc
+		c.mu.Unlock()
 
-		client.Close()
-		err = ns.Disconnect(ctx)
-		if err != nil {
-			return
-		}
+		go c.startHeartbeat(heartbeatCtx, ns)
+
+		log.Info("WS: successfully connected and heartbeat started")
+
+		// Return after successful connection - the connection will be maintained
+		// by the neffos library. If disconnected, OnNamespaceDisconnect will trigger reconnection.
 		return
+	}
+}
+
+// startHeartbeat sends periodic ping messages to keep the WebSocket connection alive
+// and verify the connection is still functional.
+func (c *WSClient) startHeartbeat(ctx context.Context, ns *neffos.NSConn) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Debug("WS: heartbeat stopped")
+			return
+		case <-ticker.C:
+			if ns == nil {
+				log.Debug("WS: heartbeat skipped - no connection")
+				continue
+			}
+			if ok := ns.Emit("ping", []byte(`{"ts":"`+time.Now().Format(time.RFC3339)+`"}`)); !ok {
+				log.Warn("WS: heartbeat ping failed, connection may be stale")
+				// Don't trigger reconnection here - let the connection timeout naturally
+				// The OnNamespaceDisconnect handler will handle reconnection
+			} else {
+				log.Debug("WS: heartbeat ping sent")
+			}
+		}
 	}
 }
 
