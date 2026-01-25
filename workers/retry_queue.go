@@ -71,9 +71,11 @@ func (q *RetryQueue) Flush(emitter Emitter) int {
 		return 0
 	}
 
-	// Take a copy of the queue for processing
+	// Take a copy of the queue for processing and clear the original
+	// This ensures new items added during flush are tracked separately
 	toSend := make([]probes.ProbeData, len(q.queue))
 	copy(toSend, q.queue)
+	q.queue = q.queue[:0] // Clear the queue - new items will be appended fresh
 	q.mu.Unlock()
 
 	log.Infof("RetryQueue: flushing %d queued items", len(toSend))
@@ -96,12 +98,13 @@ func (q *RetryQueue) Flush(emitter Emitter) int {
 		}
 	}
 
-	// Update queue with any items that still failed
-	q.mu.Lock()
-	// Prepend failed items (oldest first) to any new items added during flush
-	newItems := q.queue[len(toSend):]
-	q.queue = append(failed, newItems...)
-	q.mu.Unlock()
+	// Re-queue failed items plus any new items that arrived during flush
+	if len(failed) > 0 {
+		q.mu.Lock()
+		// Prepend failed items (oldest first) to any new items added during flush
+		q.queue = append(failed, q.queue...)
+		q.mu.Unlock()
+	}
 
 	if sent > 0 {
 		log.Infof("RetryQueue: successfully sent %d items, %d remaining", sent, len(failed))
