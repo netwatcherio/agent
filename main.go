@@ -262,8 +262,10 @@ func runAgent(ctx context.Context) error {
 			default:
 				time.Sleep(time.Minute * 1)
 				log.Debug("Getting probes again...")
-				if ws.WsConn != nil {
-					ws.WsConn.Emit("probe_get", []byte("please"))
+				if ws.IsConnected() {
+					if ok := ws.WsConn.Emit("probe_get", []byte("please")); ok {
+						updateActivity()
+					}
 				}
 			}
 		}
@@ -281,9 +283,11 @@ func runAgent(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				// Poll for new speedtest queue items
-				if ws.WsConn != nil {
+				if ws.IsConnected() {
 					log.Debug("Polling for speedtest queue...")
-					ws.WsConn.Emit("speedtest_queue_get", []byte("{}"))
+					if ok := ws.WsConn.Emit("speedtest_queue_get", []byte("{}")); ok {
+						updateActivity()
+					}
 				}
 			case items := <-queueCh:
 				// Process each queue item
@@ -294,12 +298,13 @@ func runAgent(ctx context.Context) error {
 					result := probes.RunSpeedtestForQueue(item)
 
 					// Send result back to controller
-					if ws.WsConn != nil {
+					if ws.IsConnected() {
 						data, _ := json.Marshal(result)
 						if ok := ws.WsConn.Emit("speedtest_result", data); !ok {
 							log.Warn("WS: emit speedtest_result returned false")
 						} else {
 							log.Infof("Sent speedtest result for queue item %d", item.ID)
+							updateActivity()
 						}
 					}
 				}

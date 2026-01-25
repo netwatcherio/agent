@@ -277,11 +277,20 @@ type WSClient struct {
 	mu              sync.Mutex
 	currentClient   *neffos.Client     // Current active client for cleanup
 	isConnecting    bool               // Prevents overlapping reconnection attempts
+	isStable        bool               // True when connection is fully established and usable
 	heartbeatCancel context.CancelFunc // Cancels the heartbeat goroutine
 
 	// Failure tracking for auto-reconnect
 	probeGetFailures    int
 	maxProbeGetFailures int // Max consecutive failures before reconnect (default 5)
+}
+
+// IsConnected returns true if the WebSocket connection is fully established and stable.
+// Use this instead of checking WsConn != nil to ensure the connection is ready for use.
+func (c *WSClient) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.WsConn != nil && c.isStable && !c.isConnecting
 }
 
 func (c *WSClient) namespaces() neffos.Namespaces {
@@ -320,6 +329,11 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Infof("WS: sent %d speedtest servers to controller", len(servers))
 				}()
 
+				// Mark connection as stable now that namespace is connected
+				c.mu.Lock()
+				c.isStable = true
+				c.mu.Unlock()
+
 				// Trigger reconnect callback (e.g., for flushing retry queue)
 				if c.OnReconnect != nil {
 					go c.OnReconnect()
@@ -331,16 +345,22 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Infof("WS: disconnected from namespace [%s]", msg.Namespace)
 
-				// Cancel heartbeat if running
+				// Mark connection as not stable immediately
 				c.mu.Lock()
+				c.isStable = false
+				// Cancel heartbeat if running
 				if c.heartbeatCancel != nil {
 					c.heartbeatCancel()
 					c.heartbeatCancel = nil
 				}
 				c.mu.Unlock()
 
-				// Trigger reconnection asynchronously (will respect isConnecting lock)
-				go c.ConnectWithRetry(context.Background())
+				// Delay before triggering reconnection to prevent rapid reconnect cycles
+				// This helps when the backend is replacing connections (e.g., agent restart)
+				go func() {
+					time.Sleep(1 * time.Second)
+					c.ConnectWithRetry(context.Background())
+				}()
 				return nil
 			},
 
@@ -495,6 +515,7 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		return
 	}
 	c.isConnecting = true
+	c.isStable = false // Mark as not stable during reconnection
 
 	// Cancel any existing heartbeat
 	if c.heartbeatCancel != nil {
