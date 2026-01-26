@@ -195,25 +195,92 @@ func spawnRestartProcess() error {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 
-	// Create a temporary batch script that waits briefly, then restarts the service
-	// The script deletes itself after execution
-	scriptPath := filepath.Join(filepath.Dir(exePath), ".tmp", "restart_service.bat")
-
 	// Ensure .tmp directory exists
-	tmpDir := filepath.Dir(scriptPath)
+	tmpDir := filepath.Join(filepath.Dir(exePath), ".tmp")
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return fmt.Errorf("failed to create tmp directory: %w", err)
 	}
 
-	// Batch script content:
-	// - Wait 5 seconds (using ping as a delay mechanism)
-	// - Start the service
-	// - Delete the script file
-	scriptContent := `@echo off
-ping -n 6 127.0.0.1 > nul
-net start NetWatcherAgent
-del "%~f0"
-`
+	// Create a PowerShell script for more reliable restart with retries and logging
+	scriptPath := filepath.Join(tmpDir, "restart_service.ps1")
+	logPath := filepath.Join(tmpDir, "restart_service.log")
+
+	// PowerShell script content:
+	// - Logs all actions for debugging
+	// - Waits for service to fully stop
+	// - Retries start up to 5 times with increasing delays
+	// - Cleans up the script after successful start
+	scriptContent := fmt.Sprintf(`
+$ErrorActionPreference = 'Continue'
+$ServiceName = 'NetWatcherAgent'
+$LogFile = '%s'
+$MaxRetries = 5
+$BaseDelay = 3
+
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "$timestamp - $Message" | Out-File -FilePath $LogFile -Append
+    Write-Host $Message
+}
+
+Write-Log "Restart script started"
+
+# Wait for service to fully stop
+$timeout = 30
+$elapsed = 0
+while ($elapsed -lt $timeout) {
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -eq $svc) {
+        Write-Log "Service not found, may have been uninstalled"
+        exit 0
+    }
+    if ($svc.Status -eq 'Stopped') {
+        Write-Log "Service is stopped, proceeding with restart"
+        break
+    }
+    Write-Log "Waiting for service to stop... (Status: $($svc.Status))"
+    Start-Sleep -Seconds 1
+    $elapsed++
+}
+
+if ($elapsed -ge $timeout) {
+    Write-Log "WARNING: Timeout waiting for service to stop, attempting start anyway"
+}
+
+# Retry loop to start the service
+for ($i = 1; $i -le $MaxRetries; $i++) {
+    Write-Log "Attempt $i of $MaxRetries to start service"
+    
+    try {
+        Start-Service -Name $ServiceName -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        
+        $svc = Get-Service -Name $ServiceName
+        if ($svc.Status -eq 'Running') {
+            Write-Log "SUCCESS: Service is now running"
+            # Clean up the script file
+            Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
+            exit 0
+        } else {
+            Write-Log "Service status after start attempt: $($svc.Status)"
+        }
+    }
+    catch {
+        Write-Log "ERROR on attempt $i - $_"
+    }
+    
+    if ($i -lt $MaxRetries) {
+        $delay = $BaseDelay * $i
+        Write-Log "Waiting $delay seconds before retry..."
+        Start-Sleep -Seconds $delay
+    }
+}
+
+Write-Log "FAILED: Could not start service after $MaxRetries attempts"
+Write-Log "Manual intervention required: Start-Service -Name $ServiceName"
+exit 1
+`, strings.ReplaceAll(logPath, `\`, `\\`))
 
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
 		return fmt.Errorf("failed to write restart script: %w", err)
@@ -221,9 +288,13 @@ del "%~f0"
 
 	log.WithField("script", scriptPath).Info("Spawning restart process")
 
-	// Run the script in a completely detached process
-	// Using cmd.exe /c start /b to run in background without a window
-	cmd := exec.Command("cmd.exe", "/c", "start", "/b", "", scriptPath)
+	// Run PowerShell in a completely detached process
+	// -WindowStyle Hidden prevents any visible window
+	// -ExecutionPolicy Bypass ensures the script runs even with restricted policies
+	cmd := exec.Command("powershell.exe",
+		"-WindowStyle", "Hidden",
+		"-ExecutionPolicy", "Bypass",
+		"-File", scriptPath)
 
 	// Detach from parent process
 	cmd.Stdin = nil
