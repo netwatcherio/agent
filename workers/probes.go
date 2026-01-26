@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +69,21 @@ func getControllerConfig() *probes.ControllerConfig {
 	return controllerConfig
 }
 
+// extractTargetStrings creates a sorted, normalized representation of probe targets.
+// This ensures probe keys include target information so workers are restarted when targets change.
+func extractTargetStrings(targets []probes.ProbeTarget) []string {
+	result := make([]string, len(targets))
+	for i, t := range targets {
+		if t.AgentID != nil {
+			result[i] = fmt.Sprintf("agent:%d:%s", *t.AgentID, t.Target)
+		} else {
+			result[i] = t.Target
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
 func makeProbeKey(probe probes.Probe) string {
 	// For TrafficSim servers, we want to treat allowed agent changes as updates, not new probes
 	// So we'll exclude the allowed agents from the key for server probes
@@ -105,7 +121,9 @@ func makeProbeKey(probe probes.Probe) string {
 		return fmt.Sprintf("%d_%s_%x", probe.ID, probe.Type, hash[:8])
 	}
 
-	// For all other probes (including TrafficSim clients), use the original logic
+	// For all other probes (including TrafficSim clients), include targets in the key
+	// This ensures that when target IPs change (e.g., after reconnection), the probe key
+	// changes and old workers are properly stopped/replaced with new ones.
 	normalizedConfig := struct {
 		Target   []string `json:"target"`
 		Duration int      `json:"duration"`
@@ -113,22 +131,12 @@ func makeProbeKey(probe probes.Probe) string {
 		Interval int      `json:"interval"`
 		Server   bool     `json:"server"`
 	}{
-		Target:   make([]string, 0), // todo
+		Target:   extractTargetStrings(probe.Targets),
 		Duration: probe.DurationSec,
 		Count:    probe.Count,
 		Interval: probe.IntervalSec,
 		Server:   probe.Server,
 	}
-
-	// Create a sorted, normalized representation of targets
-	/*targetStrings := make([]string, len(probe.Target))
-	for i, target := range probe.Target {
-		targetStrings[i] = fmt.Sprintf("%s|%s|%s", target.Target, target.Agent.Hex(), target.Group.Hex())
-	}*/
-
-	// Sort the target strings to ensure consistent ordering
-	/*sort.Strings(targetStrings)
-	normalizedConfig.Target = targetStrings*/
 
 	configBytes, err := json.Marshal(normalizedConfig)
 	if err != nil {
@@ -588,6 +596,23 @@ func containsKey(keys []string, key string) bool {
 		}
 	}
 	return false
+}
+
+// ClearAllProbeWorkers stops and removes all running probe workers.
+// Call this on reconnection to ensure fresh state and prevent duplicate workers
+// with stale configuration from continuing to run.
+func ClearAllProbeWorkers() {
+	log.Info("ClearAllProbeWorkers: stopping all probe workers")
+	count := 0
+	checkWorkers.Range(func(key, value interface{}) bool {
+		probeWorker := value.(ProbeWorkerS)
+		log.Debugf("ClearAllProbeWorkers: stopping worker for probe %d (type: %s)", probeWorker.Probe.ID, probeWorker.Probe.Type)
+		stopProbeWorker(&probeWorker)
+		checkWorkers.Delete(key)
+		count++
+		return true
+	})
+	log.Infof("ClearAllProbeWorkers: stopped %d probe workers", count)
 }
 
 func contains(ids []primitive.ObjectID, id primitive.ObjectID) bool {
