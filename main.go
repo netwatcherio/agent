@@ -213,10 +213,6 @@ func runAgent(ctx context.Context) error {
 		queueSize := workers.GetRetryQueue().Size()
 		log.Infof("OnReconnect: retry queue has %d items", queueSize)
 
-		// Clear stale probe workers to ensure fresh state on reconnection.
-		// This prevents duplicate workers from running with old target configurations.
-		workers.ClearAllProbeWorkers()
-
 		// Brief delay to ensure connection is stable before flushing
 		time.Sleep(500 * time.Millisecond)
 

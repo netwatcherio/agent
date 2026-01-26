@@ -601,18 +601,38 @@ func containsKey(keys []string, key string) bool {
 // ClearAllProbeWorkers stops and removes all running probe workers.
 // Call this on reconnection to ensure fresh state and prevent duplicate workers
 // with stale configuration from continuing to run.
+// This is NON-BLOCKING - it signals workers to stop but doesn't wait for completion.
 func ClearAllProbeWorkers() {
 	log.Info("ClearAllProbeWorkers: stopping all probe workers")
 	count := 0
 	checkWorkers.Range(func(key, value interface{}) bool {
 		probeWorker := value.(ProbeWorkerS)
-		log.Debugf("ClearAllProbeWorkers: stopping worker for probe %d (type: %s)", probeWorker.Probe.ID, probeWorker.Probe.Type)
-		stopProbeWorker(&probeWorker)
+		log.Debugf("ClearAllProbeWorkers: signaling stop for probe %d (type: %s)", probeWorker.Probe.ID, probeWorker.Probe.Type)
+		// Signal stop without waiting - workers will finish in background
+		signalStopProbeWorker(&probeWorker)
+		// Remove from map immediately so new probes can start fresh
 		checkWorkers.Delete(key)
 		count++
 		return true
 	})
-	log.Infof("ClearAllProbeWorkers: stopped %d probe workers", count)
+	log.Infof("ClearAllProbeWorkers: signaled %d probe workers to stop", count)
+}
+
+// signalStopProbeWorker signals a worker to stop without waiting for completion.
+// This is used for fast cleanup during reconnection.
+func signalStopProbeWorker(worker *ProbeWorkerS) {
+	// Cancel context
+	if worker.CancelFunc != nil {
+		worker.CancelFunc()
+	}
+
+	// Close stop channel
+	if worker.StopChan != nil && worker.StopOnce != nil {
+		worker.StopOnce.Do(func() {
+			close(worker.StopChan)
+		})
+	}
+	// Don't wait for WaitGroup - let workers finish in background
 }
 
 func contains(ids []primitive.ObjectID, id primitive.ObjectID) bool {
