@@ -316,8 +316,7 @@ func isNetworkChangeError(err error) bool {
 		strings.Contains(errStr, "wsasend") ||
 		strings.Contains(errStr, "wsarecv") ||
 		strings.Contains(errStr, "An invalid argument was supplied") ||
-		strings.Contains(errStr, "forcibly closed") ||
-		strings.Contains(errStr, "connection refused")
+		strings.Contains(errStr, "forcibly closed")
 }
 
 // reconnectUDP closes the existing connection and establishes a new one
