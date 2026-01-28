@@ -418,47 +418,64 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 			// Store current probes for bidirectional TrafficSim detection
 			setCurrentProbes(p)
 
+			// Build a set of incoming probe ID+type combinations
+			newProbeIdentities := make(map[string]bool)
+			for _, probe := range p {
+				identityKey := fmt.Sprintf("%d_%s", probe.ID, probe.Type)
+				newProbeIdentities[identityKey] = true
+			}
+
+			// Track new keys for this cycle
 			var newKeys []string
 
 			for _, probe := range p {
 				probeKey := makeProbeKey(probe)
+				identityKey := fmt.Sprintf("%d_%s", probe.ID, probe.Type)
+
+				// First, try to find existing worker by exact key match
 				existingWorker, exists := checkWorkers.Load(probeKey)
 
-				if !exists {
-					// New probe - create worker
-					log.Debugf("Starting NEW worker for probe %v (type: %s)", probe.ID, probe.Type)
+				if exists {
+					// Exact match - probe config unchanged, just update probe data
+					oldWorker := existingWorker.(ProbeWorkerS)
+					oldWorker.Probe = probe
+					checkWorkers.Store(probeKey, oldWorker)
 
-					ctx, cancel := context.WithCancel(context.Background())
-					stopChan := make(chan struct{})
-					stopOnce := &sync.Once{}
-					wg := &sync.WaitGroup{}
-
-					worker := ProbeWorkerS{
-						Probe:      probe,
-						ToRemove:   false,
-						StopChan:   stopChan,
-						StopOnce:   stopOnce,
-						WaitGroup:  wg,
-						Ctx:        ctx,
-						CancelFunc: cancel,
+					// If TrafficSim server, update allowed agents
+					if probe.Type == probes.ProbeType_TRAFFICSIM && probe.Server {
+						updateServerAllowedAgents(probe)
 					}
 
-					checkWorkers.Store(probeKey, worker)
-					startCheckWorker(probe, probeDataChan, thisAgent)
-				} else {
-					// Existing probe - check for updates
-					oldWorker := existingWorker.(ProbeWorkerS)
+					newKeys = append(newKeys, probeKey)
+					continue
+				}
+
+				// No exact match - look for existing worker by ID+type (config might have changed)
+				var oldWorker *ProbeWorkerS
+				var oldKey string
+				checkWorkers.Range(func(key any, value any) bool {
+					worker := value.(ProbeWorkerS)
+					workerIdentityKey := fmt.Sprintf("%d_%s", worker.Probe.ID, worker.Probe.Type)
+					if workerIdentityKey == identityKey {
+						oldWorker = &worker
+						oldKey = key.(string)
+						return false // Stop iteration
+					}
+					return true
+				})
+
+				if oldWorker != nil {
+					// Found existing worker with same ID+type but different config
+					// Check if we need to restart or just update
 
 					if probe.Type == probes.ProbeType_TRAFFICSIM {
 						if trafficSimConfigChanged(oldWorker.Probe, probe) {
-							// Configuration changed - restart
-							log.Infof("TrafficSim probe %v (type: %s) configuration changed, restarting", probe.ID, probe.Type)
+							// TrafficSim config actually changed - restart
+							log.Infof("TrafficSim probe %v config changed, restarting", probe.ID)
 
 							// Stop the old worker
-							stopProbeWorker(&oldWorker)
-
-							// Stop TrafficSim instance
-							//stopTrafficSim(probe.ID, oldWorker.probe.Server)
+							stopProbeWorker(oldWorker)
+							checkWorkers.Delete(oldKey)
 
 							// Brief pause for cleanup
 							time.Sleep(500 * time.Millisecond)
@@ -480,34 +497,61 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 							}
 
 							checkWorkers.Store(probeKey, newWorker)
-							log.Debugf("Starting UPDATED worker for probe %v (type: %s)", probe.ID, probe.Type)
 							startCheckWorker(probe, probeDataChan, thisAgent)
 						} else {
-							// Update probe data without restart
+							// TrafficSim config unchanged - just update probe data and key
+							log.Debugf("TrafficSim probe %v unchanged, updating reference", probe.ID)
 							oldWorker.Probe = probe
-							checkWorkers.Store(probeKey, oldWorker)
+							checkWorkers.Delete(oldKey)
+							checkWorkers.Store(probeKey, *oldWorker)
 
-							// If it's a server, update allowed agents
+							// Update allowed agents if server
 							if probe.Server {
 								updateServerAllowedAgents(probe)
 							}
 						}
 					} else {
-						// Non-TrafficSim probe - just update
+						// Non-TrafficSim - update probe data and key
 						oldWorker.Probe = probe
-						checkWorkers.Store(probeKey, oldWorker)
+						checkWorkers.Delete(oldKey)
+						checkWorkers.Store(probeKey, *oldWorker)
 					}
-				}
 
-				newKeys = append(newKeys, probeKey)
+					newKeys = append(newKeys, probeKey)
+				} else {
+					// Truly new probe - create worker
+					log.Debugf("Starting NEW worker for probe %v (type: %s)", probe.ID, probe.Type)
+
+					ctx, cancel := context.WithCancel(context.Background())
+					stopChan := make(chan struct{})
+					stopOnce := &sync.Once{}
+					wg := &sync.WaitGroup{}
+
+					worker := ProbeWorkerS{
+						Probe:      probe,
+						ToRemove:   false,
+						StopChan:   stopChan,
+						StopOnce:   stopOnce,
+						WaitGroup:  wg,
+						Ctx:        ctx,
+						CancelFunc: cancel,
+					}
+
+					checkWorkers.Store(probeKey, worker)
+					startCheckWorker(probe, probeDataChan, thisAgent)
+
+					newKeys = append(newKeys, probeKey)
+				}
 			}
 
-			// Remove p that are no longer in the configuration
+			// Remove probes that are no longer in the configuration
+			// Compare by probe ID+type, not full config hash, to avoid false removals
 			checkWorkers.Range(func(key any, value any) bool {
-				probeKey := key.(string)
-				if !containsKey(newKeys, probeKey) {
-					probeWorker := value.(ProbeWorkerS)
-					log.Warnf("Probe %v (type: %s) marked for removal", probeWorker.Probe.ID, probeWorker.Probe.Type)
+				probeWorker := value.(ProbeWorkerS)
+				identityKey := fmt.Sprintf("%d_%s", probeWorker.Probe.ID, probeWorker.Probe.Type)
+
+				if !newProbeIdentities[identityKey] {
+					log.Warnf("Probe %v (type: %s) marked for removal (no longer in config)", probeWorker.Probe.ID, probeWorker.Probe.Type)
 
 					// Stop the worker
 					stopProbeWorker(&probeWorker)

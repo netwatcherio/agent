@@ -316,12 +316,33 @@ func isNetworkChangeError(err error) bool {
 		strings.Contains(errStr, "wsasend") ||
 		strings.Contains(errStr, "wsarecv") ||
 		strings.Contains(errStr, "An invalid argument was supplied") ||
-		strings.Contains(errStr, "forcibly closed")
+		strings.Contains(errStr, "forcibly closed") ||
+		strings.Contains(errStr, "unreachable network") // Windows variant
+}
+
+// lastReconnectLog tracks the last time we logged a network-related error to prevent spam
+var lastReconnectLog time.Time
+var reconnectLogMu sync.Mutex
+
+// shouldLogNetworkError returns true if we should log a network-related error.
+// Rate-limits to one message every 5 seconds to prevent spam when network is down.
+func shouldLogNetworkError() bool {
+	reconnectLogMu.Lock()
+	defer reconnectLogMu.Unlock()
+	if time.Since(lastReconnectLog) > 5*time.Second {
+		lastReconnectLog = time.Now()
+		return true
+	}
+	return false
 }
 
 // reconnectUDP closes the existing connection and establishes a new one
 func (ts *TrafficSim) reconnectUDP() error {
-	log.Printf("[trafficsim] Reconnecting due to network change...")
+	shouldLog := shouldLogNetworkError()
+
+	if shouldLog {
+		log.Printf("[trafficsim] Reconnecting due to network change...")
+	}
 
 	// Close old connection
 	ts.connMu.Lock()
@@ -333,7 +354,9 @@ func (ts *TrafficSim) reconnectUDP() error {
 
 	// Establish new connection
 	if err := ts.dialUDP(); err != nil {
-		log.Printf("[trafficsim] Reconnection failed: %v", err)
+		if shouldLog {
+			log.Printf("[trafficsim] Reconnection failed: %v", err)
+		}
 		return err
 	}
 
@@ -657,12 +680,17 @@ func (ts *TrafficSim) receiveLoop(ctx context.Context) {
 			}
 			// Check for network change errors
 			if isNetworkChangeError(err) {
-				log.Printf("[trafficsim] Network change detected in receive loop: %v", err)
+				if shouldLogNetworkError() {
+					log.Printf("[trafficsim] Network change detected in receive loop: %v", err)
+				}
 				ts.setConnectionValid(false)
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			log.Printf("[trafficsim] Read error: %v", err)
+			// Only log non-network errors (closed connection during shutdown is expected)
+			if !strings.Contains(err.Error(), "use of closed network connection") {
+				log.Printf("[trafficsim] Read error: %v", err)
+			}
 			continue
 		}
 
