@@ -553,7 +553,10 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 			if !ts.isConnectionValid() {
 				if err := ts.reconnectUDP(); err != nil {
 					// Still send packet (will fail, recording loss)
-					log.Printf("[trafficsim] Reconnection failed, packet %d will fail", i+1)
+					// Only log occasionally to prevent spam when network is down
+					if shouldLogNetworkError() {
+						log.Printf("[trafficsim] Reconnection failed, packet %d will fail", i+1)
+					}
 				}
 			}
 
