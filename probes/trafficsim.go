@@ -302,7 +302,8 @@ func (ts *TrafficSim) nextReverseSequence() int {
 	return ts.reverseSequence
 }
 
-// isNetworkChangeError detects errors indicating the local IP is no longer valid
+// isNetworkChangeError detects errors indicating the local IP or socket is no longer valid.
+// This includes both Unix/Linux errors and Windows-specific socket errors.
 func isNetworkChangeError(err error) bool {
 	if err == nil {
 		return false
@@ -310,7 +311,13 @@ func isNetworkChangeError(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "can't assign requested address") ||
 		strings.Contains(errStr, "network is unreachable") ||
-		strings.Contains(errStr, "no route to host")
+		strings.Contains(errStr, "no route to host") ||
+		// Windows-specific socket errors when network state changes
+		strings.Contains(errStr, "wsasend") ||
+		strings.Contains(errStr, "wsarecv") ||
+		strings.Contains(errStr, "An invalid argument was supplied") ||
+		strings.Contains(errStr, "forcibly closed") ||
+		strings.Contains(errStr, "connection refused")
 }
 
 // reconnectUDP closes the existing connection and establishes a new one
