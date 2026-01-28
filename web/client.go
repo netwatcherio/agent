@@ -427,6 +427,17 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 						typeCounts[string(probe.Type)]++
 					}
 					log.Infof("WS: received %d probes: %v", len(p), typeCounts)
+
+					// Debug: dump each probe with ID, type, and target for debugging
+					for _, probe := range p {
+						targetStr := ""
+						if len(probe.Targets) > 0 {
+							targetStr = probe.Targets[0].Target
+						}
+						log.Debugf("WS: probe ID=%d Type=%s Server=%v Target=%s",
+							probe.ID, probe.Type, probe.Server, targetStr)
+					}
+
 					c.ProbeGetCh <- p
 				} else {
 					log.Debugf("WS: received empty probe list")
