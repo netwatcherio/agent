@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,16 +17,50 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 )
 
-const (
+// Default logging configuration (can be overridden via environment variables)
+var (
 	// LogFileName is the base name for log files
 	LogFileName = "netwatcher-agent.log"
-	// MaxLogSize is the maximum size of a log file before rotation (5MB)
-	MaxLogSize = 5 * 1024 * 1024
-	// MaxLogBackups is the number of rotated logs to keep
-	MaxLogBackups = 3
+	// DefaultMaxLogSize is the maximum size of a log file before rotation (10MB)
+	DefaultMaxLogSize int64 = 10 * 1024 * 1024
+	// DefaultMaxLogBackups is the number of rotated logs to keep (1 = keep only .log.1)
+	DefaultMaxLogBackups = 1
 	// EventLogSource is the Windows Event Log source name
 	EventLogSource = "NetWatcherAgent"
 )
+
+// LogConfig holds the logging configuration
+type LogConfig struct {
+	MaxSize    int64 // Max size in bytes before rotation
+	MaxBackups int   // Number of backup files to keep
+}
+
+// getLogConfig reads logging configuration from environment variables
+// Environment variables:
+//   - LOG_MAX_SIZE_MB: Maximum log file size in megabytes (default: 10)
+//   - LOG_MAX_BACKUPS: Number of backup files to keep (default: 1)
+func getLogConfig() LogConfig {
+	cfg := LogConfig{
+		MaxSize:    DefaultMaxLogSize,
+		MaxBackups: DefaultMaxLogBackups,
+	}
+
+	// Parse LOG_MAX_SIZE_MB
+	if sizeStr := strings.TrimSpace(os.Getenv("LOG_MAX_SIZE_MB")); sizeStr != "" {
+		if sizeMB, err := strconv.ParseInt(sizeStr, 10, 64); err == nil && sizeMB > 0 {
+			cfg.MaxSize = sizeMB * 1024 * 1024
+		}
+	}
+
+	// Parse LOG_MAX_BACKUPS
+	if backupsStr := strings.TrimSpace(os.Getenv("LOG_MAX_BACKUPS")); backupsStr != "" {
+		if backups, err := strconv.Atoi(backupsStr); err == nil && backups >= 0 {
+			cfg.MaxBackups = backups
+		}
+	}
+
+	return cfg
+}
 
 // eventLogWriter wraps the Windows event log for use with logrus
 type eventLogWriter struct {
@@ -40,18 +76,22 @@ func (w *eventLogWriter) Write(p []byte) (n int, err error) {
 
 // rotatingFileWriter implements a simple rotating file logger
 type rotatingFileWriter struct {
-	mu       sync.Mutex
-	logDir   string
-	filename string
-	file     *os.File
-	size     int64
+	mu         sync.Mutex
+	logDir     string
+	filename   string
+	file       *os.File
+	size       int64
+	maxSize    int64
+	maxBackups int
 }
 
 // newRotatingFileWriter creates a new rotating file writer
-func newRotatingFileWriter(logDir, filename string) (*rotatingFileWriter, error) {
+func newRotatingFileWriter(logDir, filename string, cfg LogConfig) (*rotatingFileWriter, error) {
 	w := &rotatingFileWriter{
-		logDir:   logDir,
-		filename: filename,
+		logDir:     logDir,
+		filename:   filename,
+		maxSize:    cfg.MaxSize,
+		maxBackups: cfg.MaxBackups,
 	}
 
 	if err := os.MkdirAll(logDir, 0755); err != nil {
@@ -95,11 +135,12 @@ func (w *rotatingFileWriter) Write(p []byte) (n int, err error) {
 
 	w.size += int64(n)
 
-	if w.size >= MaxLogSize {
+	if w.size >= w.maxSize {
 		if err := w.rotate(); err != nil {
 			// Log rotation failed, but we don't want to lose the log entry
 			// Just continue writing to the current file
-			log.Warnf("Log rotation failed: %v", err)
+			// Note: Can't use log.Warnf here as it would cause recursion
+			fmt.Fprintf(os.Stderr, "Log rotation failed: %v\n", err)
 		}
 	}
 
@@ -113,12 +154,12 @@ func (w *rotatingFileWriter) rotate() error {
 
 	basePath := filepath.Join(w.logDir, w.filename)
 
-	// Remove oldest backup if it exists
-	oldestBackup := fmt.Sprintf("%s.%d", basePath, MaxLogBackups)
+	// Remove oldest backup if it exists (beyond maxBackups limit)
+	oldestBackup := fmt.Sprintf("%s.%d", basePath, w.maxBackups)
 	os.Remove(oldestBackup)
 
-	// Rotate existing backups
-	for i := MaxLogBackups - 1; i >= 1; i-- {
+	// Rotate existing backups (shift .1 -> .2, etc.)
+	for i := w.maxBackups - 1; i >= 1; i-- {
 		src := fmt.Sprintf("%s.%d", basePath, i)
 		dst := fmt.Sprintf("%s.%d", basePath, i+1)
 		os.Rename(src, dst)
@@ -149,6 +190,10 @@ func (w *rotatingFileWriter) Close() error {
 // 1. Rotating file logging in the executable directory
 // 2. Windows Event Log integration (optional, for critical errors)
 //
+// Configuration via environment variables:
+//   - LOG_MAX_SIZE_MB: Maximum log file size in megabytes (default: 10)
+//   - LOG_MAX_BACKUPS: Number of backup files to keep (default: 1)
+//
 // Returns a cleanup function that should be called on shutdown.
 func SetupServiceLogging() (cleanup func(), err error) {
 	exePath, err := os.Executable()
@@ -157,9 +202,10 @@ func SetupServiceLogging() (cleanup func(), err error) {
 	}
 
 	logDir := filepath.Join(filepath.Dir(exePath), "logs")
+	cfg := getLogConfig()
 
 	// Set up rotating file writer
-	fileWriter, err := newRotatingFileWriter(logDir, LogFileName)
+	fileWriter, err := newRotatingFileWriter(logDir, LogFileName, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup file logging: %w", err)
 	}
@@ -179,7 +225,8 @@ func SetupServiceLogging() (cleanup func(), err error) {
 		err = eventlog.InstallAsEventCreate(EventLogSource, eventlog.Error|eventlog.Warning|eventlog.Info)
 		if err != nil {
 			// Not critical - file logging will work
-			log.Warnf("Failed to install event log source (requires admin): %v", err)
+			// Note: Can't use log.Warnf here as logging isn't configured yet
+			fmt.Fprintf(os.Stderr, "Failed to install event log source (requires admin): %v\n", err)
 		} else {
 			elog, _ = eventlog.Open(EventLogSource)
 		}
@@ -193,8 +240,9 @@ func SetupServiceLogging() (cleanup func(), err error) {
 	log.SetOutput(io.MultiWriter(writers...))
 	log.SetLevel(log.InfoLevel)
 
-	// Log startup message
-	log.Infof("Logging initialized - log directory: %s", logDir)
+	// Log startup message with config info
+	log.Infof("Logging initialized - dir: %s, max_size: %dMB, backups: %d",
+		logDir, cfg.MaxSize/(1024*1024), cfg.MaxBackups)
 	if elog != nil {
 		elog.Info(1, "NetWatcher Agent service started")
 	}
