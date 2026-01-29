@@ -277,6 +277,7 @@ type WSClient struct {
 	mu              sync.Mutex
 	currentClient   *neffos.Client     // Current active client for cleanup
 	isConnecting    bool               // Prevents overlapping reconnection attempts
+	isReconnecting  bool               // True when we're intentionally reconnecting (prevents OnDisconnect loops)
 	isStable        bool               // True when connection is fully established and usable
 	heartbeatCancel context.CancelFunc // Cancels the heartbeat goroutine
 
@@ -353,7 +354,15 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					c.heartbeatCancel()
 					c.heartbeatCancel = nil
 				}
+				// Check if this is an intentional disconnection (we're already reconnecting)
+				alreadyReconnecting := c.isReconnecting || c.isConnecting
 				c.mu.Unlock()
+
+				// Don't trigger another reconnection if we're already doing one
+				if alreadyReconnecting {
+					log.Debug("WS: skipping reconnection trigger - already reconnecting")
+					return nil
+				}
 
 				// Delay before triggering reconnection to prevent rapid reconnect cycles
 				// This helps when the backend is replacing connections (e.g., agent restart)
@@ -526,7 +535,8 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		return
 	}
 	c.isConnecting = true
-	c.isStable = false // Mark as not stable during reconnection
+	c.isReconnecting = true // Mark as intentional reconnection to prevent OnDisconnect loops
+	c.isStable = false      // Mark as not stable during reconnection
 
 	// Cancel any existing heartbeat
 	if c.heartbeatCancel != nil {
@@ -546,10 +556,11 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		clientToClose.Close()
 	}
 
-	// Ensure we reset isConnecting when we return
+	// Ensure we reset flags when we return
 	defer func() {
 		c.mu.Lock()
 		c.isConnecting = false
+		c.isReconnecting = false
 		c.mu.Unlock()
 	}()
 

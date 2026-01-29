@@ -1,6 +1,7 @@
 package workers
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -21,6 +22,9 @@ func GetRetryQueue() *RetryQueue {
 // ProbeDataWorker processes probe data and sends it to the controller.
 // If the WebSocket connection is unavailable, data is queued for retry.
 func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
+	const maxSendFailures = 3 // Trigger reconnect after 3 consecutive failures
+	sendFailures := 0
+
 	go func(cn *web.WSClient, c chan probes.ProbeData) {
 		for p := range ch {
 			p.CreatedAt = time.Now()
@@ -31,9 +35,15 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 			}
 
 			// Check if connection is available
-			if wsH.WsConn == nil {
+			if wsH.WsConn == nil || !wsH.IsConnected() {
 				log.Debug("ProbeDataWorker: no connection, queuing probe data")
 				probeRetryQueue.Enqueue(p)
+				sendFailures++
+				if sendFailures >= maxSendFailures {
+					log.Warnf("ProbeDataWorker: %d consecutive send failures (no connection), triggering reconnection", sendFailures)
+					sendFailures = 0
+					go wsH.ConnectWithRetry(context.Background())
+				}
 				continue
 			}
 
@@ -41,8 +51,15 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 			if !wsH.WsConn.Emit("probe_post", marshal) {
 				log.Warn("ProbeDataWorker: emit failed, queuing probe data for retry")
 				probeRetryQueue.Enqueue(p)
+				sendFailures++
+				if sendFailures >= maxSendFailures {
+					log.Warnf("ProbeDataWorker: %d consecutive emit failures, triggering reconnection", sendFailures)
+					sendFailures = 0
+					go wsH.ConnectWithRetry(context.Background())
+				}
 			} else {
 				log.Debug("ProbeDataWorker: probe data sent successfully")
+				sendFailures = 0 // Reset on successful send
 			}
 		}
 	}(wsH, ch)
