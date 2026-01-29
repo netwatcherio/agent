@@ -62,6 +62,16 @@ func main() {
 
 	// Check if running as Windows service
 	if platform.IsRunningAsService() {
+		// Set up file logging for Windows service mode
+		// (stdout doesn't work for Windows services)
+		cleanup, err := platform.SetupServiceLogging()
+		if err != nil {
+			// Fall back to stdout if logging setup fails
+			fmt.Printf("Warning: Failed to setup service logging: %v\n", err)
+		} else {
+			defer cleanup()
+		}
+
 		log.Info("Running as Windows service")
 		if err := platform.RunService("NetWatcherAgent", runAgent); err != nil {
 			log.Fatalf("Service error: %v", err)

@@ -11,10 +11,18 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
+)
+
+// Windows process creation flags for detaching child processes
+const (
+	CREATE_NEW_PROCESS_GROUP = 0x00000200
+	DETACHED_PROCESS         = 0x00000008
+	CREATE_NO_WINDOW         = 0x08000000
 )
 
 // Package-level restart signaling
@@ -296,7 +304,16 @@ exit 1
 		"-ExecutionPolicy", "Bypass",
 		"-File", scriptPath)
 
-	// Detach from parent process
+	// CRITICAL: Use Windows process creation flags to fully detach the child process
+	// Without these flags, the PowerShell process is killed when the parent service stops
+	// - CREATE_NEW_PROCESS_GROUP: Makes the child independent from parent's console group
+	// - DETACHED_PROCESS: The child has no console and is detached from the parent
+	// - CREATE_NO_WINDOW: Prevents any window from appearing (redundant with -WindowStyle Hidden but safer)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW,
+	}
+
+	// Ensure no handle inheritance
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
