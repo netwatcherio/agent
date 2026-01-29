@@ -418,11 +418,67 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 			// Store current probes for bidirectional TrafficSim detection
 			setCurrentProbes(p)
 
+			// === DEBUG: Log probe reconciliation details ===
+			// Collect currently running probes
+			var runningProbes []string
+			runningProbeMap := make(map[string]probes.Probe)
+			checkWorkers.Range(func(key, value interface{}) bool {
+				worker := value.(ProbeWorkerS)
+				identityKey := fmt.Sprintf("%d_%s", worker.Probe.ID, worker.Probe.Type)
+				targetStr := ""
+				if len(worker.Probe.Targets) > 0 {
+					targetStr = worker.Probe.Targets[0].Target
+				}
+				runningProbes = append(runningProbes, fmt.Sprintf("ID=%d Type=%s Target=%s", worker.Probe.ID, worker.Probe.Type, targetStr))
+				runningProbeMap[identityKey] = worker.Probe
+				return true
+			})
+
 			// Build a set of incoming probe ID+type combinations
 			newProbeIdentities := make(map[string]bool)
+			newProbeMap := make(map[string]probes.Probe)
 			for _, probe := range p {
 				identityKey := fmt.Sprintf("%d_%s", probe.ID, probe.Type)
 				newProbeIdentities[identityKey] = true
+				newProbeMap[identityKey] = probe
+			}
+
+			// Log summary
+			log.Infof("[ProbeReconcile] Received %d probes from controller, currently running %d probes",
+				len(p), len(runningProbes))
+
+			// Categorize probes: KEPT, NEW, REMOVED
+			var kept, added, removed []string
+			for identityKey, probe := range newProbeMap {
+				targetStr := ""
+				if len(probe.Targets) > 0 {
+					targetStr = probe.Targets[0].Target
+				}
+				if _, exists := runningProbeMap[identityKey]; exists {
+					kept = append(kept, fmt.Sprintf("ID=%d Type=%s Target=%s", probe.ID, probe.Type, targetStr))
+				} else {
+					added = append(added, fmt.Sprintf("ID=%d Type=%s Target=%s", probe.ID, probe.Type, targetStr))
+				}
+			}
+			for identityKey, probe := range runningProbeMap {
+				if !newProbeIdentities[identityKey] {
+					targetStr := ""
+					if len(probe.Targets) > 0 {
+						targetStr = probe.Targets[0].Target
+					}
+					removed = append(removed, fmt.Sprintf("ID=%d Type=%s Target=%s", probe.ID, probe.Type, targetStr))
+				}
+			}
+
+			// Log changes if any
+			if len(added) > 0 || len(removed) > 0 {
+				log.Infof("[ProbeReconcile] === PROBE CHANGES DETECTED ===")
+				log.Infof("[ProbeReconcile] KEPT (%d): %v", len(kept), kept)
+				log.Infof("[ProbeReconcile] NEW (%d): %v", len(added), added)
+				log.Warnf("[ProbeReconcile] REMOVING (%d): %v", len(removed), removed)
+				log.Infof("[ProbeReconcile] === END PROBE CHANGES ===")
+			} else {
+				log.Debugf("[ProbeReconcile] No changes - all %d probes continuing", len(kept))
 			}
 
 			// Track new keys for this cycle
