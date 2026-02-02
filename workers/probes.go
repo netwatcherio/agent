@@ -84,6 +84,17 @@ func extractTargetStrings(targets []probes.ProbeTarget) []string {
 	return result
 }
 
+// makeContinuityKey creates a key based on Type + Target for worker lifecycle management.
+// This allows workers to persist across probe ID changes when the actual monitoring target
+// remains the same. The probe ID is tracked separately for data reporting.
+func makeContinuityKey(probe probes.Probe) string {
+	targetStr := ""
+	if len(probe.Targets) > 0 {
+		targetStr = probe.Targets[0].Target
+	}
+	return fmt.Sprintf("%s_%s", probe.Type, targetStr)
+}
+
 func makeProbeKey(probe probes.Probe) string {
 	// For TrafficSim servers, we want to treat allowed agent changes as updates, not new probes
 	// So we'll exclude the allowed agents from the key for server probes
@@ -419,49 +430,56 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 			setCurrentProbes(p)
 
 			// === DEBUG: Log probe reconciliation details ===
-			// Collect currently running probes
+			// Collect currently running probes - indexed by CONTINUITY KEY (Type+Target)
 			var runningProbes []string
-			runningProbeMap := make(map[string]probes.Probe)
+			runningProbeMap := make(map[string]probes.Probe) // continuityKey -> probe
+			runningWorkerKeys := make(map[string]string)     // continuityKey -> probeKey (for worker lookup)
 			checkWorkers.Range(func(key, value interface{}) bool {
 				worker := value.(ProbeWorkerS)
-				identityKey := fmt.Sprintf("%d_%s", worker.Probe.ID, worker.Probe.Type)
+				continuityKey := makeContinuityKey(worker.Probe)
 				targetStr := ""
 				if len(worker.Probe.Targets) > 0 {
 					targetStr = worker.Probe.Targets[0].Target
 				}
 				runningProbes = append(runningProbes, fmt.Sprintf("ID=%d Type=%s Target=%s", worker.Probe.ID, worker.Probe.Type, targetStr))
-				runningProbeMap[identityKey] = worker.Probe
+				runningProbeMap[continuityKey] = worker.Probe
+				runningWorkerKeys[continuityKey] = key.(string)
 				return true
 			})
 
-			// Build a set of incoming probe ID+type combinations
-			newProbeIdentities := make(map[string]bool)
-			newProbeMap := make(map[string]probes.Probe)
+			// Build a set of incoming probe continuity keys (Type+Target)
+			newProbeContinuity := make(map[string]bool)
+			newProbeMap := make(map[string]probes.Probe) // continuityKey -> probe
 			for _, probe := range p {
-				identityKey := fmt.Sprintf("%d_%s", probe.ID, probe.Type)
-				newProbeIdentities[identityKey] = true
-				newProbeMap[identityKey] = probe
+				continuityKey := makeContinuityKey(probe)
+				newProbeContinuity[continuityKey] = true
+				newProbeMap[continuityKey] = probe
 			}
 
 			// Log summary
 			log.Infof("[ProbeReconcile] Received %d probes from controller, currently running %d probes",
 				len(p), len(runningProbes))
 
-			// Categorize probes: KEPT, NEW, REMOVED
+			// Categorize probes: KEPT, NEW, REMOVED (using continuity key = Type+Target)
 			var kept, added, removed []string
-			for identityKey, probe := range newProbeMap {
+			var idUpdates []string // Track probes where ID changed but worker continues
+			for continuityKey, probe := range newProbeMap {
 				targetStr := ""
 				if len(probe.Targets) > 0 {
 					targetStr = probe.Targets[0].Target
 				}
-				if _, exists := runningProbeMap[identityKey]; exists {
+				if oldProbe, exists := runningProbeMap[continuityKey]; exists {
+					if oldProbe.ID != probe.ID {
+						// Same Type+Target but different ID - worker continues with updated ID
+						idUpdates = append(idUpdates, fmt.Sprintf("ID=%d->%d Type=%s Target=%s", oldProbe.ID, probe.ID, probe.Type, targetStr))
+					}
 					kept = append(kept, fmt.Sprintf("ID=%d Type=%s Target=%s", probe.ID, probe.Type, targetStr))
 				} else {
 					added = append(added, fmt.Sprintf("ID=%d Type=%s Target=%s", probe.ID, probe.Type, targetStr))
 				}
 			}
-			for identityKey, probe := range runningProbeMap {
-				if !newProbeIdentities[identityKey] {
+			for continuityKey, probe := range runningProbeMap {
+				if !newProbeContinuity[continuityKey] {
 					targetStr := ""
 					if len(probe.Targets) > 0 {
 						targetStr = probe.Targets[0].Target
@@ -471,9 +489,12 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 			}
 
 			// Log changes if any
-			if len(added) > 0 || len(removed) > 0 {
+			if len(added) > 0 || len(removed) > 0 || len(idUpdates) > 0 {
 				log.Infof("[ProbeReconcile] === PROBE CHANGES DETECTED ===")
 				log.Infof("[ProbeReconcile] KEPT (%d): %v", len(kept), kept)
+				if len(idUpdates) > 0 {
+					log.Infof("[ProbeReconcile] ID_UPDATES (%d): %v", len(idUpdates), idUpdates)
+				}
 				log.Infof("[ProbeReconcile] NEW (%d): %v", len(added), added)
 				log.Warnf("[ProbeReconcile] REMOVING (%d): %v", len(removed), removed)
 				log.Infof("[ProbeReconcile] === END PROBE CHANGES ===")
@@ -486,7 +507,6 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 
 			for _, probe := range p {
 				probeKey := makeProbeKey(probe)
-				identityKey := fmt.Sprintf("%d_%s", probe.ID, probe.Type)
 
 				// First, try to find existing worker by exact key match
 				existingWorker, exists := checkWorkers.Load(probeKey)
@@ -506,23 +526,21 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 					continue
 				}
 
-				// No exact match - look for existing worker by ID+type (config might have changed)
+				// No exact match - look for existing worker by Type+Target (ID might have changed)
+				continuityKey := makeContinuityKey(probe)
 				var oldWorker *ProbeWorkerS
 				var oldKey string
-				checkWorkers.Range(func(key any, value any) bool {
-					worker := value.(ProbeWorkerS)
-					workerIdentityKey := fmt.Sprintf("%d_%s", worker.Probe.ID, worker.Probe.Type)
-					if workerIdentityKey == identityKey {
+				if workerKey, exists := runningWorkerKeys[continuityKey]; exists {
+					if workerInterface, ok := checkWorkers.Load(workerKey); ok {
+						worker := workerInterface.(ProbeWorkerS)
 						oldWorker = &worker
-						oldKey = key.(string)
-						return false // Stop iteration
+						oldKey = workerKey
 					}
-					return true
-				})
+				}
 
 				if oldWorker != nil {
-					// Found existing worker with same ID+type but different config
-					// Check if we need to restart or just update
+					// Found existing worker with same Type+Target
+					// Update probe ID reference and continue without restart
 
 					if probe.Type == probes.ProbeType_TRAFFICSIM {
 						if trafficSimConfigChanged(oldWorker.Probe, probe) {
@@ -601,12 +619,12 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 			}
 
 			// Remove probes that are no longer in the configuration
-			// Compare by probe ID+type, not full config hash, to avoid false removals
+			// Compare by Type+Target (continuity key) to avoid false removals when IDs change
 			checkWorkers.Range(func(key any, value any) bool {
 				probeWorker := value.(ProbeWorkerS)
-				identityKey := fmt.Sprintf("%d_%s", probeWorker.Probe.ID, probeWorker.Probe.Type)
+				continuityKey := makeContinuityKey(probeWorker.Probe)
 
-				if !newProbeIdentities[identityKey] {
+				if !newProbeContinuity[continuityKey] {
 					log.Warnf("Probe %v (type: %s) marked for removal (no longer in config)", probeWorker.Probe.ID, probeWorker.Probe.Type)
 
 					// Stop the worker
