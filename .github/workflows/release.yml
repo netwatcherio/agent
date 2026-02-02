@@ -6,9 +6,9 @@ on:
       - master
 
 jobs:
-  # Build Linux and Windows on Ubuntu (no CGO needed)
+  # Build Linux and Windows on self-hosted runner
   build-linux-windows:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: write
     outputs:
@@ -73,55 +73,10 @@ jobs:
           name: linux-windows-builds
           path: bin/*.zip
 
-  # Build Darwin on macOS (CGO required for pcap)
-  build-darwin:
-    runs-on: macos-latest
-    needs: build-linux-windows
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-          cache: false
-
-      - name: Clone NTrace-core
-        run: |
-          rm -rf lib/NTrace-core
-          git clone --depth 1 https://github.com/netwatcherio/NTrace-core.git lib/NTrace-core
-
-      - name: Build Darwin
-        env:
-          VERSION: ${{ needs.build-linux-windows.outputs.version }}
-        run: |
-          LDFLAGS="-s -w -X 'main.VERSION=$VERSION' -X 'main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)' -X 'main.gitCommit=$(git rev-parse --short HEAD)'"
-          mkdir -p bin
-          
-          # Darwin builds with CGO (required for pcap)
-          for arch in amd64 arm64; do
-            echo "Building darwin/$arch..."
-            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-darwin-$arch .
-            codesign -s - -f bin/netwatcher-darwin-$arch
-            cd bin && zip netwatcher-${VERSION}-darwin-$arch.zip netwatcher-darwin-$arch && rm netwatcher-darwin-$arch && cd ..
-          done
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: darwin-builds
-          path: bin/*.zip
-
   # Create release with all artifacts
   release:
-    runs-on: ubuntu-latest
-    needs: [build-linux-windows, build-darwin]
+    runs-on: self-hosted
+    needs: [build-linux-windows]
     permissions:
       contents: write
 
@@ -132,20 +87,14 @@ jobs:
           name: linux-windows-builds
           path: bin
 
-      - name: Download Darwin artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: darwin-builds
-          path: bin
-
       - name: Verify artifacts exist
         run: |
           echo "Listing downloaded artifacts:"
           ls -la bin/
           ZIP_COUNT=$(ls bin/*.zip 2>/dev/null | wc -l)
           echo "Found $ZIP_COUNT zip files"
-          if [ "$ZIP_COUNT" -lt 7 ]; then
-            echo "ERROR: Expected 7 zip files (3 linux + 2 windows + 2 darwin), but found $ZIP_COUNT"
+          if [ "$ZIP_COUNT" -lt 5 ]; then
+            echo "ERROR: Expected 5 zip files (3 linux + 2 windows), but found $ZIP_COUNT"
             exit 1
           fi
 
@@ -169,6 +118,11 @@ jobs:
             **Build Date:** ${{ needs.build-linux-windows.outputs.date }}
             **Commit:** ${{ github.sha }} (${{ needs.build-linux-windows.outputs.hash }})
             **Branch:** master
+            
+            ### Platforms
+            
+            - **Linux:** amd64, arm64, arm
+            - **Windows:** amd64, arm64
             
             ### Installation
             
