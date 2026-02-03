@@ -222,6 +222,7 @@ func spawnRestartProcess() error {
 $ErrorActionPreference = 'Continue'
 $ServiceName = 'NetWatcherAgent'
 $LogFile = '%s'
+$ExePath = '%s'
 $MaxRetries = 5
 $BaseDelay = 3
 
@@ -232,7 +233,20 @@ function Write-Log {
     Write-Host $Message
 }
 
+function Test-FileLocked {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $file = [System.IO.File]::Open($Path, 'Open', 'Read', 'None')
+        $file.Close()
+        return $false
+    } catch {
+        return $true
+    }
+}
+
 Write-Log "Restart script started"
+Write-Log "Executable path: $ExePath"
 
 # Wait for service to fully stop
 $timeout = 30
@@ -244,7 +258,7 @@ while ($elapsed -lt $timeout) {
         exit 0
     }
     if ($svc.Status -eq 'Stopped') {
-        Write-Log "Service is stopped, proceeding with restart"
+        Write-Log "Service is stopped"
         break
     }
     Write-Log "Waiting for service to stop... (Status: $($svc.Status))"
@@ -253,21 +267,57 @@ while ($elapsed -lt $timeout) {
 }
 
 if ($elapsed -ge $timeout) {
-    Write-Log "WARNING: Timeout waiting for service to stop, attempting start anyway"
+    Write-Log "WARNING: Timeout waiting for service to stop"
+    Write-Log "Attempting to force stop service..."
+    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
 }
+
+# Wait for file handles to be released
+Write-Log "Waiting for executable file lock to be released..."
+$lockTimeout = 30
+$lockElapsed = 0
+while ($lockElapsed -lt $lockTimeout) {
+    if (-not (Test-FileLocked -Path $ExePath)) {
+        Write-Log "Executable is no longer locked"
+        break
+    }
+    Write-Log "Executable still locked, waiting... ($lockElapsed sec)"
+    Start-Sleep -Seconds 1
+    $lockElapsed++
+}
+
+if ($lockElapsed -ge $lockTimeout) {
+    Write-Log "WARNING: Executable may still be locked after $lockTimeout seconds"
+}
+
+# Additional buffer to ensure clean state
+Start-Sleep -Seconds 2
 
 # Retry loop to start the service
 for ($i = 1; $i -le $MaxRetries; $i++) {
-    Write-Log "Attempt $i of $MaxRetries to start service"
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    Write-Log "Attempt $i of $MaxRetries to start service (current status: $($svc.Status))"
+    
+    # If stuck in StartPending, wait for it
+    if ($svc.Status -eq 'StartPending') {
+        Write-Log "Service is in StartPending, waiting..."
+        Start-Sleep -Seconds 5
+        $svc = Get-Service -Name $ServiceName
+        if ($svc.Status -eq 'Running') {
+            Write-Log "SUCCESS: Service is now running"
+            Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
+            exit 0
+        }
+    }
     
     try {
         Start-Service -Name $ServiceName -ErrorAction Stop
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 3
         
         $svc = Get-Service -Name $ServiceName
         if ($svc.Status -eq 'Running') {
             Write-Log "SUCCESS: Service is now running"
-            # Clean up the script file
             Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
             exit 0
         } else {
@@ -288,7 +338,7 @@ for ($i = 1; $i -le $MaxRetries; $i++) {
 Write-Log "FAILED: Could not start service after $MaxRetries attempts"
 Write-Log "Manual intervention required: Start-Service -Name $ServiceName"
 exit 1
-`, strings.ReplaceAll(logPath, `\`, `\\`))
+`, strings.ReplaceAll(logPath, `\`, `\\`), strings.ReplaceAll(exePath, `\`, `\\`))
 
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
 		return fmt.Errorf("failed to write restart script: %w", err)
