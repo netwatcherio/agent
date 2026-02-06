@@ -1090,8 +1090,20 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 
 	// Check if cycle is complete
 	if len(connection.ReverseCycle.PacketSeqs) >= TrafficSimReportSeq {
-		// Report stats and start new cycle
-		go ts.reportReverseStats(connection)
+		// Rotate cycle synchronously to prevent race conditions
+		completedCycle := connection.ReverseCycle
+
+		connection.ReverseCycle = &CycleTracker{
+			StartSeq:     connection.ReverseSequence + 1,
+			StartTime:    time.Now(),
+			PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+			PacketTimes:  make(map[int]PacketTime),
+			receivedSeqs: make(map[int]int),
+		}
+		connection.LastReportTime = time.Now()
+
+		// Report stats for the completed cycle asynchronously
+		go ts.reportCycleStats(completedCycle, connection.ClientProbeID, connection.AgentID, connection.Addr.String())
 	}
 }
 
@@ -1100,35 +1112,37 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	seq := data.Seq
 	recvTime := time.Now().UnixMilli()
 
-	connection.ReverseCycle.mu.Lock()
-	defer connection.ReverseCycle.mu.Unlock()
+	// Capture pointer to avoid race if cycle rotates (though handleReverseAck runs in same main loop)
+	cycle := connection.ReverseCycle
+	cycle.mu.Lock()
+	defer cycle.mu.Unlock()
 
 	// Track duplicate/out-of-order
-	connection.ReverseCycle.receivedSeqs[seq]++
-	receiveCount := connection.ReverseCycle.receivedSeqs[seq]
+	cycle.receivedSeqs[seq]++
+	receiveCount := cycle.receivedSeqs[seq]
 
 	if receiveCount > 1 {
-		connection.ReverseCycle.duplicates++
-	} else if connection.ReverseCycle.lastReceivedSeq > 0 && seq < connection.ReverseCycle.lastReceivedSeq {
-		connection.ReverseCycle.outOfOrder++
+		cycle.duplicates++
+	} else if cycle.lastReceivedSeq > 0 && seq < cycle.lastReceivedSeq {
+		cycle.outOfOrder++
 	}
-	connection.ReverseCycle.lastReceivedSeq = seq
+	cycle.lastReceivedSeq = seq
 
 	// Update packet timing
-	if pt, ok := connection.ReverseCycle.PacketTimes[seq]; ok && pt.Received == 0 {
+	if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 {
 		pt.Received = recvTime
-		connection.ReverseCycle.PacketTimes[seq] = pt
+		cycle.PacketTimes[seq] = pt
 	}
 }
 
-// reportReverseStats calculates and reports stats for reverse direction
-func (ts *TrafficSim) reportReverseStats(connection *AgentConnection) {
+// reportCycleStats calculates and reports stats for a completed reverse cycle
+func (ts *TrafficSim) reportCycleStats(cycle *CycleTracker, probeID uint, agentID uint, target string) {
 	if ts.DataChan == nil || !ts.isRunning() {
 		return
 	}
 
 	// Calculate stats using the same method as client
-	stats := ts.calculateStats(connection.ReverseCycle)
+	stats := ts.calculateStats(cycle)
 
 	payload, err := json.Marshal(stats)
 	if err != nil {
@@ -1139,29 +1153,19 @@ func (ts *TrafficSim) reportReverseStats(connection *AgentConnection) {
 	// Report with the client probe ID for this connection
 	select {
 	case ts.DataChan <- ProbeData{
-		ProbeID:     connection.ClientProbeID,
+		ProbeID:     probeID,
 		Triggered:   false,
 		CreatedAt:   time.Now(),
 		Type:        ProbeType_TRAFFICSIM,
 		Payload:     payload,
-		Target:      connection.Addr.String(),
-		TargetAgent: connection.AgentID,
+		Target:      target,
+		TargetAgent: agentID,
 	}:
 		log.Infof("[trafficsim] probe=%d (reverse) agent=%d loss=%.1f%% avgRTT=%.1fms",
-			connection.ClientProbeID, connection.AgentID, stats["lossPercentage"], stats["averageRTT"])
+			probeID, agentID, stats["lossPercentage"], stats["averageRTT"])
 	default:
 		log.Printf("[trafficsim] DataChan full, dropping reverse stats")
 	}
-
-	// Reset cycle for next round
-	connection.ReverseCycle = &CycleTracker{
-		StartSeq:     connection.ReverseSequence + 1,
-		StartTime:    time.Now(),
-		PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
-		PacketTimes:  make(map[int]PacketTime),
-		receivedSeqs: make(map[int]int),
-	}
-	connection.LastReportTime = time.Now()
 }
 
 // -------------------- Stop --------------------
