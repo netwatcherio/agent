@@ -857,6 +857,16 @@ func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataCha
 			<-stopChan
 			return
 		}
+
+		// Check for self-connection: if the target agent is this agent itself, skip it.
+		// This can happen when the controller creates probes where the source and destination
+		// agent are the same (e.g., agent 157 targeting IP 216.99.203.157 which is itself).
+		if probe.Targets[0].AgentID != nil && *probe.Targets[0].AgentID == probe.AgentID {
+			log.Warnf("[trafficsim] Skipping self-targeting probe %d (target=%s, agentID=%d) - agent cannot TrafficSim itself",
+				probe.ID, target, probe.AgentID)
+			<-stopChan
+			return
+		}
 	}
 
 	// Create new TrafficSim instance
