@@ -84,15 +84,16 @@ func extractTargetStrings(targets []probes.ProbeTarget) []string {
 	return result
 }
 
-// makeContinuityKey creates a key based on Type + Target for worker lifecycle management.
-// This allows workers to persist across probe ID changes when the actual monitoring target
-// remains the same. The probe ID is tracked separately for data reporting.
+// makeContinuityKey creates a unique key based on Probe ID + Type + Target for worker lifecycle management.
+// Each probe is uniquely identified by its ID - this ensures that multiple probes with
+// the same Type+Target (e.g., two MTR probes to the same IP from different probe configurations)
+// are correctly treated as distinct probes and won't overwrite each other.
 func makeContinuityKey(probe probes.Probe) string {
 	targetStr := ""
 	if len(probe.Targets) > 0 {
 		targetStr = probe.Targets[0].Target
 	}
-	return fmt.Sprintf("%s_%s", probe.Type, targetStr)
+	return fmt.Sprintf("%d_%s_%s", probe.ID, probe.Type, targetStr)
 }
 
 func makeProbeKey(probe probes.Probe) string {
