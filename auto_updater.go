@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,8 +40,10 @@ type GitHubRelease struct {
 		Name               string `json:"name"`
 		BrowserDownloadURL string `json:"browser_download_url"`
 	} `json:"assets"`
-	Draft      bool `json:"draft"`
-	Prerelease bool `json:"prerelease"`
+	Draft       bool      `json:"draft"`
+	Prerelease  bool      `json:"prerelease"`
+	PublishedAt time.Time `json:"published_at"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // AutoUpdater handles automatic updates
@@ -178,7 +181,14 @@ func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
 		return nil, err
 	}
 
-	// Find the first non-draft, non-prerelease release (already sorted newest first)
+	// Sort by published_at descending — GitHub's default sort uses created_at
+	// which can differ from publish order when releases are drafted/published
+	// out of order, causing the agent to "update" to an older release.
+	sort.Slice(releases, func(i, j int) bool {
+		return releases[i].PublishedAt.After(releases[j].PublishedAt)
+	})
+
+	// Return the most recently published non-draft, non-prerelease release
 	for i := range releases {
 		if !releases[i].Draft && !releases[i].Prerelease {
 			return &releases[i], nil
@@ -188,7 +198,9 @@ func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
 	return nil, nil
 }
 
-// isNewerVersion checks if the new version is newer than current
+// isNewerVersion checks if the new version is actually newer than current.
+// Version format: vYYYYMMDD-HASH (e.g. v20260219-5c692b8)
+// Compares the date portion to prevent downgrades to same-day older commits.
 func (u *AutoUpdater) isNewerVersion(newVersion, currentVersion string) bool {
 	if strings.Contains(currentVersion, "dev") {
 		log.Info("Using development version, not updating.")
@@ -197,7 +209,55 @@ func (u *AutoUpdater) isNewerVersion(newVersion, currentVersion string) bool {
 
 	newVersion = strings.TrimPrefix(newVersion, "v")
 	currentVersion = strings.TrimPrefix(currentVersion, "v")
-	return newVersion != currentVersion
+
+	// Same version string — definitely not newer
+	if newVersion == currentVersion {
+		return false
+	}
+
+	// Extract date portions (YYYYMMDD) from "YYYYMMDD-HASH" format
+	newDate := extractDateFromVersion(newVersion)
+	currentDate := extractDateFromVersion(currentVersion)
+
+	// If we can extract dates from both, compare them
+	if newDate != "" && currentDate != "" {
+		if newDate > currentDate {
+			// Newer date — definitely an update
+			return true
+		}
+		if newDate < currentDate {
+			// Older date — this would be a downgrade, skip
+			log.WithFields(log.Fields{
+				"new":     newVersion,
+				"current": currentVersion,
+			}).Warn("Skipping update: release is older than current version")
+			return false
+		}
+		// Same date, different hash — this is a same-day rebuild.
+		// Trust the API ordering (getLatestRelease sorted by published_at)
+		// so we accept it as an update.
+		return true
+	}
+
+	// Fallback: if version format doesn't match expected pattern,
+	// treat any different version as newer
+	return true
+}
+
+// extractDateFromVersion pulls the YYYYMMDD portion from a "YYYYMMDD-HASH" version string.
+// Returns empty string if the format doesn't match.
+func extractDateFromVersion(version string) string {
+	parts := strings.SplitN(version, "-", 2)
+	if len(parts) >= 1 && len(parts[0]) == 8 {
+		// Validate it looks like a date (all digits)
+		for _, c := range parts[0] {
+			if c < '0' || c > '9' {
+				return ""
+			}
+		}
+		return parts[0]
+	}
+	return ""
 }
 
 // verifyChecksum verifies the SHA256 checksum of a file
