@@ -200,8 +200,8 @@ func SetupServiceLogging() (cleanup func(), err error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get executable path: %w", err)
 	}
-
-	logDir := filepath.Join(filepath.Dir(exePath), "logs")
+	// Log directly beside the executable for easy visibility — no subfolder needed
+	logDir := filepath.Dir(exePath)
 	cfg := getLogConfig()
 
 	// Set up rotating file writer

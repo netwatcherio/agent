@@ -205,15 +205,17 @@ func spawnRestartProcess() error {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 
-	// Ensure .tmp directory exists
-	tmpDir := filepath.Join(filepath.Dir(exePath), ".tmp")
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		return fmt.Errorf("failed to create tmp directory: %w", err)
+	// Ensure .update directory exists for update artifacts
+	exeDir := filepath.Dir(exePath)
+	updateDir := filepath.Join(exeDir, ".update")
+	if err := os.MkdirAll(updateDir, 0755); err != nil {
+		return fmt.Errorf("failed to create update directory: %w", err)
 	}
 
 	// Create a PowerShell script for more reliable restart with retries and logging
-	scriptPath := filepath.Join(tmpDir, "restart_service.ps1")
-	logPath := filepath.Join(tmpDir, "restart_service.log")
+	// Script lives in .update/, but log sits beside the exe for easy visibility
+	scriptPath := filepath.Join(updateDir, "restart_service.ps1")
+	logPath := filepath.Join(exeDir, "restart_service.log")
 
 	// PowerShell script content:
 	// - Logs all actions for debugging
@@ -344,6 +346,16 @@ exit 1
 
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
 		return fmt.Errorf("failed to write restart script: %w", err)
+	}
+
+	// Pre-create the log file from Go (running as SYSTEM) so the file inherits
+	// proper ACLs. Without this, PowerShell can't create new files in Program Files
+	// even when spawned by a SYSTEM-level service.
+	seedEntry := fmt.Sprintf("%s - [Go] Restart initiated, spawning PowerShell script\n",
+		time.Now().Format("2006-01-02 15:04:05"))
+	if err := os.WriteFile(logPath, []byte(seedEntry), 0644); err != nil {
+		log.WithError(err).Warn("Failed to pre-create restart log file")
+		// Non-fatal — the script will still try to restart the service even without logging
 	}
 
 	log.WithField("script", scriptPath).Info("Spawning restart process")

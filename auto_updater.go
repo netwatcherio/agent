@@ -100,12 +100,6 @@ func (u *AutoUpdater) checkForUpdate() {
 		return
 	}
 
-	// Skip drafts and prereleases
-	if latestRelease.Draft || latestRelease.Prerelease {
-		log.WithField("version", latestRelease.TagName).Debug("Skipping draft/prerelease")
-		return
-	}
-
 	// Compare versions
 	if !u.isNewerVersion(latestRelease.TagName, u.config.CurrentVersion) {
 		log.WithFields(log.Fields{
@@ -147,9 +141,12 @@ func (u *AutoUpdater) checkForUpdate() {
 	u.restart()
 }
 
-// getLatestRelease fetches the latest release from GitHub
+// getLatestRelease fetches the latest release from GitHub.
+// Uses the /releases list endpoint (sorted by published date, newest first)
+// instead of /releases/latest which sorts by creation date and can return
+// stale results when drafts are created out of order.
 func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", u.config.Repository)
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=5", u.config.Repository)
 	if u.config.UpdateURL != "" {
 		url = u.config.UpdateURL
 	}
@@ -163,6 +160,8 @@ func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
 		req.Header.Set("Authorization", "token "+u.config.GitHubToken)
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	// Prevent cached/stale responses from GitHub's CDN
+	req.Header.Set("Cache-Control", "no-cache")
 
 	resp, err := u.client.Do(req)
 	if err != nil {
@@ -174,12 +173,19 @@ func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
 		return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
 	}
 
-	var release GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	var releases []GitHubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
 		return nil, err
 	}
 
-	return &release, nil
+	// Find the first non-draft, non-prerelease release (already sorted newest first)
+	for i := range releases {
+		if !releases[i].Draft && !releases[i].Prerelease {
+			return &releases[i], nil
+		}
+	}
+
+	return nil, nil
 }
 
 // isNewerVersion checks if the new version is newer than current
@@ -357,14 +363,14 @@ func (u *AutoUpdater) downloadAndApplyUpdate(downloadURL, filename, expectedChec
 		return fmt.Errorf("download failed with status %d", resp.StatusCode)
 	}
 
-	// Create local tmp directory next to executable (avoids read-only /tmp issues)
+	// Create local update directory next to executable (avoids read-only /tmp issues)
 	execPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
-	localTmpDir := filepath.Join(filepath.Dir(execPath), ".tmp")
+	localTmpDir := filepath.Join(filepath.Dir(execPath), ".update")
 	if err := os.MkdirAll(localTmpDir, 0755); err != nil {
-		return fmt.Errorf("failed to create local tmp directory: %w", err)
+		return fmt.Errorf("failed to create update directory: %w", err)
 	}
 
 	tempFile, err := os.CreateTemp(localTmpDir, "netwatcher-update-*")
@@ -459,14 +465,14 @@ func (u *AutoUpdater) extractTarGz(archivePath string) (string, error) {
 
 	tr := tar.NewReader(gzr)
 
-	// Use local tmp directory next to executable
+	// Use local update directory next to executable
 	execPath, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("failed to get executable path: %w", err)
 	}
-	localTmpDir := filepath.Join(filepath.Dir(execPath), ".tmp")
+	localTmpDir := filepath.Join(filepath.Dir(execPath), ".update")
 	if err := os.MkdirAll(localTmpDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create local tmp directory: %w", err)
+		return "", fmt.Errorf("failed to create update directory: %w", err)
 	}
 
 	tempDir, err := os.MkdirTemp(localTmpDir, "extract-*")
@@ -514,14 +520,14 @@ func (u *AutoUpdater) extractZip(archivePath string) (string, error) {
 	}
 	defer r.Close()
 
-	// Use local tmp directory next to executable
+	// Use local update directory next to executable
 	execPath, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("failed to get executable path: %w", err)
 	}
-	localTmpDir := filepath.Join(filepath.Dir(execPath), ".tmp")
+	localTmpDir := filepath.Join(filepath.Dir(execPath), ".update")
 	if err := os.MkdirAll(localTmpDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create local tmp directory: %w", err)
+		return "", fmt.Errorf("failed to create update directory: %w", err)
 	}
 
 	tempDir, err := os.MkdirTemp(localTmpDir, "extract-*")
