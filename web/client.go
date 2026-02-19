@@ -592,6 +592,18 @@ func isDialError410(err error) bool {
 	return strings.Contains(errStr, "410") || strings.Contains(errStr, "agent_deleted")
 }
 
+// isDialErrorAuthRejected checks if a WebSocket dial error indicates authentication was rejected.
+// This happens when the PSK was invalidated (e.g., agent regenerated or credentials rotated).
+func isDialErrorAuthRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "unauthorized") ||
+		strings.Contains(errStr, "invalid psk") ||
+		strings.Contains(errStr, "401")
+}
+
 func (c *WSClient) ConnectWithRetry(parent context.Context) {
 	// Check if already deactivated — don't reconnect
 	c.mu.Lock()
@@ -638,6 +650,8 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 
 	delay := 1 * time.Second
 	maxDelay := 2 * time.Minute
+	consecutiveAuthFailures := 0
+	const maxAuthFailuresBeforeDeactivate = 3 // PSK invalidated if auth fails repeatedly
 
 	for {
 		// Check deactivation flag before each attempt
@@ -668,6 +682,21 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 				log.Warnf("WS: Controller returned 410 Gone — agent has been deleted")
 				c.markDeactivated("deleted_reconnect")
 				return
+			}
+
+			// Check for auth rejection — PSK was invalidated (regenerated/rotated)
+			if isDialErrorAuthRejected(err) {
+				consecutiveAuthFailures++
+				log.Warnf("WS: Authentication rejected (%d/%d): %v", consecutiveAuthFailures, maxAuthFailuresBeforeDeactivate, err)
+
+				if consecutiveAuthFailures >= maxAuthFailuresBeforeDeactivate {
+					log.Warnf("WS: PSK permanently rejected after %d attempts — agent credentials were invalidated", consecutiveAuthFailures)
+					c.markDeactivated("psk_invalidated")
+					return
+				}
+			} else {
+				// Reset auth failure counter on non-auth errors (network issues, etc.)
+				consecutiveAuthFailures = 0
 			}
 
 			log.Errorf("WS dial error: %v (retry in %s)", err, delay)
