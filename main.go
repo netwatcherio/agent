@@ -53,6 +53,9 @@ func mustParseUintEnv(name string) uint {
 }
 
 func main() {
+	// Handle --version/-v before anything else (before flag.Parse which would reject unknown flags)
+	handleVersionFlag()
+
 	fmt.Printf("Starting NetWatcher Agent - Version: %s...\n", VERSION)
 
 	// ---------- CLI flags ----------
@@ -60,18 +63,19 @@ func main() {
 	flag.BoolVar(&disableUpdater, "no-update", false, "Disable auto-updater")
 	flag.Parse()
 
+	// ---------- File Logging ----------
+	// Set up rotating file logging beside the executable (all platforms).
+	// On Linux, stdout is also kept for systemd journal / launchd capture.
+	// On Windows service mode, stdout doesn't work so file logging is essential.
+	cleanup, err := platform.SetupServiceLogging()
+	if err != nil {
+		fmt.Printf("Warning: Failed to setup file logging: %v\n", err)
+	} else {
+		defer cleanup()
+	}
+
 	// Check if running as Windows service
 	if platform.IsRunningAsService() {
-		// Set up file logging for Windows service mode
-		// (stdout doesn't work for Windows services)
-		cleanup, err := platform.SetupServiceLogging()
-		if err != nil {
-			// Fall back to stdout if logging setup fails
-			fmt.Printf("Warning: Failed to setup service logging: %v\n", err)
-		} else {
-			defer cleanup()
-		}
-
 		log.Info("Running as Windows service")
 		if err := platform.RunService("NetWatcherAgent", runAgent); err != nil {
 			log.Fatalf("Service error: %v", err)

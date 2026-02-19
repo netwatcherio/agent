@@ -260,15 +260,21 @@ get_latest_version() {
 
     log_info "Fetching latest release information..."
 
-    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local response=$(curl -s "$api_url")
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=5"
+    local response=$(curl -s -H "Cache-Control: no-cache" "$api_url")
 
     if [[ $? -ne 0 ]]; then
         log_error "Failed to fetch release information from GitHub"
         exit 1
     fi
 
-    VERSION=$(echo "$response" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+    # Extract tag_name from the first non-draft, non-prerelease release
+    if command -v jq > /dev/null 2>&1; then
+        VERSION=$(echo "$response" | jq -r '[.[] | select(.draft == false and .prerelease == false)][0].tag_name' 2>/dev/null)
+    else
+        # Fallback: grab the first tag_name from the response
+        VERSION=$(echo "$response" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
 
     if [[ -z "$VERSION" ]]; then
         log_error "Could not determine latest version"
@@ -484,7 +490,7 @@ download_and_install() {
 
     # Look for common variations of the binary name (excluding backup)
     for name in "netwatcher-agent" "netwatcher" "agent"; do
-        local candidate=$(find "$INSTALL_DIR" -name "$name" -type f 2>/dev/null | grep -v '\.backup$' | head -1)
+        local candidate=$(find "$INSTALL_DIR" -maxdepth 1 -name "$name" -type f 2>/dev/null | grep -v '\.backup' | head -1)
         if [[ -n "$candidate" ]]; then
             found_binary="$candidate"
             log_debug "Found binary: $candidate"
@@ -494,7 +500,7 @@ download_and_install() {
 
     # If still not found, look for any file containing "netwatcher" that's not a backup
     if [[ -z "$found_binary" ]]; then
-        found_binary=$(find "$INSTALL_DIR" -type f -name "*netwatcher*" 2>/dev/null | grep -v '\.backup$' | grep -v '\.conf$' | grep -v '\.json$' | head -1)
+        found_binary=$(find "$INSTALL_DIR" -maxdepth 1 -type f -name "*netwatcher*" 2>/dev/null | grep -v '\.backup' | grep -v '\.conf$' | grep -v '\.json$' | grep -v '\.log' | head -1)
         if [[ -n "$found_binary" ]]; then
             log_debug "Found netwatcher file: $found_binary"
         fi
@@ -792,7 +798,11 @@ update_agent() {
     # Get current version if possible
     local current_version=""
     if [[ -x "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
-        current_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || echo "unknown")
+        # Try --version flag first (added in v20260219+), fall back to strings for older binaries
+        current_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1)
+        if [[ -z "$current_version" ]]; then
+            current_version=$(strings "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1 || echo "unknown")
+        fi
         log_info "Current version: $current_version"
     fi
 
@@ -817,7 +827,10 @@ update_agent() {
 
     # Verify new binary works
     if [[ -x "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
-        local new_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || echo "unknown")
+        local new_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1)
+        if [[ -z "$new_version" ]]; then
+            new_version=$(strings "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1 || echo "unknown")
+        fi
         log_success "New version installed: $new_version"
         
         # Remove backup
