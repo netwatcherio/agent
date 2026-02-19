@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	"github.com/netwatcherio/netwatcher-agent/lib/platform"
 	"github.com/netwatcherio/netwatcher-agent/probes"
@@ -61,6 +62,16 @@ func main() {
 
 	// Check if running as Windows service
 	if platform.IsRunningAsService() {
+		// Set up file logging for Windows service mode
+		// (stdout doesn't work for Windows services)
+		cleanup, err := platform.SetupServiceLogging()
+		if err != nil {
+			// Fall back to stdout if logging setup fails
+			fmt.Printf("Warning: Failed to setup service logging: %v\n", err)
+		} else {
+			defer cleanup()
+		}
+
 		log.Info("Running as Windows service")
 		if err := platform.RunService("NetWatcherAgent", runAgent); err != nil {
 			log.Fatalf("Service error: %v", err)
@@ -91,20 +102,6 @@ func main() {
 func runAgent(ctx context.Context) error {
 	loadConfig(configPath)
 
-	// ---------- Deactivation check ----------
-	// If a DEACTIVATED marker file exists, refuse to start.
-	// This prevents restart loops when the agent was deleted from the controller.
-	exePath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to get executable path: %w", err)
-	}
-	markerPath := filepath.Join(filepath.Dir(exePath), "DEACTIVATED")
-	if _, err := os.Stat(markerPath); err == nil {
-		log.Warnf("DEACTIVATED marker found at %s — agent was previously deleted from controller", markerPath)
-		log.Warn("Refusing to start. Remove the DEACTIVATED file to re-enable, or uninstall the agent.")
-		return fmt.Errorf("agent deactivated: remove %s to re-enable", markerPath)
-	}
-
 	// ---------- Dependencies ----------
 	if err := downloadTrippyDependency(); err != nil {
 		return fmt.Errorf("failed to download dependency: %w", err)
@@ -126,7 +123,7 @@ func runAgent(ctx context.Context) error {
 
 	// ---------- Wire websocket handler ----------
 	probeGetCh := make(chan []probes.Probe)
-	probeDataCh := make(chan probes.ProbeData)
+	probeDataCh := make(chan probes.ProbeData, 2048)
 	speedtestQueueCh := make(chan []probes.SpeedtestQueueItem)
 
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
@@ -136,6 +133,10 @@ func runAgent(ctx context.Context) error {
 
 	// Get auth file path relative to executable (not working directory)
 	// This is critical for Windows services which run from System32
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %w", err)
+	}
 	authFilePath := filepath.Join(filepath.Dir(exePath), web.AuthFileName)
 
 	// 1) Login and persist exact JSON
@@ -147,11 +148,12 @@ func runAgent(ctx context.Context) error {
 		loginResp, err := web.DoLogin(webCtx, cfg)
 		cancel()
 		if err != nil {
-			// If the controller says agent was deleted, trigger self-uninstall and exit
+			// Check if agent was deleted - clean up and exit gracefully
 			if errors.Is(err, web.ErrAgentDeleted) {
-				log.Warn("Agent has been deleted from the controller — initiating self-uninstall")
-				web.SelfUninstall("deleted_at_login")
-				return fmt.Errorf("agent deleted by controller")
+				log.Warn("Agent has been deleted from workspace - cannot authenticate")
+				log.Info("Cleaning up and exiting...")
+				_ = web.DeleteAuthFile()
+				return nil // Exit gracefully, not an error
 			}
 			return fmt.Errorf("login error: %v (server said: %s)", err, web.SafeErr(loginResp))
 		}
@@ -193,13 +195,18 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("no PSK available after login; cannot open websocket")
 	}
 
-	// 2) Create a cancellable context for the agent lifecycle
-	// This allows deactivation signals to stop all goroutines cleanly.
-	agentCtx, agentCancel := context.WithCancel(ctx)
-	defer agentCancel()
+	// 2) WS client with gobwas + headers
+	deactivateCh := make(chan string, 1) // Channel for deactivation signals
 
-	// 3) WS client with gobwas + headers
-	deactivateCh := make(chan string, 1)
+	// Watchdog: track last successful activity
+	var lastSuccessfulActivity = time.Now()
+	var activityMu sync.Mutex
+	updateActivity := func() {
+		activityMu.Lock()
+		lastSuccessfulActivity = time.Now()
+		activityMu.Unlock()
+	}
+
 	wsClient := &web.WSClient{
 		URL:              cfg.WSURL,       // e.g. ws://host:8080/ws
 		WorkspaceID:      cfg.WorkspaceID, // header: X-Workspace-ID
@@ -207,16 +214,55 @@ func runAgent(ctx context.Context) error {
 		PSK:              psk,             // header: X-Agent-PSK
 		ProbeGetCh:       probeGetCh,
 		SpeedtestQueueCh: speedtestQueueCh,
+		DeactivateCh:     deactivateCh, // For receiving deactivation signals
 		AgentVersion:     VERSION,
-		DeactivateCh:     deactivateCh,
-		CancelFunc:       agentCancel,
+	}
+
+	// Set reconnect callback after wsClient is created (avoids closure reference issue)
+	wsClient.OnReconnect = func() {
+		queueSize := workers.GetRetryQueue().Size()
+		log.Infof("OnReconnect: retry queue has %d items", queueSize)
+
+		// Brief delay to ensure connection is stable before flushing
+		time.Sleep(500 * time.Millisecond)
+
+		if queueSize > 0 {
+			sent := workers.FlushRetryQueue(wsClient)
+			log.Infof("OnReconnect: flushed %d/%d queued items", sent, queueSize)
+		}
+		updateActivity()
 	}
 
 	// If your workers expect a uint agent ID now:
+	workers.SetControllerConfig(cfg.ControllerHost, cfg.SSL, cfg.WorkspaceID, cfg.AgentID, psk)
 	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
 	workers.ProbeDataWorker(wsClient, probeDataCh)
 
-	go wsClient.ConnectWithRetry(agentCtx)
+	go wsClient.ConnectWithRetry(ctx)
+
+	// Watchdog: restart if no activity for 10 minutes
+	const watchdogTimeout = 10 * time.Minute
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				activityMu.Lock()
+				elapsed := time.Since(lastSuccessfulActivity)
+				activityMu.Unlock()
+
+				log.Debugf("Watchdog: last activity %v ago", elapsed.Round(time.Second))
+
+				if elapsed > watchdogTimeout {
+					log.Errorf("Watchdog: no successful activity for %v, forcing restart", elapsed.Round(time.Second))
+					os.Exit(1) // systemd/SCM will restart us
+				}
+			}
+		}
+	}()
 
 	go func(ws *web.WSClient, ctx context.Context) {
 		for {
@@ -226,12 +272,14 @@ func runAgent(ctx context.Context) error {
 			default:
 				time.Sleep(time.Minute * 1)
 				log.Debug("Getting probes again...")
-				if ws.WsConn != nil && !ws.Deactivated {
-					ws.WsConn.Emit("probe_get", []byte("please"))
+				if ws.IsConnected() {
+					if ok := ws.WsConn.Emit("probe_get", []byte("please")); ok {
+						updateActivity()
+					}
 				}
 			}
 		}
-	}(wsClient, agentCtx)
+	}(wsClient, ctx)
 
 	// Speedtest queue worker: poll and process queue
 	go func(ws *web.WSClient, queueCh chan []probes.SpeedtestQueueItem, ctx context.Context) {
@@ -245,9 +293,11 @@ func runAgent(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				// Poll for new speedtest queue items
-				if ws.WsConn != nil {
+				if ws.IsConnected() {
 					log.Debug("Polling for speedtest queue...")
-					ws.WsConn.Emit("speedtest_queue_get", []byte("{}"))
+					if ok := ws.WsConn.Emit("speedtest_queue_get", []byte("{}")); ok {
+						updateActivity()
+					}
 				}
 			case items := <-queueCh:
 				// Process each queue item
@@ -258,44 +308,35 @@ func runAgent(ctx context.Context) error {
 					result := probes.RunSpeedtestForQueue(item)
 
 					// Send result back to controller
-					if ws.WsConn != nil {
+					if ws.IsConnected() {
 						data, _ := json.Marshal(result)
 						if ok := ws.WsConn.Emit("speedtest_result", data); !ok {
 							log.Warn("WS: emit speedtest_result returned false")
 						} else {
 							log.Infof("Sent speedtest result for queue item %d", item.ID)
+							updateActivity()
 						}
 					}
 				}
 			}
 		}
-	}(wsClient, speedtestQueueCh, agentCtx)
+	}(wsClient, speedtestQueueCh, ctx)
 
-	// ---------- Deactivation listener ----------
-	// Listens for deactivation signals from the WebSocket client.
-	// When received, triggers self-uninstall and exits.
-	go func() {
-		select {
-		case reason := <-deactivateCh:
-			log.Warnf("Deactivation signal received (reason: %s) — initiating self-uninstall", reason)
-			web.SelfUninstall(reason)
-		case <-agentCtx.Done():
-			return
+	// Wait for context cancellation (shutdown signal) or deactivation
+	select {
+	case <-ctx.Done():
+		log.Info("shutting down")
+	case reason := <-deactivateCh:
+		log.Warnf("Agent deactivated (reason: %s) - cleaning up and exiting", reason)
+		// Delete auth file to prevent future reconnection attempts
+		if err := web.DeleteAuthFile(); err != nil {
+			log.Warnf("Failed to delete auth file: %v", err)
 		}
-	}()
-
-	// Wait for context cancellation (shutdown signal)
-	<-agentCtx.Done()
-	log.Info("shutting down")
+		log.Info("Agent will not attempt to reconnect. To reinstall, obtain a new PIN from the panel.")
+	}
 
 	// Give goroutines a moment to clean up
 	time.Sleep(500 * time.Millisecond)
-
-	// If we were deactivated, exit with specific code
-	if wsClient.Deactivated {
-		log.Warn("Agent was deactivated — exiting with code 2 to signal service managers not to restart")
-		os.Exit(2)
-	}
 
 	return nil
 }
