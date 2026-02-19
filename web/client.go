@@ -8,10 +8,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/kataras/iris/v12/websocket"
@@ -21,6 +22,10 @@ import (
 	"github.com/kataras/neffos/gobwas"
 	log "github.com/sirupsen/logrus"
 )
+
+// ErrAgentDeleted is returned when the controller returns 410 Gone,
+// indicating this agent has been permanently deleted from the workspace.
+var ErrAgentDeleted = errors.New("agent has been deleted from controller")
 
 /*
 ENV VARS:
@@ -43,11 +48,7 @@ const (
 	namespace             = "agent"
 	dialAndConnectTimeout = 5 * time.Second
 	AuthFileName          = "agent_auth.json"
-	heartbeatInterval     = 30 * time.Second // WebSocket keepalive interval
 )
-
-// ErrAgentDeleted indicates the agent was deleted from the panel and should deactivate
-var ErrAgentDeleted = errors.New("agent has been deleted from workspace")
 
 type Agent struct {
 	ID        uint      `gorm:"primaryKey;autoIncrement" json:"id"`
@@ -78,7 +79,7 @@ type Agent struct {
 }
 
 type LoginResponse struct {
-	Status string `json:"status"`          // "ok" | "bootstrapped"
+	Status string `json:"status"`          // "ok" | "bootstrapped" | "deleted"
 	PSK    string `json:"psk,omitempty"`   // only on bootstrap
 	Agent  Agent  `json:"agent,omitempty"` // convenience
 	Error  string `json:"error,omitempty"` // on failure
@@ -212,8 +213,11 @@ func DoLogin(ctx context.Context, cfg Config) (*LoginResponse, error) {
 		return nil, fmt.Errorf("login decode: %w\n%s", err, raw)
 	}
 
-	// Check for 410 Gone - agent was deleted from panel
+	// 410 Gone means the agent was deleted from the controller.
+	// Remove local auth and return a specific error so the caller can self-uninstall.
 	if resp.StatusCode == http.StatusGone {
+		log.Warnf("Controller returned 410 Gone — agent has been deleted (status=%s)", out.Status)
+		RemoveAuthFile()
 		return &out, ErrAgentDeleted
 	}
 
@@ -225,26 +229,6 @@ func DoLogin(ctx context.Context, cfg Config) (*LoginResponse, error) {
 	}
 
 	return &out, nil
-}
-
-// DeleteAuthFile removes the agent authentication file, preventing future reconnection attempts.
-// This should be called when the agent is deactivated/deleted from the panel.
-func DeleteAuthFile() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(exe)
-	authPath := filepath.Join(dir, AuthFileName)
-
-	if err := os.Remove(authPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil // Already deleted, not an error
-		}
-		return fmt.Errorf("failed to delete auth file: %w", err)
-	}
-	log.Infof("Deleted auth file: %s", authPath)
-	return nil
 }
 
 func SaveRawAuthJSON(raw []byte) error {
@@ -266,32 +250,18 @@ type WSClient struct {
 	PSK              string
 	ProbeGetCh       chan []probes.Probe
 	SpeedtestQueueCh chan []probes.SpeedtestQueueItem
-	DeactivateCh     chan string // Receives reason when agent should deactivate
 	WsConn           *neffos.NSConn
 	AgentVersion     string
-
-	// Callback called on successful (re)connection - use for retry queue flushing
-	OnReconnect func()
-
-	// Connection state management (protected by mu)
-	mu              sync.Mutex
-	currentClient   *neffos.Client     // Current active client for cleanup
-	isConnecting    bool               // Prevents overlapping reconnection attempts
-	isReconnecting  bool               // True when we're intentionally reconnecting (prevents OnDisconnect loops)
-	isStable        bool               // True when connection is fully established and usable
-	heartbeatCancel context.CancelFunc // Cancels the heartbeat goroutine
-
 	// Failure tracking for auto-reconnect
 	probeGetFailures    int
 	maxProbeGetFailures int // Max consecutive failures before reconnect (default 5)
-}
+	reconnectInProgress bool
 
-// IsConnected returns true if the WebSocket connection is fully established and stable.
-// Use this instead of checking WsConn != nil to ensure the connection is ready for use.
-func (c *WSClient) IsConnected() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.WsConn != nil && c.isStable && !c.isConnecting
+	// Deactivation state — set when controller signals agent deletion.
+	// Once true, the agent will stop reconnecting and attempt self-uninstall.
+	Deactivated  bool
+	DeactivateCh chan string        // receives the deactivation reason; buffered(1)
+	CancelFunc   context.CancelFunc // cancel function for the parent context
 }
 
 func (c *WSClient) namespaces() neffos.Namespaces {
@@ -330,46 +300,56 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Infof("WS: sent %d speedtest servers to controller", len(servers))
 				}()
 
-				// Mark connection as stable now that namespace is connected
-				c.mu.Lock()
-				c.isStable = true
-				c.mu.Unlock()
-
-				// Trigger reconnect callback (e.g., for flushing retry queue)
-				if c.OnReconnect != nil {
-					go c.OnReconnect()
+				return nil
+			},
+			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {
+				log.Infof("WS: disconnected from namespace [%s]", msg.Namespace)
+				// Do NOT reconnect if the agent has been deactivated
+				if c.Deactivated {
+					log.Warn("WS: agent is deactivated, NOT reconnecting")
+					return nil
 				}
-
+				// Use CancelFunc-aware context if available, otherwise background
+				go c.ConnectWithRetry(context.Background())
 				return nil
 			},
 
-			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Infof("WS: disconnected from namespace [%s]", msg.Namespace)
-
-				// Mark connection as not stable immediately
-				c.mu.Lock()
-				c.isStable = false
-				// Cancel heartbeat if running
-				if c.heartbeatCancel != nil {
-					c.heartbeatCancel()
-					c.heartbeatCancel = nil
+			// ---- Deactivation handler ----
+			// Sent by the controller when an admin deletes this agent from the panel.
+			// The agent should clean up, remove credentials, and attempt self-uninstall.
+			"deactivate": func(ns *neffos.NSConn, msg neffos.Message) error {
+				var deactivateMsg struct {
+					Reason string `json:"reason"`
 				}
-				// Check if this is an intentional disconnection (we're already reconnecting)
-				alreadyReconnecting := c.isReconnecting || c.isConnecting
-				c.mu.Unlock()
-
-				// Don't trigger another reconnection if we're already doing one
-				if alreadyReconnecting {
-					log.Debug("WS: skipping reconnection trigger - already reconnecting")
-					return nil
+				reason := "unknown"
+				if err := json.Unmarshal(msg.Body, &deactivateMsg); err == nil && deactivateMsg.Reason != "" {
+					reason = deactivateMsg.Reason
 				}
 
-				// Delay before triggering reconnection to prevent rapid reconnect cycles
-				// This helps when the backend is replacing connections (e.g., agent restart)
-				go func() {
-					time.Sleep(1 * time.Second)
-					c.ConnectWithRetry(context.Background())
-				}()
+				log.Warnf("===========================================================")
+				log.Warnf("AGENT DEACTIVATED by controller (reason: %s)", reason)
+				log.Warnf("===========================================================")
+
+				// Mark as deactivated to prevent reconnection
+				c.Deactivated = true
+
+				// Remove saved credentials so agent cannot authenticate on restart
+				RemoveAuthFile()
+
+				// Signal the deactivation channel so main.go can react
+				if c.DeactivateCh != nil {
+					select {
+					case c.DeactivateCh <- reason:
+					default:
+						// Channel full or nobody listening; proceed with shutdown anyway
+					}
+				}
+
+				// Cancel the parent context to trigger graceful shutdown
+				if c.CancelFunc != nil {
+					c.CancelFunc()
+				}
+
 				return nil
 			},
 
@@ -387,19 +367,17 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Debugf("WS: probe_get received empty body (%d/%d failures)", c.probeGetFailures, c.maxProbeGetFailures)
 
 					// Trigger reconnect if too many consecutive failures
-					if c.probeGetFailures >= c.maxProbeGetFailures {
-						c.mu.Lock()
-						shouldReconnect := !c.isConnecting
-						c.mu.Unlock()
-
-						if shouldReconnect {
-							log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
-							c.probeGetFailures = 0
-							go func() {
-								time.Sleep(2 * time.Second) // Brief pause before reconnecting
+					if c.probeGetFailures >= c.maxProbeGetFailures && !c.reconnectInProgress {
+						log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
+						c.probeGetFailures = 0
+						c.reconnectInProgress = true
+						go func() {
+							time.Sleep(2 * time.Second) // Brief pause before reconnecting
+							c.reconnectInProgress = false
+							if !c.Deactivated {
 								c.ConnectWithRetry(context.Background())
-							}()
-						}
+							}
+						}()
 					}
 					return nil
 				}
@@ -409,19 +387,17 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 					log.Debugf("WS: probe_get unmarshal error (%d/%d failures): %v", c.probeGetFailures, c.maxProbeGetFailures, err)
 
 					// Trigger reconnect if too many consecutive failures
-					if c.probeGetFailures >= c.maxProbeGetFailures {
-						c.mu.Lock()
-						shouldReconnect := !c.isConnecting
-						c.mu.Unlock()
-
-						if shouldReconnect {
-							log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
-							c.probeGetFailures = 0
-							go func() {
-								time.Sleep(2 * time.Second)
+					if c.probeGetFailures >= c.maxProbeGetFailures && !c.reconnectInProgress {
+						log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
+						c.probeGetFailures = 0
+						c.reconnectInProgress = true
+						go func() {
+							time.Sleep(2 * time.Second)
+							c.reconnectInProgress = false
+							if !c.Deactivated {
 								c.ConnectWithRetry(context.Background())
-							}()
-						}
+							}
+						}()
 					}
 					return nil
 				}
@@ -436,17 +412,6 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 						typeCounts[string(probe.Type)]++
 					}
 					log.Infof("WS: received %d probes: %v", len(p), typeCounts)
-
-					// Debug: dump each probe with ID, type, and target for debugging
-					for _, probe := range p {
-						targetStr := ""
-						if len(probe.Targets) > 0 {
-							targetStr = probe.Targets[0].Target
-						}
-						log.Debugf("WS: probe ID=%d Type=%s Server=%v Target=%s",
-							probe.ID, probe.Type, probe.Server, targetStr)
-					}
-
 					c.ProbeGetCh <- p
 				} else {
 					log.Debugf("WS: received empty probe list")
@@ -474,38 +439,6 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 				log.Debugf("WS: speedtest_result acknowledged")
 				return nil
 			},
-			// Pong handler - received from controller in response to heartbeat ping
-			"pong": func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Debug("WS: heartbeat pong received")
-				return nil
-			},
-
-			// Deactivate handler - received when agent is deleted from panel
-			"deactivate": func(ns *neffos.NSConn, msg neffos.Message) error {
-				var deactivateMsg struct {
-					Reason string `json:"reason"`
-				}
-				_ = json.Unmarshal(msg.Body, &deactivateMsg)
-
-				reason := deactivateMsg.Reason
-				if reason == "" {
-					reason = "deleted"
-				}
-
-				log.Warnf("WS: Received deactivation signal from controller (reason: %s)", reason)
-				log.Warnf("WS: Agent has been removed from workspace - shutting down")
-
-				// Signal deactivation to main loop if channel is set
-				if c.DeactivateCh != nil {
-					select {
-					case c.DeactivateCh <- reason:
-					default:
-						// Channel full or not listening, proceed anyway
-					}
-				}
-
-				return nil
-			},
 		},
 	}
 }
@@ -527,61 +460,46 @@ func (c *WSClient) dialOnce(ctx context.Context) (*neffos.Client, error) {
 }
 
 func (c *WSClient) ConnectWithRetry(parent context.Context) {
-	// Check if already connecting (prevent overlapping reconnection attempts)
-	c.mu.Lock()
-	if c.isConnecting {
-		c.mu.Unlock()
-		log.Debug("WS: reconnection already in progress, skipping")
-		return
-	}
-	c.isConnecting = true
-	c.isReconnecting = true // Mark as intentional reconnection to prevent OnDisconnect loops
-	c.isStable = false      // Mark as not stable during reconnection
-
-	// Cancel any existing heartbeat
-	if c.heartbeatCancel != nil {
-		c.heartbeatCancel()
-		c.heartbeatCancel = nil
-	}
-
-	// Get reference to client to close (we'll close outside the lock to avoid deadlock)
-	clientToClose := c.currentClient
-	c.currentClient = nil
-	c.mu.Unlock()
-
-	// Close outside the lock - Close() may trigger OnNamespaceDisconnect synchronously
-	// which also tries to acquire the mutex, causing deadlock if we hold it
-	if clientToClose != nil {
-		log.Info("WS: closing existing connection before reconnecting")
-		clientToClose.Close()
-	}
-
-	// Ensure we reset flags when we return
-	defer func() {
-		c.mu.Lock()
-		c.isConnecting = false
-		c.isReconnecting = false
-		c.mu.Unlock()
-	}()
-
 	delay := 1 * time.Second
 	maxDelay := 2 * time.Minute
 
 	for {
+		// Check deactivation flag before every attempt
+		if c.Deactivated {
+			log.Warn("WS: agent is deactivated, aborting reconnection")
+			return
+		}
+
 		select {
 		case <-parent.Done():
-			log.Info("WS: ConnectWithRetry exiting - parent context cancelled")
 			return
 		default:
 		}
-
-		log.Debugf("WS: attempting dial to %s", c.URL)
 
 		// Dial
 		ctx, cancel := context.WithTimeout(parent, dialAndConnectTimeout)
 		client, err := c.dialOnce(ctx)
 		cancel()
 		if err != nil {
+			// Check if the dial error indicates agent deletion (410 Gone).
+			// The WebSocket upgrade failure from the server may contain this signal.
+			errStr := err.Error()
+			if strings.Contains(errStr, "410") || strings.Contains(errStr, "agent_deleted") {
+				log.Warnf("WS: server rejected connection — agent has been deleted")
+				c.Deactivated = true
+				RemoveAuthFile()
+				if c.DeactivateCh != nil {
+					select {
+					case c.DeactivateCh <- "deleted_on_reconnect":
+					default:
+					}
+				}
+				if c.CancelFunc != nil {
+					c.CancelFunc()
+				}
+				return
+			}
+
 			log.Errorf("WS dial error: %v (retry in %s)", err, delay)
 			time.Sleep(delay)
 			if delay < maxDelay {
@@ -589,8 +507,6 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 			}
 			continue
 		}
-
-		log.Debug("WS: dial successful, joining namespace")
 
 		// Join namespace
 		ctx2, cancel2 := context.WithTimeout(parent, dialAndConnectTimeout)
@@ -606,52 +522,18 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 			continue
 		}
 
-		// Successfully connected - update state
-		c.mu.Lock()
+		// Connected: hold until parent cancels
 		c.WsConn = ns
-		c.currentClient = client
-		c.isConnecting = false  // Mark as connected, not connecting
 		delay = 1 * time.Second // reset backoff
 
-		// Start heartbeat goroutine
-		heartbeatCtx, heartbeatCancelFunc := context.WithCancel(context.Background())
-		c.heartbeatCancel = heartbeatCancelFunc
-		c.mu.Unlock()
+		<-parent.Done()
 
-		go c.startHeartbeat(heartbeatCtx, ns)
-
-		log.Info("WS: successfully connected and heartbeat started")
-
-		// Return after successful connection - the connection will be maintained
-		// by the neffos library. If disconnected, OnNamespaceDisconnect will trigger reconnection.
-		return
-	}
-}
-
-// startHeartbeat sends periodic ping messages to keep the WebSocket connection alive
-// and verify the connection is still functional.
-func (c *WSClient) startHeartbeat(ctx context.Context, ns *neffos.NSConn) {
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Debug("WS: heartbeat stopped")
+		client.Close()
+		err = ns.Disconnect(ctx)
+		if err != nil {
 			return
-		case <-ticker.C:
-			if ns == nil {
-				log.Debug("WS: heartbeat skipped - no connection")
-				continue
-			}
-			if ok := ns.Emit("ping", []byte(`{"ts":"`+time.Now().Format(time.RFC3339)+`"}`)); !ok {
-				log.Warn("WS: heartbeat ping failed, connection may be stale")
-				// Don't trigger reconnection here - let the connection timeout naturally
-				// The OnNamespaceDisconnect handler will handle reconnection
-			} else {
-				log.Debug("WS: heartbeat ping sent")
-			}
 		}
+		return
 	}
 }
 
@@ -707,4 +589,100 @@ func SafeErr(r *LoginResponse) string {
 		return ""
 	}
 	return r.Error
+}
+
+// RemoveAuthFile deletes the saved agent_auth.json credential file.
+// Called during deactivation to prevent the agent from re-authenticating after restart.
+func RemoveAuthFile() {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Warnf("Cannot determine executable path for auth file removal: %v", err)
+		return
+	}
+	authPath := filepath.Join(filepath.Dir(exe), AuthFileName)
+	if err := os.Remove(authPath); err != nil && !os.IsNotExist(err) {
+		log.Warnf("Failed to remove auth file %s: %v", authPath, err)
+	} else {
+		log.Infof("Removed auth file: %s", authPath)
+	}
+}
+
+// WriteDeactivatedMarker writes a marker file next to the binary indicating
+// the agent was deactivated. The install scripts or startup logic can check
+// for this file to prevent restart loops.
+func WriteDeactivatedMarker(reason string) {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Warnf("Cannot determine executable path for deactivation marker: %v", err)
+		return
+	}
+	markerPath := filepath.Join(filepath.Dir(exe), "DEACTIVATED")
+	content := fmt.Sprintf("Agent deactivated at %s\nReason: %s\n", time.Now().Format(time.RFC3339), reason)
+	if err := os.WriteFile(markerPath, []byte(content), 0644); err != nil {
+		log.Warnf("Failed to write deactivation marker: %v", err)
+	} else {
+		log.Infof("Wrote deactivation marker: %s", markerPath)
+	}
+}
+
+// SelfUninstall performs platform-specific cleanup to decommission the agent.
+// It directly stops/removes the system service and cleans up files — no external
+// install scripts are required.
+//
+// Service names and paths match the conventions from install.sh / install.ps1:
+//   - Linux:   systemd service "netwatcher-agent", install dir /opt/netwatcher-agent
+//   - Windows: sc service "NetWatcherAgent", install dir determined from executable path
+func SelfUninstall(reason string) {
+	log.Warnf("Performing self-uninstall (reason: %s)", reason)
+
+	// Remove credentials and write marker first — even if service cleanup fails,
+	// the marker prevents restart loops.
+	RemoveAuthFile()
+	WriteDeactivatedMarker(reason)
+
+	switch runtime.GOOS {
+	case "linux", "darwin":
+		// 1) Stop the systemd service
+		log.Info("[uninstall] Stopping netwatcher-agent service...")
+		if out, err := exec.Command("systemctl", "stop", "netwatcher-agent").CombinedOutput(); err != nil {
+			log.Debugf("[uninstall] systemctl stop: %s (%v)", string(out), err)
+		}
+
+		// 2) Disable so it doesn't start on boot
+		log.Info("[uninstall] Disabling netwatcher-agent service...")
+		if out, err := exec.Command("systemctl", "disable", "netwatcher-agent").CombinedOutput(); err != nil {
+			log.Debugf("[uninstall] systemctl disable: %s (%v)", string(out), err)
+		}
+
+		// 3) Remove the systemd unit file
+		serviceFile := "/etc/systemd/system/netwatcher-agent.service"
+		if err := os.Remove(serviceFile); err != nil && !os.IsNotExist(err) {
+			log.Warnf("[uninstall] Could not remove %s: %v", serviceFile, err)
+		} else {
+			log.Infof("[uninstall] Removed %s", serviceFile)
+		}
+
+		// 4) Reload systemd daemon so it forgets the unit
+		_ = exec.Command("systemctl", "daemon-reload").Run()
+
+		log.Info("[uninstall] Linux service cleanup complete")
+
+	case "windows":
+		// 1) Stop the Windows service
+		log.Info("[uninstall] Stopping NetWatcherAgent service...")
+		if out, err := exec.Command("sc", "stop", "NetWatcherAgent").CombinedOutput(); err != nil {
+			log.Debugf("[uninstall] sc stop: %s (%v)", string(out), err)
+		}
+
+		// 2) Delete the service registration
+		log.Info("[uninstall] Deleting NetWatcherAgent service...")
+		if out, err := exec.Command("sc", "delete", "NetWatcherAgent").CombinedOutput(); err != nil {
+			log.Debugf("[uninstall] sc delete: %s (%v)", string(out), err)
+		}
+
+		log.Info("[uninstall] Windows service cleanup complete")
+
+	default:
+		log.Warnf("[uninstall] Platform %s has no service to remove — credentials cleared and marker written", runtime.GOOS)
+	}
 }
