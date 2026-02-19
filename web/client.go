@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +45,7 @@ const (
 	namespace             = "agent"
 	dialAndConnectTimeout = 5 * time.Second
 	AuthFileName          = "agent_auth.json"
+	DeactivatedFileName   = "DEACTIVATED"
 	heartbeatInterval     = 30 * time.Second // WebSocket keepalive interval
 )
 
@@ -266,7 +269,8 @@ type WSClient struct {
 	PSK              string
 	ProbeGetCh       chan []probes.Probe
 	SpeedtestQueueCh chan []probes.SpeedtestQueueItem
-	DeactivateCh     chan string // Receives reason when agent should deactivate
+	DeactivateCh     chan string        // Receives reason when agent should deactivate
+	CancelFunc       context.CancelFunc // Cancels the agent's main context on deactivation
 	WsConn           *neffos.NSConn
 	AgentVersion     string
 
@@ -279,6 +283,7 @@ type WSClient struct {
 	isConnecting    bool               // Prevents overlapping reconnection attempts
 	isReconnecting  bool               // True when we're intentionally reconnecting (prevents OnDisconnect loops)
 	isStable        bool               // True when connection is fully established and usable
+	deactivated     bool               // True when agent has been deactivated — prevents all reconnection attempts
 	heartbeatCancel context.CancelFunc // Cancels the heartbeat goroutine
 
 	// Failure tracking for auto-reconnect
@@ -291,7 +296,57 @@ type WSClient struct {
 func (c *WSClient) IsConnected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.WsConn != nil && c.isStable && !c.isConnecting
+	return c.WsConn != nil && c.isStable && !c.isConnecting && !c.deactivated
+}
+
+// IsDeactivated returns true if the agent has been deactivated.
+func (c *WSClient) IsDeactivated() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deactivated
+}
+
+// markDeactivated sets the deactivated flag, cancels the context, and cleans up auth.
+// Should be called under the mu lock or idempotently (flag is only set to true).
+func (c *WSClient) markDeactivated(reason string) {
+	c.mu.Lock()
+	alreadyDeactivated := c.deactivated
+	c.deactivated = true
+	c.isStable = false
+	if c.heartbeatCancel != nil {
+		c.heartbeatCancel()
+		c.heartbeatCancel = nil
+	}
+	c.mu.Unlock()
+
+	if alreadyDeactivated {
+		return // Already handled
+	}
+
+	log.Warnf("WS: Agent deactivated (reason: %s) — stopping all reconnection attempts", reason)
+
+	// Delete auth file to prevent future reconnection
+	if err := DeleteAuthFile(); err != nil {
+		log.Warnf("WS: Failed to delete auth file during deactivation: %v", err)
+	}
+
+	// Write marker file to prevent restart loops
+	if err := WriteDeactivatedMarker(reason); err != nil {
+		log.Warnf("WS: Failed to write deactivated marker: %v", err)
+	}
+
+	// Signal deactivation to main loop
+	if c.DeactivateCh != nil {
+		select {
+		case c.DeactivateCh <- reason:
+		default:
+		}
+	}
+
+	// Cancel the agent's main context
+	if c.CancelFunc != nil {
+		c.CancelFunc()
+	}
 }
 
 func (c *WSClient) namespaces() neffos.Namespaces {
@@ -349,6 +404,7 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 				// Mark connection as not stable immediately
 				c.mu.Lock()
 				c.isStable = false
+				isDeactivated := c.deactivated
 				// Cancel heartbeat if running
 				if c.heartbeatCancel != nil {
 					c.heartbeatCancel()
@@ -357,6 +413,12 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 				// Check if this is an intentional disconnection (we're already reconnecting)
 				alreadyReconnecting := c.isReconnecting || c.isConnecting
 				c.mu.Unlock()
+
+				// Don't reconnect if agent has been deactivated
+				if isDeactivated {
+					log.Info("WS: skipping reconnection — agent is deactivated")
+					return nil
+				}
 
 				// Don't trigger another reconnection if we're already doing one
 				if alreadyReconnecting {
@@ -493,16 +555,10 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 				}
 
 				log.Warnf("WS: Received deactivation signal from controller (reason: %s)", reason)
-				log.Warnf("WS: Agent has been removed from workspace - shutting down")
+				log.Warnf("WS: Agent has been removed from workspace — shutting down")
 
-				// Signal deactivation to main loop if channel is set
-				if c.DeactivateCh != nil {
-					select {
-					case c.DeactivateCh <- reason:
-					default:
-						// Channel full or not listening, proceed anyway
-					}
-				}
+				// Mark deactivated — deletes auth, writes marker, signals channel, cancels context
+				c.markDeactivated(reason)
 
 				return nil
 			},
@@ -526,9 +582,25 @@ func (c *WSClient) dialOnce(ctx context.Context) (*neffos.Client, error) {
 	return neffos.Dial(ctx, dialer, c.URL, c.namespaces())
 }
 
+// isDialError410 checks if a WebSocket dial error indicates the agent was deleted (HTTP 410 Gone).
+func isDialError410(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// The neffos/gobwas dialer includes the HTTP status code in the error message
+	return strings.Contains(errStr, "410") || strings.Contains(errStr, "agent_deleted")
+}
+
 func (c *WSClient) ConnectWithRetry(parent context.Context) {
-	// Check if already connecting (prevent overlapping reconnection attempts)
+	// Check if already deactivated — don't reconnect
 	c.mu.Lock()
+	if c.deactivated {
+		c.mu.Unlock()
+		log.Info("WS: ConnectWithRetry skipped — agent is deactivated")
+		return
+	}
+	// Check if already connecting (prevent overlapping reconnection attempts)
 	if c.isConnecting {
 		c.mu.Unlock()
 		log.Debug("WS: reconnection already in progress, skipping")
@@ -568,6 +640,15 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 	maxDelay := 2 * time.Minute
 
 	for {
+		// Check deactivation flag before each attempt
+		c.mu.Lock()
+		if c.deactivated {
+			c.mu.Unlock()
+			log.Info("WS: ConnectWithRetry aborting — agent deactivated during retry loop")
+			return
+		}
+		c.mu.Unlock()
+
 		select {
 		case <-parent.Done():
 			log.Info("WS: ConnectWithRetry exiting - parent context cancelled")
@@ -582,6 +663,13 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		client, err := c.dialOnce(ctx)
 		cancel()
 		if err != nil {
+			// Check for 410 Gone — agent was deleted from the controller
+			if isDialError410(err) {
+				log.Warnf("WS: Controller returned 410 Gone — agent has been deleted")
+				c.markDeactivated("deleted_reconnect")
+				return
+			}
+
 			log.Errorf("WS dial error: %v (retry in %s)", err, delay)
 			time.Sleep(delay)
 			if delay < maxDelay {
@@ -597,6 +685,14 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		ns, err := client.Connect(ctx2, namespace)
 		cancel2()
 		if err != nil {
+			// Check for 410 in namespace join too
+			if isDialError410(err) {
+				log.Warnf("WS: Controller returned 410 Gone during namespace join — agent has been deleted")
+				client.Close()
+				c.markDeactivated("deleted_reconnect")
+				return
+			}
+
 			log.Errorf("WS join namespace error: %v (retry in %s)", err, delay)
 			client.Close()
 			time.Sleep(delay)
@@ -707,4 +803,165 @@ func SafeErr(r *LoginResponse) string {
 		return ""
 	}
 	return r.Error
+}
+
+// -------------------- Deactivation / Uninstall Helpers --------------------
+
+// WriteDeactivatedMarker writes a DEACTIVATED marker file next to the executable.
+// This prevents the agent from starting again after being deleted, even if the
+// service manager restarts the process.
+func WriteDeactivatedMarker(reason string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(exe)
+	markerPath := filepath.Join(dir, DeactivatedFileName)
+
+	content := fmt.Sprintf("Agent deactivated at %s\nReason: %s\n", time.Now().Format(time.RFC3339), reason)
+	if err := os.WriteFile(markerPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write deactivated marker: %w", err)
+	}
+	log.Infof("Wrote deactivated marker: %s", markerPath)
+	return nil
+}
+
+// CheckDeactivatedMarker returns true if the DEACTIVATED marker file exists,
+// indicating the agent was previously deactivated and should not start.
+func CheckDeactivatedMarker() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	dir := filepath.Dir(exe)
+	markerPath := filepath.Join(dir, DeactivatedFileName)
+	_, err = os.Stat(markerPath)
+	return err == nil
+}
+
+// SelfUninstall attempts to remove the agent service and files from the system.
+// This is a best-effort operation — it logs failures but does not return errors
+// because the agent is exiting regardless.
+func SelfUninstall() {
+	log.Warn("Attempting self-uninstall...")
+
+	switch runtime.GOOS {
+	case "linux":
+		selfUninstallLinux()
+	case "darwin":
+		selfUninstallDarwin()
+	case "windows":
+		selfUninstallWindows()
+	default:
+		log.Warnf("Self-uninstall not supported on %s", runtime.GOOS)
+	}
+}
+
+func selfUninstallLinux() {
+	// Try systemd first (most common)
+	log.Info("Attempting systemd service removal...")
+
+	// Disable and stop the service
+	cmd := exec.Command("systemctl", "disable", "--now", "netwatcher-agent")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Warnf("systemctl disable failed (may not be systemd): %v — %s", err, string(out))
+	} else {
+		log.Info("Disabled and stopped netwatcher-agent systemd service")
+	}
+
+	// Remove systemd unit file
+	unitPaths := []string{
+		"/etc/systemd/system/netwatcher-agent.service",
+		"/lib/systemd/system/netwatcher-agent.service",
+	}
+	for _, p := range unitPaths {
+		if err := os.Remove(p); err == nil {
+			log.Infof("Removed systemd unit: %s", p)
+		}
+	}
+
+	// Reload systemd daemon
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+
+	// Try to remove the install directory (typically /opt/netwatcher-agent/)
+	exe, err := os.Executable()
+	if err == nil {
+		installDir := filepath.Dir(exe)
+		// Safety check: only remove if it looks like a netwatcher directory
+		if strings.Contains(installDir, "netwatcher") {
+			log.Infof("Removing install directory: %s", installDir)
+			if err := os.RemoveAll(installDir); err != nil {
+				log.Warnf("Failed to remove install directory: %v", err)
+			}
+		}
+	}
+
+	log.Info("Linux self-uninstall complete")
+}
+
+func selfUninstallDarwin() {
+	// macOS uses launchd
+	log.Info("Attempting launchd service removal...")
+
+	serviceName := "io.netwatcher.agent"
+
+	// Unload the launchd service
+	cmd := exec.Command("launchctl", "unload", "-w",
+		fmt.Sprintf("/Library/LaunchDaemons/%s.plist", serviceName))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Warnf("launchctl unload failed: %v — %s", err, string(out))
+	} else {
+		log.Info("Unloaded launchd service")
+	}
+
+	// Remove plist file
+	plistPath := fmt.Sprintf("/Library/LaunchDaemons/%s.plist", serviceName)
+	if err := os.Remove(plistPath); err == nil {
+		log.Infof("Removed plist: %s", plistPath)
+	}
+
+	// Try to remove the install directory
+	exe, err := os.Executable()
+	if err == nil {
+		installDir := filepath.Dir(exe)
+		if strings.Contains(installDir, "netwatcher") {
+			log.Infof("Removing install directory: %s", installDir)
+			if err := os.RemoveAll(installDir); err != nil {
+				log.Warnf("Failed to remove install directory: %v", err)
+			}
+		}
+	}
+
+	log.Info("macOS self-uninstall complete")
+}
+
+func selfUninstallWindows() {
+	log.Info("Attempting Windows service removal...")
+
+	serviceName := "NetWatcherAgent"
+
+	// Stop the service first
+	cmd := exec.Command("sc.exe", "stop", serviceName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Warnf("sc stop failed: %v — %s", err, string(out))
+	} else {
+		log.Info("Stopped Windows service")
+	}
+
+	// Brief pause to let the service stop
+	time.Sleep(2 * time.Second)
+
+	// Delete the service
+	cmd = exec.Command("sc.exe", "delete", serviceName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Warnf("sc delete failed: %v — %s", err, string(out))
+	} else {
+		log.Infof("Deleted Windows service: %s", serviceName)
+	}
+
+	// Note: We don't try to remove the binary on Windows while it's running.
+	// The DEACTIVATED marker file will prevent the agent from starting if
+	// the binary is somehow executed again.
+
+	log.Info("Windows self-uninstall complete")
 }

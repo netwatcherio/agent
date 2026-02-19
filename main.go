@@ -100,6 +100,15 @@ func main() {
 // runAgent contains the core agent logic.
 // It is called either directly (console mode) or by the Windows service handler.
 func runAgent(ctx context.Context) error {
+	// ---------- Deactivation Guard ----------
+	// If a DEACTIVATED marker exists, the agent was previously deleted.
+	// Refuse to start to prevent restart loops from service managers.
+	if web.CheckDeactivatedMarker() {
+		log.Warn("DEACTIVATED marker found — agent was previously removed from workspace")
+		log.Warn("To reinstall this agent, delete the DEACTIVATED file and obtain a new PIN from the panel")
+		os.Exit(2)
+	}
+
 	loadConfig(configPath)
 
 	// ---------- Dependencies ----------
@@ -150,10 +159,12 @@ func runAgent(ctx context.Context) error {
 		if err != nil {
 			// Check if agent was deleted - clean up and exit gracefully
 			if errors.Is(err, web.ErrAgentDeleted) {
-				log.Warn("Agent has been deleted from workspace - cannot authenticate")
+				log.Warn("Agent has been deleted from workspace — cannot authenticate")
 				log.Info("Cleaning up and exiting...")
 				_ = web.DeleteAuthFile()
-				return nil // Exit gracefully, not an error
+				_ = web.WriteDeactivatedMarker("deleted_on_login")
+				web.SelfUninstall()
+				os.Exit(2)
 			}
 			return fmt.Errorf("login error: %v (server said: %s)", err, web.SafeErr(loginResp))
 		}
@@ -198,6 +209,10 @@ func runAgent(ctx context.Context) error {
 	// 2) WS client with gobwas + headers
 	deactivateCh := make(chan string, 1) // Channel for deactivation signals
 
+	// Create a child context for the agent that can be cancelled on deactivation
+	agentCtx, agentCancel := context.WithCancel(ctx)
+	defer agentCancel()
+
 	// Watchdog: track last successful activity
 	var lastSuccessfulActivity = time.Now()
 	var activityMu sync.Mutex
@@ -215,6 +230,7 @@ func runAgent(ctx context.Context) error {
 		ProbeGetCh:       probeGetCh,
 		SpeedtestQueueCh: speedtestQueueCh,
 		DeactivateCh:     deactivateCh, // For receiving deactivation signals
+		CancelFunc:       agentCancel,  // Cancel agent context on deactivation
 		AgentVersion:     VERSION,
 	}
 
@@ -238,7 +254,7 @@ func runAgent(ctx context.Context) error {
 	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
 	workers.ProbeDataWorker(wsClient, probeDataCh)
 
-	go wsClient.ConnectWithRetry(ctx)
+	go wsClient.ConnectWithRetry(agentCtx)
 
 	// Watchdog: restart if no activity for 10 minutes
 	const watchdogTimeout = 10 * time.Minute
@@ -279,7 +295,7 @@ func runAgent(ctx context.Context) error {
 				}
 			}
 		}
-	}(wsClient, ctx)
+	}(wsClient, agentCtx)
 
 	// Speedtest queue worker: poll and process queue
 	go func(ws *web.WSClient, queueCh chan []probes.SpeedtestQueueItem, ctx context.Context) {
@@ -320,19 +336,25 @@ func runAgent(ctx context.Context) error {
 				}
 			}
 		}
-	}(wsClient, speedtestQueueCh, ctx)
+	}(wsClient, speedtestQueueCh, agentCtx)
 
 	// Wait for context cancellation (shutdown signal) or deactivation
 	select {
-	case <-ctx.Done():
+	case <-agentCtx.Done():
+		// Check if this was due to deactivation
+		if wsClient.IsDeactivated() {
+			log.Warn("Agent deactivated — performing cleanup and self-uninstall")
+			web.SelfUninstall()
+			time.Sleep(500 * time.Millisecond)
+			os.Exit(2) // Signal to service managers not to restart
+		}
 		log.Info("shutting down")
 	case reason := <-deactivateCh:
-		log.Warnf("Agent deactivated (reason: %s) - cleaning up and exiting", reason)
-		// Delete auth file to prevent future reconnection attempts
-		if err := web.DeleteAuthFile(); err != nil {
-			log.Warnf("Failed to delete auth file: %v", err)
-		}
-		log.Info("Agent will not attempt to reconnect. To reinstall, obtain a new PIN from the panel.")
+		log.Warnf("Agent deactivated (reason: %s) — performing cleanup and self-uninstall", reason)
+		// Auth file and marker already handled by markDeactivated()
+		web.SelfUninstall()
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(2) // Signal to service managers not to restart
 	}
 
 	// Give goroutines a moment to clean up
