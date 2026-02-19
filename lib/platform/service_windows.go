@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows/svc"
@@ -20,9 +21,10 @@ import (
 
 // Windows process creation flags for detaching child processes
 const (
-	CREATE_NEW_PROCESS_GROUP = 0x00000200
-	DETACHED_PROCESS         = 0x00000008
-	CREATE_NO_WINDOW         = 0x08000000
+	CREATE_NEW_PROCESS_GROUP  = 0x00000200
+	DETACHED_PROCESS          = 0x00000008
+	CREATE_NO_WINDOW          = 0x08000000
+	CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 )
 
 // Package-level restart signaling
@@ -354,13 +356,18 @@ exit 1
 		"-ExecutionPolicy", "Bypass",
 		"-File", scriptPath)
 
-	// CRITICAL: Use Windows process creation flags to fully detach the child process
+	// CRITICAL: Use Windows process creation flags to fully detach the child process.
 	// Without these flags, the PowerShell process is killed when the parent service stops
+	// because Windows SCM associates child processes with the service's Job Object.
+	//
 	// - CREATE_NEW_PROCESS_GROUP: Makes the child independent from parent's console group
 	// - DETACHED_PROCESS: The child has no console and is detached from the parent
-	// - CREATE_NO_WINDOW: Prevents any window from appearing (redundant with -WindowStyle Hidden but safer)
+	// - CREATE_NO_WINDOW: Prevents any window from appearing
+	// - CREATE_BREAKAWAY_FROM_JOB: Breaks the child out of the SCM's Job Object so it
+	//   survives the service process exit. Without this, SCM kills all child processes
+	//   when the service stops, regardless of DETACHED_PROCESS.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW,
+		CreationFlags: CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
 	}
 
 	// Ensure no handle inheritance
@@ -369,9 +376,25 @@ exit 1
 	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
-		// Clean up script if we failed to start
-		os.Remove(scriptPath)
-		return fmt.Errorf("failed to start restart process: %w", err)
+		// Direct spawn failed — likely Job Object breakaway is disallowed by Group Policy.
+		// Fall back to scheduling via Windows Task Scheduler which runs outside the
+		// service's Job Object entirely.
+		log.WithError(err).Warn("Direct spawn failed, trying Task Scheduler fallback")
+
+		startTime := time.Now().Add(10 * time.Second).Format("15:04")
+		taskCmd := exec.Command("schtasks.exe",
+			"/Create", "/TN", "NetWatcherRestart",
+			"/TR", fmt.Sprintf(`powershell.exe -ExecutionPolicy Bypass -File "%s"`, scriptPath),
+			"/SC", "ONCE", "/ST", startTime,
+			"/F", "/RL", "HIGHEST")
+
+		if taskErr := taskCmd.Run(); taskErr != nil {
+			os.Remove(scriptPath)
+			return fmt.Errorf("failed to start restart process (direct: %w, schtasks: %v)", err, taskErr)
+		}
+
+		log.WithField("scheduled_time", startTime).Info("Restart scheduled via Task Scheduler as fallback")
+		return nil
 	}
 
 	// Don't wait for the process - it will run after we exit
