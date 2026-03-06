@@ -599,9 +599,29 @@ func isDialErrorAuthRejected(err error) bool {
 		return false
 	}
 	errStr := strings.ToLower(err.Error())
+	// Only match genuine auth rejection — NOT server errors
+	if isDialErrorServerError(err) {
+		return false
+	}
 	return strings.Contains(errStr, "unauthorized") ||
 		strings.Contains(errStr, "invalid psk") ||
 		strings.Contains(errStr, "401")
+}
+
+// isDialErrorServerError checks if a WebSocket dial error indicates a transient server-side problem.
+// These errors mean the backend is having issues (DB down, storage full, overloaded) but the
+// agent's credentials are NOT necessarily invalid. The agent should retry with backoff.
+func isDialErrorServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "502") ||
+		strings.Contains(errStr, "500") ||
+		strings.Contains(errStr, "504") ||
+		strings.Contains(errStr, "server_error") ||
+		strings.Contains(errStr, "service unavailable")
 }
 
 func (c *WSClient) ConnectWithRetry(parent context.Context) {
@@ -651,7 +671,7 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 	delay := 1 * time.Second
 	maxDelay := 2 * time.Minute
 	consecutiveAuthFailures := 0
-	const maxAuthFailuresBeforeDeactivate = 3 // PSK invalidated if auth fails repeatedly
+	const maxAuthFailuresBeforeDeactivate = 10 // Increased from 3 — more runway for transient issues
 
 	for {
 		// Check deactivation flag before each attempt
@@ -684,15 +704,59 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 				return
 			}
 
+			// Check for server errors (503, 500, etc.) — backend is having issues
+			// but our credentials are NOT necessarily invalid. Retry with backoff.
+			if isDialErrorServerError(err) {
+				log.Warnf("WS: Server error (backend may be unavailable): %v (retry in %s)", err, delay)
+				// Do NOT count toward auth failures — this is a transient server issue
+				consecutiveAuthFailures = 0
+				time.Sleep(delay)
+				if delay < maxDelay {
+					delay *= 2
+				}
+				continue
+			}
+
 			// Check for auth rejection — PSK was invalidated (regenerated/rotated)
 			if isDialErrorAuthRejected(err) {
 				consecutiveAuthFailures++
 				log.Warnf("WS: Authentication rejected (%d/%d): %v", consecutiveAuthFailures, maxAuthFailuresBeforeDeactivate, err)
 
 				if consecutiveAuthFailures >= maxAuthFailuresBeforeDeactivate {
-					log.Warnf("WS: PSK permanently rejected after %d attempts — agent credentials were invalidated", consecutiveAuthFailures)
-					c.markDeactivated("psk_invalidated")
-					return
+					// Cooldown: wait 30 minutes and try once more before deactivating.
+					// This gives time for backend recovery (e.g., storage cleanup).
+					log.Warnf("WS: PSK rejected %d times — entering 30-minute cooldown before deactivation", consecutiveAuthFailures)
+					select {
+					case <-parent.Done():
+						log.Info("WS: ConnectWithRetry exiting during cooldown - parent context cancelled")
+						return
+					case <-time.After(30 * time.Minute):
+					}
+
+					// Final attempt after cooldown
+					log.Infof("WS: Cooldown complete — making final auth attempt before deactivation")
+					finalCtx, finalCancel := context.WithTimeout(parent, dialAndConnectTimeout)
+					_, finalErr := c.dialOnce(finalCtx)
+					finalCancel()
+					if finalErr != nil && isDialErrorAuthRejected(finalErr) {
+						log.Warnf("WS: PSK permanently rejected after cooldown — agent credentials were invalidated")
+						c.markDeactivated("psk_invalidated")
+						return
+					} else if finalErr == nil {
+						// Connection succeeded after cooldown! Reset and let the normal flow handle it.
+						log.Infof("WS: Connection succeeded after cooldown — backend recovered")
+						consecutiveAuthFailures = 0
+						// Note: we already dialed successfully but didn't join namespace,
+						// so just reset and continue the loop for a clean connection.
+						delay = 1 * time.Second
+						continue
+					} else {
+						// Non-auth error (network issue, server error) — keep retrying
+						log.Infof("WS: Post-cooldown dial failed with non-auth error: %v — continuing retries", finalErr)
+						consecutiveAuthFailures = 0
+						delay = 1 * time.Second
+						continue
+					}
 				}
 			} else {
 				// Reset auth failure counter on non-auth errors (network issues, etc.)
