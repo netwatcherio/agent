@@ -115,11 +115,6 @@ func runAgent(ctx context.Context) error {
 
 	loadConfig(configPath)
 
-	// ---------- Dependencies ----------
-	if err := downloadTrippyDependency(); err != nil {
-		return fmt.Errorf("failed to download dependency: %w", err)
-	}
-
 	// ---------- Updater ----------
 	if !disableUpdater {
 		updateConfig := &UpdaterConfig{

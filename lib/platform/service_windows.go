@@ -83,6 +83,13 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 				log.WithError(err).Error("Failed to spawn restart process")
 			}
 
+			// Give the spawned PowerShell process time to fully initialize before
+			// we exit. Without this delay, SCM kills all child processes when the
+			// service handler returns, even with CREATE_BREAKAWAY_FROM_JOB,
+			// because PowerShell hasn't finished loading (~1-2s cold start).
+			log.Info("Waiting for restart process to initialize...")
+			time.Sleep(5 * time.Second)
+
 			// Cancel context to stop the agent
 			cancel()
 
@@ -392,24 +399,45 @@ exit 1
 		// Fall back to scheduling via Windows Task Scheduler which runs outside the
 		// service's Job Object entirely.
 		log.WithError(err).Warn("Direct spawn failed, trying Task Scheduler fallback")
-
-		startTime := time.Now().Add(10 * time.Second).Format("15:04")
-		taskCmd := exec.Command("schtasks.exe",
-			"/Create", "/TN", "NetWatcherRestart",
-			"/TR", fmt.Sprintf(`powershell.exe -ExecutionPolicy Bypass -File "%s"`, scriptPath),
-			"/SC", "ONCE", "/ST", startTime,
-			"/F", "/RL", "HIGHEST")
-
-		if taskErr := taskCmd.Run(); taskErr != nil {
-			os.Remove(scriptPath)
-			return fmt.Errorf("failed to start restart process (direct: %w, schtasks: %v)", err, taskErr)
-		}
-
-		log.WithField("scheduled_time", startTime).Info("Restart scheduled via Task Scheduler as fallback")
-		return nil
+		return scheduleRestartViaTaskScheduler(scriptPath)
 	}
 
-	// Don't wait for the process - it will run after we exit
+	// Verify the spawned process is actually alive. On some Windows configurations,
+	// the process can exit immediately due to missing PowerShell, execution policy
+	// issues, or other system restrictions.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		// Process exited immediately — this is abnormal, PowerShell didn't initialize
+		log.WithError(err).Warn("Restart process exited immediately, trying Task Scheduler fallback")
+		return scheduleRestartViaTaskScheduler(scriptPath)
+	case <-time.After(2 * time.Second):
+		// Process still running after 2s — PowerShell has initialized successfully
+		log.Info("Restart process confirmed alive")
+	}
+
 	log.Info("Restart process spawned successfully")
+	return nil
+}
+
+// scheduleRestartViaTaskScheduler uses schtasks.exe to schedule a one-time
+// restart task. This runs outside the service's Job Object entirely, making it
+// immune to SCM process cleanup.
+func scheduleRestartViaTaskScheduler(scriptPath string) error {
+	startTime := time.Now().Add(10 * time.Second).Format("15:04")
+	taskCmd := exec.Command("schtasks.exe",
+		"/Create", "/TN", "NetWatcherRestart",
+		"/TR", fmt.Sprintf(`powershell.exe -ExecutionPolicy Bypass -File "%s"`, scriptPath),
+		"/SC", "ONCE", "/ST", startTime,
+		"/F", "/RL", "HIGHEST")
+
+	if taskErr := taskCmd.Run(); taskErr != nil {
+		os.Remove(scriptPath)
+		return fmt.Errorf("failed to schedule restart via Task Scheduler: %w", taskErr)
+	}
+
+	log.WithField("scheduled_time", startTime).Info("Restart scheduled via Task Scheduler as fallback")
 	return nil
 }

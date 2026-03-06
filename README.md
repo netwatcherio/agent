@@ -4,7 +4,7 @@ A lightweight network monitoring agent that reports metrics to the NetWatcher pl
 
 ## Features
 
-- **MTR Checks** - Traceroute analysis using Trippy
+- **MTR Checks** - Traceroute analysis using NTrace-core
 - **Ping Tests** - ICMP latency monitoring with pro-bing
 - **Traffic Simulation** - Synthetic traffic using rPerf
 - **System Information** - Host metrics and status
@@ -179,7 +179,7 @@ go build -o netwatcher-agent
 
 ## Libraries
 
-- [trippy](https://github.com/fujiapple852/trippy) - MTR/traceroute
+
 - [pro-bing](https://github.com/prometheus-community/pro-bing) - ICMP ping
 - [rperf](https://github.com/opensource-3d-p/rperf) - Traffic simulation
 
