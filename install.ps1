@@ -496,6 +496,13 @@ function Install-Agent {
         Remove-Item -Path $authFile -Force -ErrorAction SilentlyContinue
     }
 
+    # Remove DEACTIVATED marker to allow agent to start after re-registration
+    $deactivatedFile = Join-Path $InstallDir "DEACTIVATED"
+    if (Test-Path $deactivatedFile) {
+        Write-Info "Removing DEACTIVATED marker from previous installation..."
+        Remove-Item -Path $deactivatedFile -Force -ErrorAction SilentlyContinue
+    }
+
     # Create configuration file
     $configPath = Join-Path $InstallDir $Script:ConfigFile
     Write-Info "Creating configuration file: $configPath"

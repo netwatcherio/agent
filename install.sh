@@ -890,6 +890,20 @@ main() {
     stop_existing_service
     get_latest_version
     download_and_install
+
+    # Remove stale auth and deactivation markers to allow fresh authentication
+    local auth_file="${INSTALL_DIR}/agent_auth.json"
+    if [[ -f "$auth_file" ]]; then
+        log_info "Removing stale auth file to force re-authentication..."
+        rm -f "$auth_file"
+    fi
+
+    local deactivated_file="${INSTALL_DIR}/DEACTIVATED"
+    if [[ -f "$deactivated_file" ]]; then
+        log_info "Removing DEACTIVATED marker from previous installation..."
+        rm -f "$deactivated_file"
+    fi
+
     create_config
     create_service
     start_service
