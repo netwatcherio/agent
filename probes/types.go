@@ -6,23 +6,21 @@ import (
 )
 
 type Probe struct {
-	ID          uint      `json:"id"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	WorkspaceId int       `json:"workspace_id"`
-	AgentID     uint      `json:"agent_id"`
-	Type        ProbeType `json:"type"`
-	Enabled     bool      `json:"enabled"`
-	IntervalSec int       `json:"interval_sec"`
-	TimeoutSec  int       `json:"timeout_sec"`
-	Count       int       `json:"count"`
-	DurationSec int       `json:"duration_sec"`
-	Server      bool      `json:"server"`
-	Labels      struct {
-	} `json:"labels"`
-	Metadata struct {
-	} `json:"metadata"`
-	Targets      []ProbeTarget `json:"targets"`
+	ID           uint            `json:"id"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
+	WorkspaceId  int             `json:"workspace_id"`
+	AgentID      uint            `json:"agent_id"`
+	Type         ProbeType       `json:"type"`
+	Enabled      bool            `json:"enabled"`
+	IntervalSec  int             `json:"interval_sec"`
+	TimeoutSec   int             `json:"timeout_sec"`
+	Count        int             `json:"count"`
+	DurationSec  int             `json:"duration_sec"`
+	Server       bool            `json:"server"`
+	Labels       json.RawMessage `json:"labels"`
+	Metadata     json.RawMessage `json:"metadata"`
+	Targets      []ProbeTarget   `json:"targets"`
 	ProbeProcess int
 }
 

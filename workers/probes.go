@@ -233,6 +233,10 @@ func sameAgentSets(set1, set2 map[primitive.ObjectID]bool) bool {
 var (
 	checkWorkers syncmap.Map // Key: probeID_probeType composite key
 
+	// Track running TrafficSim server instance for dynamic allowed agent updates
+	activeTrafficSimServer   *probes.TrafficSim
+	activeTrafficSimServerMu sync.RWMutex
+
 	// Track TrafficSim instances with better synchronization
 	// Note: TrafficSim tracking uses just probe ID (not composite key) since
 	// there can only be one TrafficSim instance per probe ID
@@ -676,36 +680,27 @@ func stopProbeWorker(worker *ProbeWorkerS) {
 }
 
 func updateServerAllowedAgents(probe probes.Probe) {
-	// var allowedAgentsList []primitive.ObjectID todo
-
-	// The issue is here - we need to handle the target list properly
-	// The first target (index 0) contains the server address/port
-	// Subsequent targets contain allowed agent IDs
-
-	// Check if we have allowed agents in the config
-	/*if len(probe.Target) > 1 {
-		// Skip the first target (server address) and collect agent IDs
-		for i := 1; i < len(probe.Target); i++ {
-			target := probe.Target[i]
-			// Only add valid agent IDs
-			if target.Agent != primitive.NilObjectID {
-				allowedAgentsList = append(allowedAgentsList, target.Agent)
+	// Extract allowed agent IDs from the probe targets.
+	// Target[0] is the server address; targets at index 1+ carry AgentIDs.
+	var allowedAgents []uint
+	if len(probe.Targets) > 1 {
+		for i := 1; i < len(probe.Targets); i++ {
+			if probe.Targets[i].AgentID != nil {
+				allowedAgents = append(allowedAgents, *probe.Targets[i].AgentID)
 			}
 		}
-	}*/
+	}
 
-	// If no specific agents are listed, this might mean "allow all"
-	// You may want to handle this case differently based on your requirements
+	activeTrafficSimServerMu.RLock()
+	server := activeTrafficSimServer
+	activeTrafficSimServerMu.RUnlock()
 
-	/*trafficSimServerMutex.Lock()
-	defer trafficSimServerMutex.Unlock()
-
-	if trafficSimServer != nil {
-		updateAllowedAgents(trafficSimServer, allowedAgentsList)
-		log.Infof("Updated allowed agents for server probe %s: %v", probe.ID, allowedAgentsList)
+	if server != nil {
+		server.UpdateAllowedAgents(allowedAgents)
+		log.Infof("[trafficsim] Updated allowed agents for server probe %d: %v", probe.ID, allowedAgents)
 	} else {
-		log.Warnf("Attempted to update allowed agents but server is nil for probe %s", probe.ID)
-	}*/
+		log.Debugf("[trafficsim] Server not running yet, allowed agents will be set on startup")
+	}
 }
 
 func containsKey(keys []string, key string) bool {
@@ -831,6 +826,9 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 				case probes.ProbeType_NETWORKINFO:
 					handleNetworkInfoProbe(probe, dC)
 
+				case probes.ProbeType_DNS:
+					handleDNSProbe(probe, dC)
+
 				case "AGENT":
 					// Agent probe type - skip for now as it's likely metadata
 					log.Debugf("Skipping AGENT probe type for probe %d", probe.ID)
@@ -885,6 +883,11 @@ func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataCha
 		ts.SetAllProbes(allProbes)
 		ts.GetProbesFunc = getCurrentProbes // Dynamic callback for fresh probe list
 		log.Infof("[trafficsim] Server probe %d loaded %d probes for bidirectional detection (dynamic refresh enabled)", probe.ID, len(allProbes))
+
+		// Register the running server instance for dynamic allowed agent updates
+		activeTrafficSimServerMu.Lock()
+		activeTrafficSimServer = ts
+		activeTrafficSimServerMu.Unlock()
 	}
 
 	log.Debugf("[trafficsim] Starting probe %d (server=%v, target=%s:%d)",
@@ -897,6 +900,15 @@ func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataCha
 	<-stopChan
 	log.Infof("[trafficsim] Stopping probe %d", probe.ID)
 	ts.Stop()
+
+	// Unregister server instance on stop
+	if probe.Server {
+		activeTrafficSimServerMu.Lock()
+		if activeTrafficSimServer == ts {
+			activeTrafficSimServer = nil
+		}
+		activeTrafficSimServerMu.Unlock()
+	}
 }
 
 /*func handleTrafficSimServer(probe probes.Probe, thisAgent primitive.ObjectID, ipAddress string, port int, stopChan chan struct{}) {
@@ -1221,6 +1233,34 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 		Payload:   marshal,
 		ProbeID:   probe.ID,
 		CreatedAt: time.Now(),
+	}
+}
+
+func handleDNSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Infof("DNS: Running query for %s", probe.Targets[0].Target)
+
+	interval := probe.IntervalSec
+	if interval < 60 {
+		interval = 60
+	}
+
+	// Ensure we always sleep to prevent tight loops on any error path
+	defer time.Sleep(time.Duration(interval) * time.Second)
+
+	// Run DNS query for each target
+	for _, target := range probe.Targets {
+		if target.Target == "" {
+			continue
+		}
+
+		// Create a copy of the probe with just this target
+		singleTargetProbe := probe
+		singleTargetProbe.Targets = []probes.ProbeTarget{target}
+
+		if err := probes.DNSQuery(&singleTargetProbe, dataChan); err != nil {
+			log.Errorf("DNS error for %s: %v", target.Target, err)
+			// Error payloads are already emitted by DNSQuery, so just log
+		}
 	}
 }
 

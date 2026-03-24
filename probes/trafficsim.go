@@ -108,9 +108,10 @@ type TrafficSim struct {
 	IsServer  bool
 
 	// Server mode: allowed agents
-	AllowedAgents []uint
-	connections   map[uint]*AgentConnection
-	connectionsMu sync.RWMutex
+	AllowedAgents   []uint
+	allowedAgentsMu sync.RWMutex
+	connections     map[uint]*AgentConnection
+	connectionsMu   sync.RWMutex
 
 	// Statistics
 	clientStats  *ClientStats
@@ -259,6 +260,16 @@ func (ts *TrafficSim) SetAllProbes(probes []Probe) {
 	defer ts.allProbesMu.Unlock()
 	ts.allProbes = probes
 	log.Printf("[trafficsim] Server loaded %d probes for bidirectional detection", len(probes))
+}
+
+// UpdateAllowedAgents replaces the allowed agents list on a running server.
+// This is called when the probe reconciliation delivers updated targets.
+func (ts *TrafficSim) UpdateAllowedAgents(agents []uint) {
+	ts.allowedAgentsMu.Lock()
+	defer ts.allowedAgentsMu.Unlock()
+	old := ts.AllowedAgents
+	ts.AllowedAgents = agents
+	log.Printf("[trafficsim] Updated allowed agents: %v -> %v", old, agents)
 }
 
 // GetClientProbeForAgent finds a TRAFFICSIM probe targeting the given agent for bidirectional testing.
@@ -962,6 +973,9 @@ func (ts *TrafficSim) runServer() error {
 }
 
 func (ts *TrafficSim) isAgentAllowed(agentID uint) bool {
+	ts.allowedAgentsMu.RLock()
+	defer ts.allowedAgentsMu.RUnlock()
+
 	// If no allowed list, allow all
 	if len(ts.AllowedAgents) == 0 {
 		return true
