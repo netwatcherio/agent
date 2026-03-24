@@ -1240,8 +1240,8 @@ func handleDNSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 	log.Infof("DNS: Running query for %s", probe.Targets[0].Target)
 
 	interval := probe.IntervalSec
-	if interval < 60 {
-		interval = 60
+	if interval < 30 {
+		interval = 300 // Default: 5 minutes
 	}
 
 	// Ensure we always sleep to prevent tight loops on any error path
