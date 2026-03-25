@@ -4,23 +4,24 @@ A lightweight network monitoring agent that reports metrics to the NetWatcher pl
 
 ## Features
 
-- **MTR Checks** - Traceroute analysis using NTrace-core
+- **MTR Checks** - Traceroute analysis using Trippy
 - **Ping Tests** - ICMP latency monitoring with pro-bing
-- **Traffic Simulation** - Synthetic traffic using rPerf
+- **DNS Monitoring** - DNS resolution time and record validation
+- **Traffic Simulation** - Synthetic UDP traffic between agents
 - **System Information** - Host metrics and status
 - **Network Information** - Interface and connectivity data
-- **Speedtests** - Bandwidth testing (coming soon)
+- **Speedtests** - On-demand bandwidth testing
 - **Auto-Updates** - Automatic version updates from GitHub releases
 
 ## Requirements
 
-- **Platforms**: Linux, macOS, Windows
+- **Platforms**: Linux, Windows
 - **Permissions**: Root/Administrator (required for ICMP and raw sockets)
 - **NetWatcher Controller**: Running instance of [netwatcher-oss](https://github.com/netwatcherio/oss)
 
 ## Quick Start
 
-### Linux / macOS
+### Linux
 
 ```bash
 # Download and run the installer
@@ -45,7 +46,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/netwatcherio/agent/mas
 For self-hosted NetWatcher instances:
 
 ```bash
-# Linux/macOS
+# Linux
 curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install.sh | sudo bash -s -- \
   --host your-controller.example.com \
   --ssl true \
@@ -75,7 +76,7 @@ The agent stores its configuration in `config.conf`:
 
 | Platform | Path |
 |----------|------|
-| Linux/macOS | `/opt/netwatcher-agent/config.conf` |
+| Linux | `/opt/netwatcher-agent/config.conf` |
 | Windows | `C:\Program Files\NetWatcher-Agent\config.conf` |
 
 ## Service Management
@@ -98,7 +99,7 @@ Get-EventLog -LogName Application -Source NetWatcherAgent -Newest 20  # View log
 
 ## Installer Options
 
-### Linux / macOS (`install.sh`)
+### Linux (`install.sh`)
 
 | Flag | Description |
 |------|-------------|
@@ -168,7 +169,7 @@ sudo ./install.sh --uninstall --force
 If the agent's auto-update fails (e.g., read-only `/tmp`, network issues), use the install script to manually update. See [Installer Options](#installer-options) above for all flags.
 
 ```bash
-# Linux/macOS
+# Linux
 sudo ./install.sh --update
 
 # Windows
