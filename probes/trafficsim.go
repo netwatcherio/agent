@@ -1030,31 +1030,26 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		// Check if we have a client probe for this connected agent (enables bidirectional mode)
 		ts.initBidirectional(connection)
 	} else {
-		// Existing connection — detect reconnection scenarios:
-		// 1. Client sent a HELLO (explicit reconnect handshake)
-		// 2. Source IP changed (network change, VPN switch)
-		// 3. Connection went stale (>30s gap between packets)
-		//
-		// NOTE: We compare only the IP, NOT the port. UDP source ports
-		// naturally vary (NAT remapping, multiple sockets from same agent)
-		// and port changes are normal — not a reconnection signal.
-		ipChanged := connection.Addr == nil || connection.Addr.IP.String() != addr.IP.String()
-		staleConnection := time.Since(connection.LastSeen) > 30*time.Second
-		isReconnect := msg.Type == MsgHello || ipChanged || staleConnection
-
-		// Always update the address so reverse DATA goes to the latest addr:port
+		// Existing connection — always update the address so reverse DATA goes
+		// to the latest addr:port. Connection identity is the agent ID (map key),
+		// not the network address. Multiple agents can share an IP behind NAT,
+		// and one agent can have multiple sockets on different ports.
 		connection.Addr = addr
 
+		// Detect reconnection purely by behavioral signals:
+		// 1. Stale HELLO (>30s gap + handshake) = agent restarted or reconnected
+		// 2. Very long silence (>2min) on any packet = connection dropped and resumed
+		staleConnection := time.Since(connection.LastSeen) > 30*time.Second
+		isReconnect := (staleConnection && msg.Type == MsgHello) || time.Since(connection.LastSeen) > 2*time.Minute
+
 		if isReconnect {
-			reason := "HELLO"
-			if ipChanged {
-				reason = fmt.Sprintf("IP changed %s -> %s", connection.Addr.IP, addr.IP)
-			} else if staleConnection {
-				reason = fmt.Sprintf("stale (last seen %v ago)", time.Since(connection.LastSeen).Round(time.Second))
+			reason := "HELLO after gap"
+			if time.Since(connection.LastSeen) > 2*time.Minute {
+				reason = fmt.Sprintf("silence for %v", time.Since(connection.LastSeen).Round(time.Second))
 			}
 			log.Infof("[trafficsim] Agent %d reconnected (%s), resetting connection state", msg.SrcAgent, reason)
 
-			// Reset counters
+			// Reset counters and reverse cycle
 			connection.PacketsRecv = 0
 			connection.PacketsSent = 0
 			connection.ReverseSequence = 0
