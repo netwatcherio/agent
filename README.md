@@ -96,32 +96,83 @@ Restart-Service -Name NetWatcherAgent    # Restart
 Get-EventLog -LogName Application -Source NetWatcherAgent -Newest 20  # View logs
 ```
 
-## Uninstallation
+## Installer Options
+
+### Linux / macOS (`install.sh`)
+
+| Flag | Description |
+|------|-------------|
+| `--workspace`, `-w` | Workspace ID (required for install) |
+| `--id`, `-i` | Agent ID (required for install) |
+| `--pin`, `-p` | Agent PIN (required for install) |
+| `--host` | Controller host (default: `api.netwatcher.io`) |
+| `--ssl` | Use SSL/HTTPS — `true` or `false` (default: `true`) |
+| `--install-dir` | Installation directory (default: `/opt/netwatcher-agent`) |
+| `--version` | Install a specific version tag |
+| `--force` | Force reinstallation or skip uninstall confirmation |
+| `--no-service` | Skip systemd service creation |
+| `--no-start` | Don't start the service after installation |
+| `--update` | Update only the binary (preserves config and service) |
+| `--uninstall` | Uninstall the agent |
+| `--debug` | Enable debug output |
 
 ```bash
-# Linux/macOS
+# Update to latest
+sudo ./install.sh --update
+
+# Update to specific version
+sudo ./install.sh --update --version v20260219-5c692b8
+
+# Uninstall
 sudo ./install.sh --uninstall
 
-# Windows
+# Force uninstall without confirmation
+sudo ./install.sh --uninstall --force
+```
+
+### Windows (`install.ps1`)
+
+| Flag | Description |
+|------|-------------|
+| `-Workspace` | Workspace ID (required for install) |
+| `-Id` | Agent ID (required for install) |
+| `-Pin` | Agent PIN (required for install) |
+| `-ControllerHost` | Controller host (default: `api.netwatcher.io`) |
+| `-SSL` | Use SSL/HTTPS (default: `$true`) |
+| `-InstallDir` | Installation directory (default: `C:\Program Files\NetWatcher-Agent`) |
+| `-Version` | Install a specific version tag |
+| `-Force` | Force reinstallation |
+| `-NoStart` | Don't start the service after installation |
+| `-Update` | Update only the binary (preserves config and service) |
+| `-UpdateVersion` | Specific version to update to (used with `-Update`) |
+| `-Uninstall` | Uninstall the agent |
+
+```powershell
+# Update to latest
+.\install.ps1 -Update
+
+# Update to specific version
+.\install.ps1 -Update -UpdateVersion "v20260219-5c692b8"
+
+# Uninstall
 .\install.ps1 -Uninstall
+
+# Force uninstall without confirmation
+.\install.ps1 -Uninstall -Force
 ```
 
 ## Troubleshooting
 
 ### Failed Auto-Updates
 
-If the agent's auto-update fails (e.g., read-only `/tmp`, network issues), use the install script to manually update:
+If the agent's auto-update fails (e.g., read-only `/tmp`, network issues), use the install script to manually update. See [Installer Options](#installer-options) above for all flags.
 
 ```bash
-# Linux/macOS - Update binary only (preserves config/service)
+# Linux/macOS
 sudo ./install.sh --update
-
-# Update to a specific version
-sudo ./install.sh --update --version v20260114-abc123
 
 # Windows
 .\install.ps1 -Update
-.\install.ps1 -Update -Version "v20260114-abc123"
 ```
 
 ### Manual Binary Replacement
