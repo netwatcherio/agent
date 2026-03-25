@@ -1032,23 +1032,29 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 	} else {
 		// Existing connection — detect reconnection scenarios:
 		// 1. Client sent a HELLO (explicit reconnect handshake)
-		// 2. Source address/port changed (NAT rebind, network change)
+		// 2. Source IP changed (network change, VPN switch)
 		// 3. Connection went stale (>30s gap between packets)
-		addrChanged := connection.Addr == nil || connection.Addr.String() != addr.String()
+		//
+		// NOTE: We compare only the IP, NOT the port. UDP source ports
+		// naturally vary (NAT remapping, multiple sockets from same agent)
+		// and port changes are normal — not a reconnection signal.
+		ipChanged := connection.Addr == nil || connection.Addr.IP.String() != addr.IP.String()
 		staleConnection := time.Since(connection.LastSeen) > 30*time.Second
-		isReconnect := msg.Type == MsgHello || addrChanged || staleConnection
+		isReconnect := msg.Type == MsgHello || ipChanged || staleConnection
+
+		// Always update the address so reverse DATA goes to the latest addr:port
+		connection.Addr = addr
 
 		if isReconnect {
 			reason := "HELLO"
-			if addrChanged {
-				reason = fmt.Sprintf("addr changed %s -> %s", connection.Addr, addr)
+			if ipChanged {
+				reason = fmt.Sprintf("IP changed %s -> %s", connection.Addr.IP, addr.IP)
 			} else if staleConnection {
 				reason = fmt.Sprintf("stale (last seen %v ago)", time.Since(connection.LastSeen).Round(time.Second))
 			}
 			log.Infof("[trafficsim] Agent %d reconnected (%s), resetting connection state", msg.SrcAgent, reason)
 
-			// Update address and reset counters
-			connection.Addr = addr
+			// Reset counters
 			connection.PacketsRecv = 0
 			connection.PacketsSent = 0
 			connection.ReverseSequence = 0
@@ -1056,9 +1062,6 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 
 			// Re-check bidirectional (probes may have changed since first connect)
 			ts.initBidirectional(connection)
-		} else {
-			// Normal ongoing traffic — always update address in case of minor NAT changes
-			connection.Addr = addr
 		}
 	}
 	connection.LastSeen = time.Now()
