@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
@@ -145,11 +144,10 @@ func (u *AutoUpdater) checkForUpdate() {
 }
 
 // getLatestRelease fetches the latest release from GitHub.
-// Uses the /releases list endpoint (sorted by published date, newest first)
-// instead of /releases/latest which sorts by creation date and can return
-// stale results when drafts are created out of order.
+// Uses the /releases/latest endpoint which returns the most recent
+// non-draft, non-prerelease release as shown on the GitHub releases page.
 func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=5", u.config.Repository)
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", u.config.Repository)
 	if u.config.UpdateURL != "" {
 		url = u.config.UpdateURL
 	}
@@ -176,26 +174,12 @@ func (u *AutoUpdater) getLatestRelease() (*GitHubRelease, error) {
 		return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
 	}
 
-	var releases []GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	var release GitHubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return nil, err
 	}
 
-	// Sort by published_at descending — GitHub's default sort uses created_at
-	// which can differ from publish order when releases are drafted/published
-	// out of order, causing the agent to "update" to an older release.
-	sort.Slice(releases, func(i, j int) bool {
-		return releases[i].PublishedAt.After(releases[j].PublishedAt)
-	})
-
-	// Return the most recently published non-draft, non-prerelease release
-	for i := range releases {
-		if !releases[i].Draft && !releases[i].Prerelease {
-			return &releases[i], nil
-		}
-	}
-
-	return nil, nil
+	return &release, nil
 }
 
 // isNewerVersion checks if the new version is actually newer than current.

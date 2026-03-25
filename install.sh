@@ -260,7 +260,7 @@ get_latest_version() {
 
     log_info "Fetching latest release information..."
 
-    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=5"
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
     local response=$(curl -s -H "Cache-Control: no-cache" "$api_url")
 
     if [[ $? -ne 0 ]]; then
@@ -268,11 +268,11 @@ get_latest_version() {
         exit 1
     fi
 
-    # Extract tag_name from the first non-draft, non-prerelease release
+    # Extract tag_name from the latest release
     if command -v jq > /dev/null 2>&1; then
-        VERSION=$(echo "$response" | jq -r '[.[] | select(.draft == false and .prerelease == false)][0].tag_name' 2>/dev/null)
+        VERSION=$(echo "$response" | jq -r '.tag_name' 2>/dev/null)
     else
-        # Fallback: grab the first tag_name from the response
+        # Fallback: grab the tag_name from the response
         VERSION=$(echo "$response" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
 
