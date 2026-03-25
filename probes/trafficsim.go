@@ -272,6 +272,29 @@ func (ts *TrafficSim) UpdateAllowedAgents(agents []uint) {
 	log.Printf("[trafficsim] Updated allowed agents: %v -> %v", old, agents)
 }
 
+// initBidirectional checks if this server has a TRAFFICSIM client probe for the
+// connected agent and, if so, (re)initializes reverse-direction tracking.
+// Must be called with ts.connectionsMu held.
+func (ts *TrafficSim) initBidirectional(connection *AgentConnection) {
+	clientProbe := ts.GetClientProbeForAgent(connection.AgentID)
+	if clientProbe != nil {
+		connection.ClientProbeID = clientProbe.ID
+		connection.ReverseCycle = &CycleTracker{
+			StartSeq:     1,
+			StartTime:    time.Now(),
+			PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+			PacketTimes:  make(map[int]PacketTime),
+			receivedSeqs: make(map[int]int),
+		}
+		log.Infof("[trafficsim] Bidirectional mode enabled for agent %d using client probe %d",
+			connection.AgentID, clientProbe.ID)
+	} else {
+		// Bidirectional not available (or no longer available after probe change)
+		connection.ClientProbeID = 0
+		connection.ReverseCycle = nil
+	}
+}
+
 // GetClientProbeForAgent finds a TRAFFICSIM probe targeting the given agent for bidirectional testing.
 // The controller creates TRAFFICSIM probes when:
 // 1. Target agent has a server (client mode)
@@ -994,6 +1017,7 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 	ts.connectionsMu.Lock()
 	connection, exists := ts.connections[msg.SrcAgent]
 	if !exists {
+		// Brand new connection
 		connection = &AgentConnection{
 			AgentID:        msg.SrcAgent,
 			Addr:           addr,
@@ -1004,17 +1028,37 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		log.Debugf("[trafficsim] New connection from agent %d at %s", msg.SrcAgent, addr.String())
 
 		// Check if we have a client probe for this connected agent (enables bidirectional mode)
-		if clientProbe := ts.GetClientProbeForAgent(msg.SrcAgent); clientProbe != nil {
-			connection.ClientProbeID = clientProbe.ID
-			connection.ReverseCycle = &CycleTracker{
-				StartSeq:     1,
-				StartTime:    time.Now(),
-				PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
-				PacketTimes:  make(map[int]PacketTime),
-				receivedSeqs: make(map[int]int),
+		ts.initBidirectional(connection)
+	} else {
+		// Existing connection — detect reconnection scenarios:
+		// 1. Client sent a HELLO (explicit reconnect handshake)
+		// 2. Source address/port changed (NAT rebind, network change)
+		// 3. Connection went stale (>30s gap between packets)
+		addrChanged := connection.Addr == nil || connection.Addr.String() != addr.String()
+		staleConnection := time.Since(connection.LastSeen) > 30*time.Second
+		isReconnect := msg.Type == MsgHello || addrChanged || staleConnection
+
+		if isReconnect {
+			reason := "HELLO"
+			if addrChanged {
+				reason = fmt.Sprintf("addr changed %s -> %s", connection.Addr, addr)
+			} else if staleConnection {
+				reason = fmt.Sprintf("stale (last seen %v ago)", time.Since(connection.LastSeen).Round(time.Second))
 			}
-			log.Infof("[trafficsim] Bidirectional mode enabled for agent %d using client probe %d",
-				msg.SrcAgent, clientProbe.ID)
+			log.Infof("[trafficsim] Agent %d reconnected (%s), resetting connection state", msg.SrcAgent, reason)
+
+			// Update address and reset counters
+			connection.Addr = addr
+			connection.PacketsRecv = 0
+			connection.PacketsSent = 0
+			connection.ReverseSequence = 0
+			connection.LastReportTime = time.Now()
+
+			// Re-check bidirectional (probes may have changed since first connect)
+			ts.initBidirectional(connection)
+		} else {
+			// Normal ongoing traffic — always update address in case of minor NAT changes
+			connection.Addr = addr
 		}
 	}
 	connection.LastSeen = time.Now()
