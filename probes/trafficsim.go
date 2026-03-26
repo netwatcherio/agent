@@ -480,7 +480,14 @@ func (ts *TrafficSim) runClient(ctx context.Context, mtrProbe *Probe) error {
 	if err := ts.dialUDP(); err != nil {
 		return fmt.Errorf("dial UDP: %w", err)
 	}
-	defer ts.conn.Close()
+	// Don't capture ts.conn directly — reconnectUDP() may replace it.
+	// Cleanup is handled by setConn() and Stop().
+	defer func() {
+		conn := ts.getConn()
+		if conn != nil {
+			conn.Close()
+		}
+	}()
 
 	// Attempt handshake
 	if !ts.handshake() {
@@ -960,11 +967,22 @@ func (ts *TrafficSim) runServer() error {
 
 	log.Debugf("[trafficsim] Server listening on %s", listenAddr)
 
+	lastValidPacket := time.Now()
+	const serverStaleTimeout = 2 * time.Minute
+
 	for ts.isRunning() && !ts.isStopping() {
 		select {
 		case <-ts.stopChan:
 			return nil
 		default:
+		}
+
+		// Staleness watchdog: if no valid packets for 2 min, force rebind
+		if time.Since(lastValidPacket) > serverStaleTimeout {
+			if shouldLogNetworkError() {
+				log.Printf("[trafficsim] Server stale for %v, forcing rebind", time.Since(lastValidPacket).Round(time.Second))
+			}
+			return fmt.Errorf("server stale, no packets for %v", serverStaleTimeout)
 		}
 
 		buf := make([]byte, 2048)
@@ -973,6 +991,13 @@ func (ts *TrafficSim) runServer() error {
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
+			}
+			// Check for network-change errors (Windows: wsarecv, WSAEINVAL, etc.)
+			if isNetworkChangeError(err) {
+				if shouldLogNetworkError() {
+					log.Printf("[trafficsim] Server network change detected: %v. Rebinding...", err)
+				}
+				return fmt.Errorf("network change: %w", err)
 			}
 			log.Printf("[trafficsim] Server read error: %v", err)
 			continue
@@ -989,6 +1014,7 @@ func (ts *TrafficSim) runServer() error {
 			continue
 		}
 
+		lastValidPacket = time.Now()
 		ts.handleServerMessage(conn, remoteAddr, msg)
 	}
 
@@ -1073,6 +1099,14 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		}
 
 		if _, err := conn.WriteToUDP(ack, addr); err != nil {
+			if isNetworkChangeError(err) {
+				if shouldLogNetworkError() {
+					log.Printf("[trafficsim] Server network change on ACK send: %v", err)
+				}
+				// Close socket to force the read loop to exit and trigger rebind
+				conn.Close()
+				return
+			}
 			log.Printf("[trafficsim] Failed to send ACK: %v", err)
 		}
 
