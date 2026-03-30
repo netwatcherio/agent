@@ -46,9 +46,12 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	var mtrResult MtrPayload
 	mtrResult.StartTimestamp = time.Now()
 
-	numMeasurements := 5
+	numMeasurements := cd.Count
+	if numMeasurements <= 0 {
+		numMeasurements = 5 // default: 5 packets per hop
+	}
 	if triggered {
-		numMeasurements = 15
+		numMeasurements = 15 // triggered MTR always uses 15 for diagnostics
 	}
 
 	target := cd.Targets[0].Target

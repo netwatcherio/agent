@@ -39,11 +39,12 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 	// ----- Configure pinger per pro-bing docs -----
 
-	// Count: use configured count (default to 10 if not set)
+	// Count: use configured count (default to 60 if not set)
+	// Each packet is sent at 1s intervals, so count=60 = ~60s per run
 	if ac.Count > 0 {
 		pinger.Count = ac.Count
 	} else {
-		pinger.Count = 10
+		pinger.Count = 60
 	}
 
 	// Interval between individual pings: fixed at 1 second

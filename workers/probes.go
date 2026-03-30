@@ -1231,12 +1231,11 @@ func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		log.Errorf("Ping error: %v", err)
 	}
 
-	// Sleep for the configured interval before next execution
-	interval := probe.IntervalSec
-	if interval < 60 {
-		interval = 60 // Minimum 60 seconds between probe runs
-	}
-	time.Sleep(time.Duration(interval) * time.Second)
+	// PING runs continuously back-to-back. The upload cadence is determined
+	// by packet count (e.g., count=60 = ~60s per run at 1 pkt/sec).
+	// IntervalSec is NOT used for PING scheduling — the gap between runs is always 0.
+	// Small safety sleep prevents tight loops if Ping() errors out instantly.
+	time.Sleep(1 * time.Second)
 }
 
 func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
