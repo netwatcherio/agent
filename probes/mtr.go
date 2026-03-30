@@ -80,6 +80,17 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 		PktSize:          52,
 	}
 
+	// Interface binding: if BindInterface is configured, resolve its IP
+	// and set it as the source address for traceroute packets.
+	if cd.BindInterface != "" {
+		if bindIP := resolveBindIP(cd.BindInterface); bindIP != "" {
+			config.SrcAddr = bindIP
+			log.Infof("[mtr] probe=%d binding to interface %q (source: %s)", cd.ID, cd.BindInterface, bindIP)
+		} else {
+			log.Warnf("[mtr] probe=%d: configured interface %q has no valid IP, using OS default", cd.ID, cd.BindInterface)
+		}
+	}
+
 	log.WithFields(log.Fields{
 		"target":       target,
 		"ip":           ip.String(),

@@ -3,6 +3,7 @@ package probes
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -151,6 +152,15 @@ func DNSQuery(probe *Probe, dataChan chan ProbeData) error {
 
 	log.Infof("[dns] Querying %s %s @%s (proto=%s)", cfg.RecordType, target, cfg.DNSServer, cfg.Protocol)
 
+	// Resolve interface binding early (before any emitDNSResult calls)
+	var sourceIP, sourceIface string
+	if probe.BindInterface != "" {
+		if bindIP := resolveBindIP(probe.BindInterface); bindIP != "" {
+			sourceIP = bindIP
+			sourceIface = probe.BindInterface
+		}
+	}
+
 	// Build the DNS message
 	qtype, err := recordTypeToUint16(cfg.RecordType)
 	if err != nil {
@@ -163,7 +173,7 @@ func DNSQuery(probe *Probe, dataChan chan ProbeData) error {
 			Error:        err.Error(),
 			Answers:      []DNSAnswer{},
 		}
-		emitDNSResult(probe, dataChan, target, payload)
+		emitDNSResult(probe, dataChan, target, payload, sourceIP, sourceIface)
 		return err
 	}
 
@@ -183,6 +193,16 @@ func DNSQuery(probe *Probe, dataChan chan ProbeData) error {
 		client.Timeout = 10 * time.Second
 	}
 
+	// Interface binding: if BindInterface is configured, set a custom Dialer
+	// with LocalAddr so DNS queries originate from the specified interface.
+	if sourceIP != "" {
+		client.Dialer = &net.Dialer{
+			Timeout:   client.Timeout,
+			LocalAddr: &net.UDPAddr{IP: net.ParseIP(sourceIP)},
+		}
+		log.Infof("[dns] probe=%d binding to interface %q (source: %s)", probe.ID, probe.BindInterface, sourceIP)
+	}
+
 	// Execute the query
 	start := time.Now()
 	resp, rtt, err := client.Exchange(msg, cfg.DNSServer)
@@ -200,7 +220,7 @@ func DNSQuery(probe *Probe, dataChan chan ProbeData) error {
 			Answers:      []DNSAnswer{},
 			RawResponse:  fmt.Sprintf("; query failed: %v\n; server: %s\n; elapsed: %v", err, cfg.DNSServer, rtt),
 		}
-		emitDNSResult(probe, dataChan, target, payload)
+		emitDNSResult(probe, dataChan, target, payload, sourceIP, sourceIface)
 		return fmt.Errorf("dns exchange failed: %w", err)
 	}
 
@@ -224,11 +244,11 @@ func DNSQuery(probe *Probe, dataChan chan ProbeData) error {
 	log.Infof("[dns] %s %s @%s -> %s (%d answers, %.2fms)",
 		cfg.RecordType, target, cfg.DNSServer, payload.ResponseCode, len(payload.Answers), queryMs)
 
-	emitDNSResult(probe, dataChan, target, payload)
+	emitDNSResult(probe, dataChan, target, payload, sourceIP, sourceIface)
 	return nil
 }
 
-func emitDNSResult(probe *Probe, dataChan chan ProbeData, target string, payload DNSPayload) {
+func emitDNSResult(probe *Probe, dataChan chan ProbeData, target string, payload DNSPayload, sourceIP, sourceIface string) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		log.Errorf("[dns] marshal error: %v", err)
@@ -236,10 +256,12 @@ func emitDNSResult(probe *Probe, dataChan chan ProbeData, target string, payload
 	}
 
 	dataChan <- ProbeData{
-		ProbeID:   probe.ID,
-		Type:      ProbeType_DNS,
-		Payload:   raw,
-		Target:    target,
-		CreatedAt: time.Now(),
+		ProbeID:         probe.ID,
+		Type:            ProbeType_DNS,
+		Payload:         raw,
+		Target:          target,
+		CreatedAt:       time.Now(),
+		SourceIP:        sourceIP,
+		SourceInterface: sourceIface,
 	}
 }

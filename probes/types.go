@@ -6,22 +6,23 @@ import (
 )
 
 type Probe struct {
-	ID           uint            `json:"id"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
-	WorkspaceId  int             `json:"workspace_id"`
-	AgentID      uint            `json:"agent_id"`
-	Type         ProbeType       `json:"type"`
-	Enabled      bool            `json:"enabled"`
-	IntervalSec  int             `json:"interval_sec"`
-	TimeoutSec   int             `json:"timeout_sec"`
-	Count        int             `json:"count"`
-	DurationSec  int             `json:"duration_sec"`
-	Server       bool            `json:"server"`
-	Labels       json.RawMessage `json:"labels"`
-	Metadata     json.RawMessage `json:"metadata"`
-	Targets      []ProbeTarget   `json:"targets"`
-	ProbeProcess int
+	ID            uint            `json:"id"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	WorkspaceId   int             `json:"workspace_id"`
+	AgentID       uint            `json:"agent_id"`
+	Type          ProbeType       `json:"type"`
+	Enabled       bool            `json:"enabled"`
+	IntervalSec   int             `json:"interval_sec"`
+	TimeoutSec    int             `json:"timeout_sec"`
+	Count         int             `json:"count"`
+	DurationSec   int             `json:"duration_sec"`
+	Server        bool            `json:"server"`
+	BindInterface string          `json:"bind_interface,omitempty"` // Interface name to bind probes to (empty = OS default)
+	Labels        json.RawMessage `json:"labels"`
+	Metadata      json.RawMessage `json:"metadata"`
+	Targets       []ProbeTarget   `json:"targets"`
+	ProbeProcess  int
 }
 
 type ProbeTarget struct {
@@ -59,6 +60,8 @@ type ProbeData struct {
 	Type    ProbeType       `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 	// Optional: carry target string if you still resolve AGENT types dynamically
-	Target      string `json:"target,omitempty"`
-	TargetAgent uint   `json:"target_agent,omitempty"`
+	Target          string `json:"target,omitempty"`
+	TargetAgent     uint   `json:"target_agent,omitempty"`
+	SourceIP        string `json:"source_ip,omitempty"`        // Local IP the test ran from
+	SourceInterface string `json:"source_interface,omitempty"` // Interface name the test ran from
 }

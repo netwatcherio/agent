@@ -133,6 +133,8 @@ type TrafficSim struct {
 	// Connection validity
 	connectionValid   bool
 	connectionValidMu sync.RWMutex
+	boundLocalIP      string // IP captured from conn.LocalAddr() after dial — used to detect stale sockets
+	boundLocalIPMu    sync.RWMutex
 
 	// Bidirectional mode: server sends test data back to connected clients
 	// When a client connects, if this agent has a TRAFFICSIM client probe targeting that agent,
@@ -251,6 +253,75 @@ func (ts *TrafficSim) setConnectionValid(valid bool) {
 	ts.connectionValidMu.Lock()
 	defer ts.connectionValidMu.Unlock()
 	ts.connectionValid = valid
+}
+
+// IsRunning returns true if this TrafficSim instance is active.
+// Exported for use by the interface watcher callback.
+func (ts *TrafficSim) IsRunning() bool {
+	return ts.isRunning()
+}
+
+// InvalidateConnection marks the current UDP socket as invalid, forcing
+// reconnection on the next send cycle. Called by the interface watcher
+// when a network change (gateway/interface IP change) is detected.
+func (ts *TrafficSim) InvalidateConnection() {
+	ts.setConnectionValid(false)
+}
+
+func (ts *TrafficSim) setBoundLocalIP(ip string) {
+	ts.boundLocalIPMu.Lock()
+	defer ts.boundLocalIPMu.Unlock()
+	ts.boundLocalIP = ip
+}
+
+func (ts *TrafficSim) getBoundLocalIP() string {
+	ts.boundLocalIPMu.RLock()
+	defer ts.boundLocalIPMu.RUnlock()
+	return ts.boundLocalIP
+}
+
+// isBoundIPValid checks whether the IP our socket is bound to is still
+// assigned to any active network interface. If it isn't, the socket is stale
+// (the interface went down, changed IP, or was removed) and must be reconnected.
+//
+// This is the deterministic replacement for loss-based heuristics:
+// - UDP is connectionless, so writes to a dead interface "succeed" silently
+// - conn.LocalAddr() tells us exactly which IP the socket is using
+// - If that IP vanished from the interface list, the socket is guaranteed stale
+func (ts *TrafficSim) isBoundIPValid() bool {
+	boundIP := ts.getBoundLocalIP()
+	if boundIP == "" {
+		return true // No bound IP recorded, skip this check
+	}
+
+	return isLocalIPActive(boundIP)
+}
+
+// isLocalIPActive checks if the given IP address is currently assigned to any
+// active (UP) network interface on this host. Used by probes to validate
+// socket health after network changes.
+func isLocalIPActive(ip string) bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return true // Can't check, assume valid to avoid false reconnects
+	}
+
+	targetIP := net.ParseIP(ip)
+	if targetIP == nil {
+		return true // Couldn't parse, assume valid
+	}
+
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ipNet.IP.Equal(targetIP) {
+			return true // IP is still assigned to an active interface
+		}
+	}
+
+	return false // IP not found on any interface — socket is stale
 }
 
 // SetAllProbes stores all probes for this agent, enabling bidirectional detection
@@ -516,9 +587,33 @@ func (ts *TrafficSim) dialUDP() error {
 		return err
 	}
 
-	conn, err := net.DialUDP("udp", nil, raddr)
+	// Resolve bind address from probe config.
+	// If BindInterface is set, bind the socket to that specific interface's IP.
+	// If empty, DialUDPWithBind passes nil laddr (OS default — current behavior).
+	bindIP := ""
+	if ts.Probe != nil && ts.Probe.BindInterface != "" {
+		bindIP = resolveBindIP(ts.Probe.BindInterface)
+		if bindIP != "" {
+			log.Infof("[trafficsim] probe=%d binding to interface %q (IP: %s)",
+				ts.Probe.ID, ts.Probe.BindInterface, bindIP)
+		} else {
+			log.Warnf("[trafficsim] probe=%d: configured interface %q has no valid IP, using OS default",
+				ts.Probe.ID, ts.Probe.BindInterface)
+		}
+	}
+
+	conn, err := DialUDPWithBind(bindIP, raddr)
 	if err != nil {
 		return err
+	}
+
+	// Capture the local IP the OS actually bound us to.
+	// We'll check this before each cycle — if this IP is no longer
+	// assigned to any active interface, the socket is stale.
+	if localAddr := conn.LocalAddr(); localAddr != nil {
+		host, _, _ := net.SplitHostPort(localAddr.String())
+		ts.setBoundLocalIP(host)
+		log.Debugf("[trafficsim] probe=%d bound to local IP %s", ts.Probe.ID, host)
 	}
 
 	ts.setConn(conn)
@@ -580,6 +675,15 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 
 		log.Debugf("[trafficsim] Starting cycle, %d packets", TrafficSimReportSeq)
 
+		// Pre-cycle check: validate the socket's bound IP is still on a live interface.
+		// This catches silent socket death (Windows rebinding to a dead interface)
+		// without the overhead of calling net.InterfaceAddrs() on every packet.
+		if !ts.isBoundIPValid() {
+			log.Warnf("[trafficsim] probe=%d: bound IP %s no longer valid, forcing reconnect",
+				ts.Probe.ID, ts.getBoundLocalIP())
+			ts.setConnectionValid(false)
+		}
+
 		// Send packets
 		for i := 0; i < TrafficSimReportSeq && ts.isRunning() && !ts.isStopping(); i++ {
 			select {
@@ -590,7 +694,7 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 			default:
 			}
 
-			// Check if we need to reconnect due to network change
+			// Check if connection was invalidated (by error handler, watcher, or pre-cycle check)
 			if !ts.isConnectionValid() {
 				if err := ts.reconnectUDP(); err != nil {
 					// Still send packet (will fail, recording loss)
@@ -623,7 +727,7 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 		// Reset sequence for next cycle
 		ts.resetSequence()
 
-		// Check for packet loss trigger
+		// Check for packet loss trigger (run MTR for diagnostics)
 		if loss, ok := stats["lossPercentage"].(float64); ok && loss > 5.0 {
 			ts.triggerMTR(mtrProbe, loss)
 		}
@@ -944,15 +1048,62 @@ func (ts *TrafficSim) triggerMTR(mtrProbe *Probe, lossPercent float64) {
 		return
 	}
 
-	log.Printf("[trafficsim] Triggering MTR due to %.1f%% packet loss", lossPercent)
-	// The actual MTR execution would be handled by the probe worker
-	// This just logs the trigger for now
+	log.Infof("[trafficsim] Triggering MTR due to %.1f%% packet loss", lossPercent)
+
+	// Run actual MTR trace for diagnostics
+	go func() {
+		mtrResult, err := Mtr(mtrProbe, true) // triggered=true for higher sample count
+		if err != nil {
+			log.Errorf("[trafficsim] Triggered MTR failed for probe %d: %v", mtrProbe.ID, err)
+			return
+		}
+
+		payload, err := json.Marshal(mtrResult)
+		if err != nil {
+			log.Errorf("[trafficsim] Triggered MTR marshal error: %v", err)
+			return
+		}
+
+		if ts.DataChan == nil || !ts.isRunning() {
+			return
+		}
+
+		target := ""
+		if len(mtrProbe.Targets) > 0 {
+			target = mtrProbe.Targets[0].Target
+		}
+
+		select {
+		case ts.DataChan <- ProbeData{
+			ProbeID:   mtrProbe.ID,
+			Triggered: true,
+			CreatedAt: time.Now(),
+			Type:      ProbeType_MTR,
+			Payload:   payload,
+			Target:    target,
+		}:
+			log.Infof("[trafficsim] Triggered MTR completed for %s (loss was %.1f%%)", target, lossPercent)
+		default:
+			log.Warnf("[trafficsim] DataChan full, dropping triggered MTR result")
+		}
+	}()
 }
 
 // -------------------- Server Mode --------------------
 
 func (ts *TrafficSim) runServer() error {
-	listenAddr := fmt.Sprintf("0.0.0.0:%d", ts.Port)
+	// Determine listen address: use BindInterface IP if configured, else 0.0.0.0 (all interfaces)
+	listenIP := "0.0.0.0"
+	if ts.Probe != nil && ts.Probe.BindInterface != "" {
+		if bindIP := resolveBindIP(ts.Probe.BindInterface); bindIP != "" {
+			listenIP = bindIP
+			log.Infof("[trafficsim] Server binding to interface %q (IP: %s)", ts.Probe.BindInterface, bindIP)
+		} else {
+			log.Warnf("[trafficsim] Server configured for interface %q but no valid IP, using 0.0.0.0", ts.Probe.BindInterface)
+		}
+	}
+
+	listenAddr := fmt.Sprintf("%s:%d", listenIP, ts.Port)
 	addr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return err

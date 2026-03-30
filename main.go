@@ -250,6 +250,14 @@ func runAgent(ctx context.Context) error {
 
 	// If your workers expect a uint agent ID now:
 	workers.SetControllerConfig(cfg.ControllerHost, cfg.SSL, cfg.WorkspaceID, cfg.AgentID, psk)
+
+	// Start network interface watchdog — polls for interface/gateway changes
+	// and proactively invalidates TrafficSim sockets on network flaps.
+	ifWatcher := probes.NewInterfaceWatcher(10 * time.Second)
+	ifWatcher.Start()
+	defer ifWatcher.Stop()
+	workers.SetInterfaceWatcher(ifWatcher)
+
 	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
 	workers.ProbeDataWorker(wsClient, probeDataCh)
 

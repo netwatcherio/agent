@@ -73,6 +73,20 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 		pinger.SetPrivileged(true)
 	}
 
+	// Interface binding: if the probe specifies a BindInterface, resolve its IP
+	// and set it as the source address for ICMP packets.
+	var sourceIP, sourceIface string
+	if ac.BindInterface != "" {
+		if bindIP := resolveBindIP(ac.BindInterface); bindIP != "" {
+			pinger.Source = bindIP
+			sourceIP = bindIP
+			sourceIface = ac.BindInterface
+			log.Infof("[ping] probe=%d binding to interface %q (source: %s)", ac.ID, ac.BindInterface, bindIP)
+		} else {
+			log.Warnf("[ping] probe=%d: configured interface %q has no valid IP, using OS default", ac.ID, ac.BindInterface)
+		}
+	}
+
 	// ----- Callbacks -----
 
 	pinger.OnRecv = func(pkt *probing.Packet) {
@@ -112,10 +126,12 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 		}
 
 		cD := ProbeData{
-			ProbeID: ac.ID,
-			Type:    ProbeType_PING,
-			Payload: bytes,
-			Target:  target,
+			ProbeID:         ac.ID,
+			Type:            ProbeType_PING,
+			Payload:         bytes,
+			Target:          target,
+			SourceIP:        sourceIP,
+			SourceInterface: sourceIface,
 		}
 		pingChan <- cD
 

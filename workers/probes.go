@@ -37,6 +37,9 @@ var currentProbeListMu sync.RWMutex
 var controllerConfig *probes.ControllerConfig
 var controllerConfigMu sync.RWMutex
 
+// interfaceWatcher monitors network interfaces and broadcasts change events
+var interfaceWatcher *probes.InterfaceWatcher
+
 func getCurrentProbes() []probes.Probe {
 	currentProbeListMu.RLock()
 	defer currentProbeListMu.RUnlock()
@@ -67,6 +70,16 @@ func getControllerConfig() *probes.ControllerConfig {
 	controllerConfigMu.RLock()
 	defer controllerConfigMu.RUnlock()
 	return controllerConfig
+}
+
+// SetInterfaceWatcher stores the interface watcher so probe workers can register change handlers.
+func SetInterfaceWatcher(w *probes.InterfaceWatcher) {
+	interfaceWatcher = w
+}
+
+// GetInterfaceWatcher returns the active interface watcher, or nil.
+func GetInterfaceWatcher() *probes.InterfaceWatcher {
+	return interfaceWatcher
 }
 
 // extractTargetStrings creates a sorted, normalized representation of probe targets.
@@ -109,11 +122,13 @@ func makeProbeKey(probe probes.Probe) string {
 			Interval int    `json:"interval"`
 			Server   bool   `json:"server"`
 			Pending  int64  `json:"pending"`
+			BindIf   string `json:"bind_if"`
 		}{
 			Duration: probe.DurationSec,
 			Count:    probe.Count,
 			Interval: probe.IntervalSec,
 			Server:   probe.Server,
+			BindIf:   probe.BindInterface,
 		}
 
 		// Only include the server address (first target) for server probes
@@ -142,12 +157,14 @@ func makeProbeKey(probe probes.Probe) string {
 		Count    int      `json:"count"`
 		Interval int      `json:"interval"`
 		Server   bool     `json:"server"`
+		BindIf   string   `json:"bind_if"`
 	}{
 		Target:   extractTargetStrings(probe.Targets),
 		Duration: probe.DurationSec,
 		Count:    probe.Count,
 		Interval: probe.IntervalSec,
 		Server:   probe.Server,
+		BindIf:   probe.BindInterface,
 	}
 
 	configBytes, err := json.Marshal(normalizedConfig)
@@ -871,6 +888,20 @@ func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataCha
 	ts := probes.NewTrafficSim(&probe, dataChan)
 	ts.ThisAgent = probe.AgentID // Use the agent ID from the probe
 
+	// Register with interface watcher for proactive socket invalidation.
+	// When the watcher detects a gateway/interface change, it immediately
+	// marks this TrafficSim's connection as invalid so the next cycle reconnects
+	// instead of waiting for 60s of 100% loss to trigger the reactive fix.
+	if watcher := GetInterfaceWatcher(); watcher != nil {
+		watcher.OnChange(func(event probes.InterfaceChangeEvent) {
+			if ts.IsRunning() {
+				log.Warnf("[trafficsim] probe=%d: network change (%s), invalidating socket",
+					probe.ID, event.Reason)
+				ts.InvalidateConnection()
+			}
+		})
+	}
+
 	// Find matching MTR probe for triggered diagnostics
 	mtrProbe, err := findMatchingMTRProbe(probe)
 	if err != nil {
@@ -1193,7 +1224,7 @@ func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 
 	mtrProbe, err := findMatchingMTRProbe(probe)
 	if err != nil {
-		log.Errorf("Failed to find matching MTR probe: %v", err)
+		log.Debugf("No matching MTR probe for %s (loss-triggered MTR disabled for this target)", probe.Targets[0].Target)
 	}
 
 	if err := probes.Ping(&probe, dataChan, mtrProbe); err != nil {
