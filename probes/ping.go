@@ -39,24 +39,25 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 
 	// ----- Configure pinger per pro-bing docs -----
 
-	// Count: use configured count (default to 60 if not set)
-	// Each packet is sent at 1s intervals, so count=60 = ~60s per run
-	if ac.Count > 0 {
-		pinger.Count = ac.Count
-	} else {
-		pinger.Count = 60
+	// Count: use configured count, enforce minimum of 30, default to 60.
+	// Each packet is sent at 1s intervals, so count=60 = ~60s per run.
+	count := ac.Count
+	if count <= 0 {
+		count = 60
+	} else if count < 30 {
+		count = 30
 	}
+	pinger.Count = count
 
-	// Interval between individual pings: fixed at 1 second
-	// Note: IntervalSec is for SCHEDULING between probe runs, not individual ping interval
+	// Interval between individual pings: fixed at 1 second.
+	// Note: IntervalSec is for SCHEDULING between probe runs, not individual ping interval.
 	pinger.Interval = time.Second
 
-	// Timeout: use configured timeout, default to 30s
-	timeout := ac.TimeoutSec
-	if timeout <= 0 {
-		timeout = 30
-	}
-	pinger.Timeout = time.Duration(timeout) * time.Second
+	// Timeout: derived from count so the pinger has enough time to send all packets.
+	// Formula: count × interval × 1.25 (25% headroom for slow/timed-out responses).
+	// Without this, the controller's default TimeoutSec=10 would kill a 60-packet
+	// run after only ~10 packets, causing reports every ~11s instead of every ~60s.
+	pinger.Timeout = time.Duration(float64(count) * float64(time.Second) * 1.25)
 
 	// OS privilege behavior (see README notes):
 	switch runtime.GOOS {
