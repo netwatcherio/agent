@@ -118,6 +118,11 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 		targetURL = probe.Targets[0].Target
 	}
 
+	// Auto-prepend https:// if no scheme is provided
+	if targetURL != "" && !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		targetURL = "https://" + targetURL
+	}
+
 	startTime := time.Now()
 
 	var dnsStart, dnsEnd, connectStart, connectEnd, tlsStart, tlsEnd, firstByteTime time.Time

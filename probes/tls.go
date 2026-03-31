@@ -81,6 +81,14 @@ func TLSProbe(probe *Probe, dataChan chan ProbeData) error {
 		target = probe.Targets[0].Target
 	}
 
+	// Strip scheme if present (e.g., https:// from https://example.com)
+	if strings.HasPrefix(target, "https://") {
+		target = strings.TrimPrefix(target, "https://")
+	} else if strings.HasPrefix(target, "http://") {
+		target = strings.TrimPrefix(target, "http://")
+	}
+
+	// Add default TLS port 443 if no port specified
 	if !strings.Contains(target, ":") {
 		target = target + ":443"
 	}
