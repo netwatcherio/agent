@@ -48,6 +48,9 @@ const (
 	ProbeType_TRAFFICSIM        ProbeType = "TRAFFICSIM"
 	ProbeType_WEB               ProbeType = "WEB"
 	ProbeType_DNS               ProbeType = "DNS"
+	ProbeType_HTTP              ProbeType = "HTTP"
+	ProbeType_TLS               ProbeType = "TLS"
+	ProbeType_SNMP              ProbeType = "SNMP"
 )
 
 // ProbeData What the agent posts (flattened main-level fields + kind + raw payload)

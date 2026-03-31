@@ -846,6 +846,15 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 				case probes.ProbeType_DNS:
 					handleDNSProbe(probe, dC)
 
+				case probes.ProbeType_HTTP:
+					handleHTTPProbe(probe, dC)
+
+				case probes.ProbeType_TLS:
+					handleTLSProbe(probe, dC)
+
+				case probes.ProbeType_SNMP:
+					handleSNMPProbe(probe, dC)
+
 				case "AGENT":
 					// Agent probe type - skip for now as it's likely metadata
 					log.Debugf("Skipping AGENT probe type for probe %d", probe.ID)
@@ -1291,6 +1300,51 @@ func handleDNSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 			log.Errorf("DNS error for %s: %v", target.Target, err)
 			// Error payloads are already emitted by DNSQuery, so just log
 		}
+	}
+}
+
+func handleHTTPProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Infof("HTTP: Running probe for %s", probe.Targets[0].Target)
+
+	interval := probe.IntervalSec
+	if interval < 30 {
+		interval = 60
+	}
+
+	defer time.Sleep(time.Duration(interval) * time.Second)
+
+	if err := probes.HTTPProbe(&probe, dataChan); err != nil {
+		log.Errorf("HTTP error: %v", err)
+	}
+}
+
+func handleTLSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Infof("TLS: Running probe for %s", probe.Targets[0].Target)
+
+	interval := probe.IntervalSec
+	if interval < 60 {
+		interval = 300
+	}
+
+	defer time.Sleep(time.Duration(interval) * time.Second)
+
+	if err := probes.TLSProbe(&probe, dataChan); err != nil {
+		log.Errorf("TLS error: %v", err)
+	}
+}
+
+func handleSNMPProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+	log.Infof("SNMP: Running probe for %s", probe.Targets[0].Target)
+
+	interval := probe.IntervalSec
+	if interval < 30 {
+		interval = 300
+	}
+
+	defer time.Sleep(time.Duration(interval) * time.Second)
+
+	if err := probes.SNMPProbe(&probe, dataChan); err != nil {
+		log.Errorf("SNMP error: %v", err)
 	}
 }
 

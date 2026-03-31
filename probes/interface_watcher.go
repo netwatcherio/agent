@@ -1,6 +1,7 @@
 package probes
 
 import (
+	"fmt"
 	"net"
 	"sort"
 	"strings"
@@ -299,20 +300,36 @@ func DialUDPWithBind(localIP string, raddr *net.UDPAddr) (*net.UDPConn, error) {
 // This is the function probes call when they have a BindInterface configured.
 // It always queries the live interface list to get the current IP (not cached).
 func resolveBindIP(ifaceName string) string {
+	if ip, _ := ResolveBindInterface(ifaceName); ip != "" {
+		return ip
+	}
+	return ""
+}
+
+// ResolveBindInterface resolves a network interface name to its primary IPv4 address.
+// Returns (ip, nil) on success.
+// Returns ("", err) if the interface is explicitly configured but not found.
+// Returns ("", nil) if the interface exists but has no IPv4 address.
+//
+// Use this when you need to distinguish between "interface missing" vs "no IPv4".
+func ResolveBindInterface(ifaceName string) (string, error) {
 	ifaces, err := DiscoverInterfaces()
 	if err != nil {
 		log.Debugf("[bind] DiscoverInterfaces error: %v", err)
-		return ""
+		return "", fmt.Errorf("failed to enumerate interfaces: %w", err)
 	}
 
 	for _, iface := range ifaces {
-		if iface.Name == ifaceName && len(iface.IPv4) > 0 {
+		if iface.Name == ifaceName {
+			if len(iface.IPv4) == 0 {
+				return "", fmt.Errorf("interface %q exists but has no IPv4 address", ifaceName)
+			}
 			ip := iface.IPv4[0]
 			if idx := strings.Index(ip, "/"); idx != -1 {
 				ip = ip[:idx]
 			}
-			return ip
+			return ip, nil
 		}
 	}
-	return ""
+	return "", fmt.Errorf("interface %q not found", ifaceName)
 }

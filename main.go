@@ -129,6 +129,19 @@ func runAgent(ctx context.Context) error {
 		log.Info("Auto-updater disabled")
 	}
 
+	// ---------- Prometheus Metrics Server ----------
+	web.SetAgentVersion(VERSION)
+	if err := web.StartMetricsServer(); err != nil {
+		log.Warnf("Failed to start metrics server: %v", err)
+	}
+	defer func() {
+		if _, ok := ctx.Deadline(); !ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = web.StopMetricsServer(ctx)
+		}
+	}()
+
 	// ---------- Wire websocket handler ----------
 	probeGetCh := make(chan []probes.Probe)
 	probeDataCh := make(chan probes.ProbeData, 2048)

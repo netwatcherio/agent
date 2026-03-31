@@ -79,14 +79,14 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 	// and set it as the source address for ICMP packets.
 	var sourceIP, sourceIface string
 	if ac.BindInterface != "" {
-		if bindIP := resolveBindIP(ac.BindInterface); bindIP != "" {
-			pinger.Source = bindIP
-			sourceIP = bindIP
-			sourceIface = ac.BindInterface
-			log.Infof("[ping] probe=%d binding to interface %q (source: %s)", ac.ID, ac.BindInterface, bindIP)
-		} else {
-			log.Warnf("[ping] probe=%d: configured interface %q has no valid IP, using OS default", ac.ID, ac.BindInterface)
+		bindIP, err := ResolveBindInterface(ac.BindInterface)
+		if err != nil {
+			return fmt.Errorf("ping probe=%d: bind interface %q: %w", ac.ID, ac.BindInterface, err)
 		}
+		pinger.Source = bindIP
+		sourceIP = bindIP
+		sourceIface = ac.BindInterface
+		log.Infof("[ping] probe=%d binding to interface %q (source: %s)", ac.ID, ac.BindInterface, bindIP)
 	}
 
 	// ----- Callbacks -----

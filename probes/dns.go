@@ -155,10 +155,12 @@ func DNSQuery(probe *Probe, dataChan chan ProbeData) error {
 	// Resolve interface binding early (before any emitDNSResult calls)
 	var sourceIP, sourceIface string
 	if probe.BindInterface != "" {
-		if bindIP := resolveBindIP(probe.BindInterface); bindIP != "" {
-			sourceIP = bindIP
-			sourceIface = probe.BindInterface
+		bindIP, err := ResolveBindInterface(probe.BindInterface)
+		if err != nil {
+			return fmt.Errorf("dns probe=%d: bind interface %q: %w", probe.ID, probe.BindInterface, err)
 		}
+		sourceIP = bindIP
+		sourceIface = probe.BindInterface
 	}
 
 	// Build the DNS message

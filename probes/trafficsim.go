@@ -592,14 +592,13 @@ func (ts *TrafficSim) dialUDP() error {
 	// If empty, DialUDPWithBind passes nil laddr (OS default — current behavior).
 	bindIP := ""
 	if ts.Probe != nil && ts.Probe.BindInterface != "" {
-		bindIP = resolveBindIP(ts.Probe.BindInterface)
-		if bindIP != "" {
-			log.Infof("[trafficsim] probe=%d binding to interface %q (IP: %s)",
-				ts.Probe.ID, ts.Probe.BindInterface, bindIP)
-		} else {
-			log.Warnf("[trafficsim] probe=%d: configured interface %q has no valid IP, using OS default",
-				ts.Probe.ID, ts.Probe.BindInterface)
+		var err error
+		bindIP, err = ResolveBindInterface(ts.Probe.BindInterface)
+		if err != nil {
+			return fmt.Errorf("trafficsim probe=%d: bind interface %q: %w", ts.Probe.ID, ts.Probe.BindInterface, err)
 		}
+		log.Infof("[trafficsim] probe=%d binding to interface %q (IP: %s)",
+			ts.Probe.ID, ts.Probe.BindInterface, bindIP)
 	}
 
 	conn, err := DialUDPWithBind(bindIP, raddr)
@@ -1095,12 +1094,12 @@ func (ts *TrafficSim) runServer() error {
 	// Determine listen address: use BindInterface IP if configured, else 0.0.0.0 (all interfaces)
 	listenIP := "0.0.0.0"
 	if ts.Probe != nil && ts.Probe.BindInterface != "" {
-		if bindIP := resolveBindIP(ts.Probe.BindInterface); bindIP != "" {
-			listenIP = bindIP
-			log.Infof("[trafficsim] Server binding to interface %q (IP: %s)", ts.Probe.BindInterface, bindIP)
-		} else {
-			log.Warnf("[trafficsim] Server configured for interface %q but no valid IP, using 0.0.0.0", ts.Probe.BindInterface)
+		bindIP, err := ResolveBindInterface(ts.Probe.BindInterface)
+		if err != nil {
+			return fmt.Errorf("trafficsim server probe=%d: bind interface %q: %w", ts.Probe.ID, ts.Probe.BindInterface, err)
 		}
+		listenIP = bindIP
+		log.Infof("[trafficsim] Server binding to interface %q (IP: %s)", ts.Probe.BindInterface, listenIP)
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", listenIP, ts.Port)
