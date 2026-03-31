@@ -354,7 +354,6 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 		namespace: neffos.Events{
 			neffos.OnNamespaceConnected: func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Infof("WS: connected to namespace [%s]", msg.Namespace)
-				SetWSConnected(true)
 				// Ask server for probes; your server replies with "bing bong" currently.
 				if ok := ns.Emit("probe_get", []byte("hello")); !ok {
 					log.Warn("WS: emit probe_get returned false")
