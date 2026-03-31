@@ -7,3 +7,4 @@ config.conf
 .DS_Store
 agent_auth.json
 lib/NTrace-core
+netwatcher-agent
