@@ -50,6 +50,15 @@ func setCurrentProbes(probes []probes.Probe) {
 	currentProbeListMu.Lock()
 	defer currentProbeListMu.Unlock()
 	currentProbeList = probes
+
+	// Refresh bidirectional for server - the probe list may have updated
+	// and connections that were established before the list was populated need re-checking
+	activeTrafficSimServerMu.RLock()
+	server := activeTrafficSimServer
+	activeTrafficSimServerMu.RUnlock()
+	if server != nil {
+		server.RefreshBidirectional()
+	}
 }
 
 // SetControllerConfig stores the controller config for use by network probes
@@ -715,6 +724,9 @@ func updateServerAllowedAgents(probe probes.Probe) {
 	if server != nil {
 		server.UpdateAllowedAgents(allowedAgents)
 		log.Infof("[trafficsim] Updated allowed agents for server probe %d: %v", probe.ID, allowedAgents)
+		// Refresh bidirectional for all connections - the probe list may have updated
+		// and connections that were established before the list was populated need re-checking
+		server.RefreshBidirectional()
 	} else {
 		log.Debugf("[trafficsim] Server not running yet, allowed agents will be set on startup")
 	}

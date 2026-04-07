@@ -366,6 +366,41 @@ func (ts *TrafficSim) initBidirectional(connection *AgentConnection) {
 	}
 }
 
+// RefreshBidirectional re-checks all existing connections for bidirectional probe support.
+// Called when the probe list is updated (e.g., after FetchProbesWorker delivers new probes)
+// to ensure connections that were established before the probe list was populated
+// get a chance to enable bidirectional mode.
+func (ts *TrafficSim) RefreshBidirectional() {
+	ts.connectionsMu.Lock()
+	defer ts.connectionsMu.Unlock()
+
+	refreshed := 0
+	for _, connection := range ts.connections {
+		// Skip if bidirectional already enabled
+		if connection.ClientProbeID != 0 {
+			continue
+		}
+		// Re-check if we now have a client probe for this agent
+		clientProbe := ts.GetClientProbeForAgent(connection.AgentID)
+		if clientProbe != nil {
+			connection.ClientProbeID = clientProbe.ID
+			connection.ReverseCycle = &CycleTracker{
+				StartSeq:     1,
+				StartTime:    time.Now(),
+				PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+				PacketTimes:  make(map[int]PacketTime),
+				receivedSeqs: make(map[int]int),
+			}
+			log.Infof("[trafficsim] Bidirectional mode (refresh) enabled for agent %d using client probe %d",
+				connection.AgentID, clientProbe.ID)
+			refreshed++
+		}
+	}
+	if refreshed > 0 {
+		log.Infof("[trafficsim] Bidirectional refresh complete: %d connections updated", refreshed)
+	}
+}
+
 // GetClientProbeForAgent finds a TRAFFICSIM probe targeting the given agent for bidirectional testing.
 // The controller creates TRAFFICSIM probes when:
 // 1. Target agent has a server (client mode)

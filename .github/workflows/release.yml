@@ -4,11 +4,18 @@ on:
   push:
     branches:
       - master
+    paths:
+      - '**.go'
+      - '*.sh'
+      - 'lib/**'
+      - '.github/workflows/**'
+      - '!*.md'
+      - '!docs/**'
 
 jobs:
-  # Build Linux and Windows on self-hosted runner
+  # Build Linux and Windows on ubuntu-latest
   build-linux-windows:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
@@ -73,10 +80,61 @@ jobs:
           name: linux-windows-builds
           path: bin/*.zip
 
+  # Build macOS on macOS runner (requires CGO for pcap support)
+  build-darwin:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+
+      - name: Get version metadata
+        run: |
+          DATE=$(date +%Y%m%d)
+          HASH=$(git rev-parse --short HEAD)
+          VERSION="v${DATE}-${HASH}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Clone NTrace-core
+        run: |
+          rm -rf lib/NTrace-core
+          git clone --depth 1 https://github.com/netwatcherio/NTrace-core.git lib/NTrace-core
+
+      - name: Build macOS
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          LDFLAGS="-s -w -X 'main.VERSION=$VERSION' -X 'main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)' -X 'main.gitCommit=$(git rev-parse --short HEAD)'"
+          mkdir -p bin
+          
+          # macOS builds (CGO required for pcap)
+          for arch in amd64 arm64; do
+            echo "Building darwin/$arch..."
+            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-darwin-$arch .
+            cd bin && zip netwatcher-${VERSION}-darwin-$arch.zip netwatcher-darwin-$arch && rm netwatcher-darwin-$arch && cd ..
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-builds
+          path: bin/*.zip
+
   # Create release with all artifacts
   release:
-    runs-on: self-hosted
-    needs: [build-linux-windows]
+    runs-on: ubuntu-latest
+    needs: [build-linux-windows, build-darwin]
     permissions:
       contents: write
 
@@ -87,14 +145,20 @@ jobs:
           name: linux-windows-builds
           path: bin
 
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-builds
+          path: bin
+
       - name: Verify artifacts exist
         run: |
           echo "Listing downloaded artifacts:"
           ls -la bin/
           ZIP_COUNT=$(ls bin/*.zip 2>/dev/null | wc -l)
           echo "Found $ZIP_COUNT zip files"
-          if [ "$ZIP_COUNT" -lt 5 ]; then
-            echo "ERROR: Expected 5 zip files (3 linux + 2 windows), but found $ZIP_COUNT"
+          if [ "$ZIP_COUNT" -lt 7 ]; then
+            echo "ERROR: Expected 7 zip files (3 linux + 2 windows + 2 darwin), but found $ZIP_COUNT"
             exit 1
           fi
 
@@ -123,12 +187,39 @@ jobs:
             
             - **Linux:** amd64, arm64, arm
             - **Windows:** amd64, arm64
+            - **macOS:** amd64, arm64
             
             ### Installation
             
-            1. Download the appropriate binary for your platform
-            2. Extract the zip file
-            3. Run `./netwatcher --version` to verify the installation
+            #### Linux
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install.sh | sudo bash -s -- \
+              --workspace YOUR_WORKSPACE_ID \
+              --id YOUR_AGENT_ID \
+              --pin YOUR_AGENT_PIN
+            ```
+            
+            #### macOS
+            ```bash
+            # User-level (no sudo)
+            curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install-macos.sh | bash -s -- \
+              --workspace YOUR_WORKSPACE_ID \
+              --id YOUR_AGENT_ID \
+              --pin YOUR_AGENT_PIN
+            
+            # System-level (requires sudo, runs at boot)
+            curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install-macos.sh | sudo bash -s -- \
+              --workspace YOUR_WORKSPACE_ID \
+              --id YOUR_AGENT_ID \
+              --pin YOUR_AGENT_PIN \
+              --system
+            ```
+            
+            #### Windows
+            ```powershell
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/netwatcherio/agent/master/install.ps1" -OutFile "install.ps1"
+            .\install.ps1 -Workspace YOUR_WORKSPACE_ID -Id YOUR_AGENT_ID -Pin "YOUR_AGENT_PIN"
+            ```
             
             ### Checksums
             

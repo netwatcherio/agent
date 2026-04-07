@@ -15,7 +15,7 @@ A lightweight network monitoring agent that reports metrics to the NetWatcher pl
 
 ## Requirements
 
-- **Platforms**: Linux, Windows
+- **Platforms**: Linux, macOS, Windows
 - **Permissions**: Root/Administrator (required for ICMP and raw sockets)
 - **NetWatcher Controller**: Running instance of [netwatcher-oss](https://github.com/netwatcherio/oss)
 
@@ -41,6 +41,30 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/netwatcherio/agent/mas
 .\install.ps1 -Workspace YOUR_WORKSPACE_ID -Id YOUR_AGENT_ID -Pin "YOUR_AGENT_PIN"
 ```
 
+> **Note:** If you encounter an execution policy error, run PowerShell as Administrator and use:
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File install.ps1 -Workspace YOUR_WORKSPACE_ID -Id YOUR_AGENT_ID -Pin "YOUR_AGENT_PIN"
+> ```
+
+### macOS
+
+```bash
+# Download and run the installer (user-level, no sudo)
+curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install-macos.sh | bash -s -- \
+  --workspace YOUR_WORKSPACE_ID \
+  --id YOUR_AGENT_ID \
+  --pin YOUR_AGENT_PIN
+
+# Or system-level (requires sudo, runs at boot)
+curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install-macos.sh | sudo bash -s -- \
+  --workspace YOUR_WORKSPACE_ID \
+  --id YOUR_AGENT_ID \
+  --pin YOUR_AGENT_PIN \
+  --system
+```
+
+For detailed macOS installation and administration documentation, see [docs/agent-installation-macos.md](../docs/agent-installation-macos.md).
+
 ### Self-Hosted Deployment
 
 For self-hosted NetWatcher instances:
@@ -57,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/netwatcherio/agent/master/install.s
 
 ```powershell
 # Windows
-.\install.ps1 -Host "your-controller.example.com" -SSL $true -Workspace 1 -Id 42 -Pin "123456789"
+powershell -ExecutionPolicy Bypass -File install.ps1 -Host "your-controller.example.com" -SSL $true -Workspace 1 -Id 42 -Pin "123456789"
 ```
 
 ## Configuration
@@ -77,6 +101,8 @@ The agent stores its configuration in `config.conf`:
 | Platform | Path |
 |----------|------|
 | Linux | `/opt/netwatcher-agent/config.conf` |
+| macOS (user-level) | `~/netwatcher-agent/config.conf` |
+| macOS (system-level) | `/var/root/netwatcher-agent/config.conf` |
 | Windows | `C:\Program Files\NetWatcher-Agent\config.conf` |
 
 ## Service Management
@@ -95,6 +121,19 @@ sudo journalctl -u netwatcher-agent -f   # View logs
 Get-Service -Name NetWatcherAgent        # Check status
 Restart-Service -Name NetWatcherAgent    # Restart
 Get-EventLog -LogName Application -Source NetWatcherAgent -Newest 20  # View logs
+```
+
+### macOS (launchd)
+
+```bash
+# User-level service
+launchctl list | grep com.netwatcher.agent   # Check status
+tail -f ~/netwatcher-agent/agent.log          # View logs
+launchctl stop com.netwatcher.agent && launchctl start com.netwatcher.agent  # Restart
+
+# System-level service
+sudo launchctl list | grep com.netwatcher.agent   # Check status
+sudo tail -f /var/root/netwatcher-agent/agent.log # View logs
 ```
 
 ## Installer Options
@@ -129,6 +168,40 @@ sudo ./install.sh --uninstall
 
 # Force uninstall without confirmation
 sudo ./install.sh --uninstall --force
+```
+
+### macOS (`install-macos.sh`)
+
+| Flag | Description |
+|------|-------------|
+| `--workspace`, `-w` | Workspace ID (required for install) |
+| `--id`, `-i` | Agent ID (required for install) |
+| `--pin`, `-p` | Agent PIN (required for install) |
+| `--host` | Controller host (default: `api.netwatcher.io`) |
+| `--ssl` | Use SSL/HTTPS — `true` or `false` (default: `true`) |
+| `--install-dir` | Installation directory (default: `~/netwatcher-agent`) |
+| `--system` | Install as system-level service (requires sudo) |
+| `--user` | Install as user-level service (default, no sudo) |
+| `--force` | Force reinstallation or skip uninstall confirmation |
+| `--no-service` | Skip launchd service creation |
+| `--no-start` | Don't start the service after installation |
+| `--version` | Install a specific version tag |
+| `--update` | Update only the binary (preserves config and service) |
+| `--uninstall` | Uninstall the agent |
+| `--debug` | Enable debug output |
+
+```bash
+# Update to latest
+./install-macos.sh --update
+
+# Update to specific version
+./install-macos.sh --update --version v20260219-5c692b8
+
+# Uninstall
+./install-macos.sh --uninstall
+
+# Force uninstall without confirmation
+./install-macos.sh --uninstall --force
 ```
 
 ### Windows (`install.ps1`)
@@ -216,6 +289,12 @@ sudo journalctl -u netwatcher-agent -f
 
 # Linux - Last 100 lines
 sudo journalctl -u netwatcher-agent -n 100
+
+# macOS - User-level
+tail -f ~/netwatcher-agent/agent.log
+
+# macOS - System-level
+sudo tail -f /var/root/netwatcher-agent/agent.log
 
 # Windows
 Get-EventLog -LogName Application -Source NetWatcherAgent -Newest 50
