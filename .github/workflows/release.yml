@@ -85,6 +85,10 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      date: ${{ steps.version.outputs.date }}
+      hash: ${{ steps.version.outputs.hash }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -98,6 +102,7 @@ jobs:
           cache: false
 
       - name: Get version metadata
+        id: version
         run: |
           DATE=$(date +%Y%m%d)
           HASH=$(git rev-parse --short HEAD)
