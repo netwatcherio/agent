@@ -48,17 +48,21 @@ func getCurrentProbes() []probes.Probe {
 
 func setCurrentProbes(probes []probes.Probe) {
 	currentProbeListMu.Lock()
-	defer currentProbeListMu.Unlock()
 	currentProbeList = probes
+	currentProbeListMu.Unlock()
 
 	// Refresh bidirectional for server - the probe list may have updated
-	// and connections that were established before the list was populated need re-checking
-	activeTrafficSimServerMu.RLock()
-	server := activeTrafficSimServer
-	activeTrafficSimServerMu.RUnlock()
-	if server != nil {
-		server.RefreshBidirectional()
-	}
+	// and connections that were established before the list was populated need re-checking.
+	// Must be called AFTER releasing currentProbeListMu to avoid deadlock, since
+	// RefreshBidirectional -> GetClientProbeForAgent -> getCurrentProbes -> currentProbeListMu.RLock
+	go func() {
+		activeTrafficSimServerMu.RLock()
+		server := activeTrafficSimServer
+		activeTrafficSimServerMu.RUnlock()
+		if server != nil {
+			server.RefreshBidirectional()
+		}
+	}()
 }
 
 // SetControllerConfig stores the controller config for use by network probes
