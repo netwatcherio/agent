@@ -4,6 +4,7 @@
 package platform
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -168,6 +169,11 @@ func IsDebugMode() bool {
 		}
 	}
 	return os.Getenv("NETWATCHER_DEBUG") != ""
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // RequestServiceRestart signals the service handler to initiate a restart.
@@ -358,22 +364,38 @@ exit 1
 	// Pre-create the log file from Go (running as SYSTEM) so the file inherits
 	// proper ACLs. Without this, PowerShell can't create new files in Program Files
 	// even when spawned by a SYSTEM-level service.
-	seedEntry := fmt.Sprintf("%s - [Go] Restart initiated, spawning PowerShell script\n",
-		time.Now().Format("2006-01-02 15:04:05"))
+	seedEntry := fmt.Sprintf("%s - [Go] Restart initiated\n"+
+		"  exe_path: %s\n"+
+		"  script_path: %s\n"+
+		"  log_path: %s\n"+
+		"  update_dir: %s\n"+
+		"  pid: %d\n"+
+		"  cwd: %s\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		exePath, scriptPath, logPath, updateDir,
+		os.Getpid(), exeDir)
 	if err := os.WriteFile(logPath, []byte(seedEntry), 0644); err != nil {
 		log.WithError(err).Warn("Failed to pre-create restart log file")
-		// Non-fatal — the script will still try to restart the service even without logging
 	}
 
-	log.WithField("script", scriptPath).Info("Spawning restart process")
+	log.WithFields(log.Fields{
+		"script_path":   scriptPath,
+		"log_path":      logPath,
+		"exe_path":      exePath,
+		"script_exists": fileExists(scriptPath),
+	}).Info("Spawning restart process")
 
 	// Run PowerShell in a completely detached process
 	// -WindowStyle Hidden prevents any visible window
 	// -ExecutionPolicy Bypass ensures the script runs even with restricted policies
+	// -NoProfile skips loading PowerShell profile for faster startup
+	// Use -Command with quoted path instead of -File to handle paths with spaces correctly
+	// The & call operator ensures PowerShell interprets the path as a literal string
 	cmd := exec.Command("powershell.exe",
 		"-WindowStyle", "Hidden",
 		"-ExecutionPolicy", "Bypass",
-		"-File", scriptPath)
+		"-NoProfile",
+		"-Command", fmt.Sprintf("& '%s'", scriptPath))
 
 	// CRITICAL: Use Windows process creation flags to fully detach the child process.
 	// Without these flags, the PowerShell process is killed when the parent service stops
@@ -391,8 +413,11 @@ exit 1
 
 	// Ensure no handle inheritance
 	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+
+	// Capture stdout/stderr to help diagnose why PowerShell exits immediately
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
 		// Direct spawn failed — likely Job Object breakaway is disallowed by Group Policy.
@@ -411,7 +436,20 @@ exit 1
 	select {
 	case err := <-done:
 		// Process exited immediately — this is abnormal, PowerShell didn't initialize
-		log.WithError(err).Warn("Restart process exited immediately, trying Task Scheduler fallback")
+		// Capture output for debugging even though process exited
+		errMsg := "Restart process exited immediately"
+		if stdout.Len() > 0 {
+			errMsg += fmt.Sprintf(", stdout: %s", stdout.String())
+		}
+		if stderr.Len() > 0 {
+			errMsg += fmt.Sprintf(", stderr: %s", stderr.String())
+		}
+		if err == nil {
+			// Exit with code 0 is still an error for our purposes - PowerShell should still be running
+			log.Warn(errMsg + ", trying Task Scheduler fallback")
+		} else {
+			log.WithError(err).Warn(errMsg + ", trying Task Scheduler fallback")
+		}
 		return scheduleRestartViaTaskScheduler(scriptPath)
 	case <-time.After(2 * time.Second):
 		// Process still running after 2s — PowerShell has initialized successfully
@@ -427,15 +465,38 @@ exit 1
 // immune to SCM process cleanup.
 func scheduleRestartViaTaskScheduler(scriptPath string) error {
 	startTime := time.Now().Add(10 * time.Second).Format("15:04")
+
+	// First try with /RL HIGHEST which requires admin privileges
+	// If that fails (common in containers or restricted environments), retry without it
+	var stderr bytes.Buffer
 	taskCmd := exec.Command("schtasks.exe",
 		"/Create", "/TN", "NetWatcherRestart",
 		"/TR", fmt.Sprintf(`powershell.exe -ExecutionPolicy Bypass -File "%s"`, scriptPath),
 		"/SC", "ONCE", "/ST", startTime,
 		"/F", "/RL", "HIGHEST")
+	taskCmd.Stderr = &stderr
 
 	if taskErr := taskCmd.Run(); taskErr != nil {
-		os.Remove(scriptPath)
-		return fmt.Errorf("failed to schedule restart via Task Scheduler: %w", taskErr)
+		// /RL HIGHEST may fail due to insufficient privileges.
+		// Retry without it - the task will still run, just not with highest privileges.
+		log.WithFields(log.Fields{
+			"error":  taskErr,
+			"stderr": stderr.String(),
+		}).Warn("Task Scheduler with HIGHEST privileges failed, retrying without")
+
+		// Retry without /RL HIGHEST
+		stderr.Reset()
+		taskCmd = exec.Command("schtasks.exe",
+			"/Create", "/TN", "NetWatcherRestart",
+			"/TR", fmt.Sprintf(`powershell.exe -ExecutionPolicy Bypass -File "%s"`, scriptPath),
+			"/SC", "ONCE", "/ST", startTime,
+			"/F")
+		taskCmd.Stderr = &stderr
+
+		if taskErr2 := taskCmd.Run(); taskErr2 != nil {
+			os.Remove(scriptPath)
+			return fmt.Errorf("failed to schedule restart via Task Scheduler (tried HIGHEST and standard): %w (stderr: %s)", taskErr2, stderr.String())
+		}
 	}
 
 	log.WithField("scheduled_time", startTime).Info("Restart scheduled via Task Scheduler as fallback")
