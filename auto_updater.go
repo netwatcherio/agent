@@ -89,7 +89,10 @@ func (u *AutoUpdater) Start(ctx context.Context) {
 
 // checkForUpdate checks if a new version is available and updates if needed
 func (u *AutoUpdater) checkForUpdate() {
-	log.Debug("Checking for updates...")
+	log.WithFields(log.Fields{
+		"goos":   runtime.GOOS,
+		"goarch": runtime.GOARCH,
+	}).Debug("Checking for updates...")
 
 	latestRelease, err := u.getLatestRelease()
 	if err != nil {
@@ -102,11 +105,12 @@ func (u *AutoUpdater) checkForUpdate() {
 		return
 	}
 
-	// Compare versions
 	if !u.isNewerVersion(latestRelease.TagName, u.config.CurrentVersion) {
 		log.WithFields(log.Fields{
 			"latest":  latestRelease.TagName,
 			"current": u.config.CurrentVersion,
+			"goos":    runtime.GOOS,
+			"goarch":  runtime.GOARCH,
 		}).Debug("Already up to date")
 		return
 	}
@@ -114,6 +118,9 @@ func (u *AutoUpdater) checkForUpdate() {
 	log.WithFields(log.Fields{
 		"new_version":     latestRelease.TagName,
 		"current_version": u.config.CurrentVersion,
+		"goos":            runtime.GOOS,
+		"goarch":          runtime.GOARCH,
+		"total_assets":    len(latestRelease.Assets),
 	}).Info("New version available")
 
 	// Find appropriate asset for current platform
@@ -333,65 +340,136 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 
-	// Build exact platform string we're looking for
-	// Asset naming convention: netwatcher-{version}-{os}-{arch}.{ext}
-	osPatterns := []string{goos}
-	archPatterns := []string{goarch}
-
-	// Add OS aliases
-	if goos == "windows" {
-		osPatterns = append(osPatterns, "win")
-	} else if goos == "darwin" {
-		osPatterns = append(osPatterns, "macos", "mac")
-	}
-
-	// Add architecture aliases
-	if goarch == "amd64" {
-		archPatterns = append(archPatterns, "x86_64", "x64")
-	} else if goarch == "arm64" {
-		archPatterns = append(archPatterns, "aarch64")
-	}
-
 	log.WithFields(log.Fields{
-		"os_patterns":   osPatterns,
-		"arch_patterns": archPatterns,
-	}).Debug("Looking for matching asset")
+		"goos":   goos,
+		"goarch": goarch,
+		"assets": len(release.Assets),
+	}).Debug("findAssetForPlatform: searching for matching asset")
 
 	for _, asset := range release.Assets {
 		name := strings.ToLower(asset.Name)
 
-		// Must contain netwatcher
 		if !strings.Contains(name, "netwatcher") {
 			continue
 		}
 
-		// Must match BOTH os AND architecture
-		var osMatch, archMatch bool
-		for _, pattern := range osPatterns {
-			if strings.Contains(name, strings.ToLower(pattern)) {
-				osMatch = true
-				break
-			}
-		}
-		for _, pattern := range archPatterns {
-			if strings.Contains(name, strings.ToLower(pattern)) {
-				archMatch = true
-				break
-			}
+		assetOS, assetArch, err := parseAssetName(name)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"asset": asset.Name,
+				"error": err.Error(),
+			}).Debug("Skipping asset - could not parse OS/arch")
+			continue
 		}
 
-		if osMatch && archMatch {
-			log.WithField("asset", asset.Name).Info("Found matching asset")
-			return &asset
+		if !isOSMatch(assetOS, goos) {
+			log.WithFields(log.Fields{
+				"asset":    asset.Name,
+				"assetOS":  assetOS,
+				"targetOS": goos,
+			}).Debug("Skipping asset - OS mismatch")
+			continue
 		}
+
+		if !isArchMatch(assetArch, goarch) {
+			log.WithFields(log.Fields{
+				"asset":      asset.Name,
+				"assetArch":  assetArch,
+				"targetArch": goarch,
+			}).Debug("Skipping asset - arch mismatch")
+			continue
+		}
+
+		log.WithFields(log.Fields{
+			"asset":       asset.Name,
+			"matchedOS":   goos,
+			"matchedArch": goarch,
+		}).Info("Found matching asset")
+		return &asset
 	}
 
-	// No fallback - if we can't find an exact match, don't download wrong binary
 	log.WithFields(log.Fields{
 		"os":   goos,
 		"arch": goarch,
 	}).Warn("No matching asset found for this platform")
 	return nil
+}
+
+// parseAssetName extracts OS and arch from asset name following the pattern:
+// netwatcher-{version}-{os}-{arch}.{ext}
+// Returns the detected OS string and arch string, or error if parsing fails.
+func parseAssetName(name string) (os string, arch string, err error) {
+	// Remove extension (.zip, .tar.gz, .exe)
+	base := name
+	if idx := strings.LastIndex(base, "."); idx > 0 {
+		base = base[:idx]
+	}
+
+	parts := strings.Split(base, "-")
+	if len(parts) < 4 {
+		return "", "", fmt.Errorf("asset name doesn't have enough dash-separated parts: %s", name)
+	}
+
+	// OS is the third-to-last part (after netwatcher and version)
+	// Arch is the second-to-last part
+	// Example: netwatcher-v20260407-e33e3f4-darwin-amd64 -> [netwatcher, v20260407, e33e3f4, darwin, amd64]
+	os = parts[len(parts)-2]
+	arch = parts[len(parts)-1]
+
+	return os, arch, nil
+}
+
+// isOSMatch checks if the detected OS in the asset matches the target OS,
+// accounting for OS aliases (win->windows, mac/macos->darwin).
+func isOSMatch(assetOS, targetOS string) bool {
+	assetOS = strings.ToLower(assetOS)
+	targetOS = strings.ToLower(targetOS)
+
+	if assetOS == targetOS {
+		return true
+	}
+
+	osAliases := map[string][]string{
+		"windows": {"win"},
+		"darwin":  {"macos", "mac"},
+		"linux":   {},
+	}
+
+	if aliases, ok := osAliases[targetOS]; ok {
+		for _, alias := range aliases {
+			if assetOS == alias {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// isArchMatch checks if the detected architecture in the asset matches the target arch,
+// accounting for architecture aliases.
+func isArchMatch(assetArch, targetArch string) bool {
+	assetArch = strings.ToLower(assetArch)
+	targetArch = strings.ToLower(targetArch)
+
+	if assetArch == targetArch {
+		return true
+	}
+
+	archAliases := map[string][]string{
+		"amd64": {"x86_64", "x64"},
+		"arm64": {"aarch64"},
+	}
+
+	if aliases, ok := archAliases[targetArch]; ok {
+		for _, alias := range aliases {
+			if assetArch == alias {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // downloadAndApplyUpdate downloads and applies the update

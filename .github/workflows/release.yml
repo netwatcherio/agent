@@ -166,6 +166,39 @@ jobs:
             echo "ERROR: Expected 7 zip files (3 linux + 2 windows + 2 darwin), but found $ZIP_COUNT"
             exit 1
           fi
+          
+          VERSION="${{ needs.build-linux-windows.outputs.version }}"
+          
+          echo "Verifying specific platform artifacts..."
+          
+          # Verify Linux artifacts
+          for arch in amd64 arm64 arm; do
+            if [ ! -f "bin/netwatcher-${VERSION}-linux-${arch}.zip" ]; then
+              echo "ERROR: Missing Linux ${arch} artifact: netwatcher-${VERSION}-linux-${arch}.zip"
+              exit 1
+            fi
+            echo "  [OK] Linux ${arch}"
+          done
+          
+          # Verify Windows artifacts
+          for arch in amd64 arm64; do
+            if [ ! -f "bin/netwatcher-${VERSION}-windows-${arch}.zip" ]; then
+              echo "ERROR: Missing Windows ${arch} artifact: netwatcher-${VERSION}-windows-${arch}.zip"
+              exit 1
+            fi
+            echo "  [OK] Windows ${arch}"
+          done
+          
+          # Verify macOS artifacts
+          for arch in amd64 arm64; do
+            if [ ! -f "bin/netwatcher-${VERSION}-darwin-${arch}.zip" ]; then
+              echo "ERROR: Missing macOS ${arch} artifact: netwatcher-${VERSION}-darwin-${arch}.zip"
+              exit 1
+            fi
+            echo "  [OK] macOS ${arch}"
+          done
+          
+          echo "All platform artifacts verified successfully!"
 
       - name: Generate checksums
         run: |

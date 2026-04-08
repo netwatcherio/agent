@@ -218,27 +218,76 @@ function Find-MatchingAsset {
         [string]$Architecture
     )
     
-    # Look for Windows assets matching our architecture
-    $patterns = @(
-        "windows.*$Architecture.*\.zip$",
-        "windows.*$Architecture.*\.exe$",
-        "win.*$Architecture.*\.zip$"
-    )
+    $osPatterns = @("windows", "win")
+    $archPatterns = @($Architecture)
     
-    foreach ($pattern in $patterns) {
-        $match = $Assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
-        if ($match) {
-            return $match
+    if ($Architecture -eq "amd64") {
+        $archPatterns += @("x86_64", "x64")
+    } elseif ($Architecture -eq "arm64") {
+        $archPatterns += @("aarch64")
+    }
+    
+    foreach ($asset in $Assets) {
+        $name = $asset.name.ToLower()
+        
+        if (-not $name.Contains("netwatcher")) {
+            continue
+        }
+        
+        $os, $arch, $err = Parse-AssetName -Name $name
+        if ($err) {
+            Write-Verbose "Skipping $($asset.name): $err"
+            continue
+        }
+        
+        $osMatch = $false
+        foreach ($pattern in $osPatterns) {
+            if ($os -eq $pattern) {
+                $osMatch = $true
+                break
+            }
+        }
+        
+        $archMatch = $false
+        foreach ($pattern in $archPatterns) {
+            if ($arch -eq $pattern) {
+                $archMatch = $true
+                break
+            }
+        }
+        
+        if ($osMatch -and $archMatch) {
+            return $asset
         }
     }
     
-    # Fallback: look for any Windows asset
-    $fallback = $Assets | Where-Object { $_.name -match "windows|win" -and $_.name -match $Architecture } | Select-Object -First 1
-    if ($fallback) {
-        return $fallback
+    return $null
+}
+
+function Parse-AssetName {
+    param([string]$Name)
+    
+    $nameLower = $Name.ToLower()
+    
+    if ($nameLower.EndsWith(".zip")) {
+        $base = $nameLower.Substring(0, $nameLower.Length - 4)
+    } elseif ($nameLower.EndsWith(".tar.gz")) {
+        $base = $nameLower.Substring(0, $nameLower.Length - 7)
+    } elseif ($nameLower.EndsWith(".exe")) {
+        $base = $nameLower.Substring(0, $nameLower.Length - 4)
+    } else {
+        return $null, $null, "Unknown extension"
     }
     
-    return $null
+    $parts = $base.Split("-")
+    if ($parts.Count -lt 4) {
+        return $null, $null, "Not enough dash-separated parts"
+    }
+    
+    $os = $parts[$parts.Count - 2]
+    $arch = $parts[$parts.Count - 1]
+    
+    return $os, $arch, $null
 }
 
 function Test-ServiceExists {
