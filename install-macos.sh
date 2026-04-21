@@ -57,7 +57,7 @@ Required Arguments (for installation):
     --pin, -p <AGENT_PIN>           Agent PIN
 
 Optional Arguments:
-    --host <HOST>           Controller host (default: api.α2.io)
+    --host <HOST>           Controller host (default: api.netwatcher.io)
     --ssl <true|false>      Use SSL/HTTPS (default: true)
     --install-dir <DIR>     Installation directory (default: ~/netwatcher-agent)
     --system                Install as system-wide launchd service (requires sudo)
@@ -402,7 +402,7 @@ download_and_install() {
 
     local found_binary=""
 
-    for name in "α2-agent" "α2" "agent"; do
+    for name in "netwatcher-agent" "netwatcher" "agent"; do
         local candidate=$(find "$INSTALL_DIR" -maxdepth 1 -name "$name" -type f 2>/dev/null | grep -v '\.backup' | head -1)
         if [[ -n "$candidate" ]]; then
             found_binary="$candidate"
@@ -411,7 +411,7 @@ download_and_install() {
     done
 
     if [[ -z "$found_binary" ]]; then
-        found_binary=$(find "$INSTALL_DIR" -maxdepth 1 -type f -name "*α2*" 2>/dev/null | grep -v '\.backup' | grep -v '\.conf$' | grep -v '\.json$' | grep -v '\.log' | head -1)
+        found_binary=$(find "$INSTALL_DIR" -maxdepth 1 -type f -name "*netwatcher*" 2>/dev/null | grep -v '\.backup' | grep -v '\.conf$' | grep -v '\.json$' | grep -v '\.log' | head -1)
     fi
 
     if [[ -n "$found_binary" ]] && [[ "$found_binary" != "$binary_path" ]]; then
