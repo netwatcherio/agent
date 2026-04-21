@@ -62,6 +62,7 @@ Optional Arguments:
     --install-dir <DIR>     Installation directory (default: ~/netwatcher-agent)
     --system                Install as system-wide launchd service (requires sudo)
     --user                  Install as user-level launchd service (default, no sudo)
+    --boot-service          Install as system-wide boot service (auto-starts at boot, hidden from Dock, requires sudo)
     --force                 Force reinstallation or skip uninstall confirmation
     --no-service            Skip launchd service creation
     --no-start              Don't start the service after installation
@@ -72,11 +73,11 @@ Optional Arguments:
     --help, -h              Show this help message
 
 Examples:
-    # Basic installation (user-level, no sudo required)
-    $0 --workspace 1 --id 42 --pin 123456789
+    # Boot service installation (auto-starts at boot, recommended for root)
+    sudo $0 --workspace 1 --id 42 --pin 123456789
 
-    # System-level installation (runs always, requires sudo)
-    sudo $0 --workspace 1 --id 42 --pin 123456789 --system
+    # User-level installation (starts at login, no sudo)
+    $0 --workspace 1 --id 42 --pin 123456789 --user
 
     # Update binary only
     $0 --update
@@ -130,6 +131,11 @@ parse_arguments() {
                 SYSTEM_LEVEL=false
                 shift
                 ;;
+            --boot-service)
+                BOOT_SERVICE=true
+                SYSTEM_LEVEL=true
+                shift
+                ;;
             --no-service)
                 NO_SERVICE=true
                 shift
@@ -171,6 +177,14 @@ parse_arguments() {
     UNINSTALL_MODE=${UNINSTALL_MODE:-false}
     UPDATE_MODE=${UPDATE_MODE:-false}
     DEBUG=${DEBUG:-false}
+
+    if [[ "$BOOT_SERVICE" == true ]]; then
+        SYSTEM_LEVEL=true
+    elif [[ -w "/Library/LaunchDaemons" ]] && [[ "$BOOT_SERVICE" != false ]]; then
+        log_info "Running as root - enabling boot service for automatic startup at boot"
+        BOOT_SERVICE=true
+        SYSTEM_LEVEL=true
+    fi
 }
 
 validate_arguments() {
@@ -452,7 +466,7 @@ EOF
 }
 
 get_plist_destination() {
-    if [[ "$SYSTEM_LEVEL" == true ]]; then
+    if [[ "$BOOT_SERVICE" == true ]] || [[ "$SYSTEM_LEVEL" == true ]]; then
         echo "/Library/LaunchDaemons/${LAUNCHD_PLIST}"
     else
         echo "$HOME/Library/LaunchAgents/${LAUNCHD_PLIST}"
@@ -470,7 +484,40 @@ create_launchd_service() {
 
     log_info "Creating launchd service file: $plist_path"
 
-    if [[ "$SYSTEM_LEVEL" == true ]]; then
+    if [[ "$BOOT_SERVICE" == true ]]; then
+        cat > "$plist_path" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/${BINARY_NAME}</string>
+        <string>--config</string>
+        <string>${INSTALL_DIR}/${CONFIG_FILE}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${INSTALL_DIR}/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>${INSTALL_DIR}/agent.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>UserName</key>
+    <string>root</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
+EOF
+    elif [[ "$SYSTEM_LEVEL" == true ]]; then
         cat > "$plist_path" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -627,7 +674,7 @@ show_summary() {
     echo "  - Binary: ${INSTALL_DIR}/${BINARY_NAME}"
     echo "  - Config: ${INSTALL_DIR}/${CONFIG_FILE}"
     echo "  - Service: $SERVICE_NAME"
-    echo "  - Service level: $([[ "$SYSTEM_LEVEL" == true ]] && echo "system-wide" || echo "user-level")"
+    echo "  - Service level: $([[ "$BOOT_SERVICE" == true ]] && echo "boot service (hidden)" || ([[ "$SYSTEM_LEVEL" == true ]] && echo "system-wide" || echo "user-level"))"
     echo "  - Version: $VERSION"
     echo
     log_info "Useful Commands:"
@@ -638,7 +685,9 @@ show_summary() {
     echo "  - Unload: launchctl unload $(get_plist_destination)"
     echo
     if [[ "$NO_SERVICE" != true ]]; then
-        if [[ "$SYSTEM_LEVEL" == true ]]; then
+        if [[ "$BOOT_SERVICE" == true ]]; then
+            log_info "The NetWatcher Agent is now running as a boot service and will start automatically at system boot (hidden from Dock)."
+        elif [[ "$SYSTEM_LEVEL" == true ]]; then
             log_info "The NetWatcher Agent is now running as a system service and will start automatically on boot."
         else
             log_info "The NetWatcher Agent is now running as a user service and will start automatically on login."
