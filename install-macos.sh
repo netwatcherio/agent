@@ -2,14 +2,18 @@
 
 set -e
 
-GITHUB_REPO="α2io/agent"
+# Configuration
+GITHUB_REPO="netwatcherio/agent"
+BINARY_NAME="netwatcher-agent"
+
+# Default values
+DEFAULT_HOST="https://api.netwatcher.io"
+DEFAULT_HOST_WS="wss://api.netwatcher.io/agent_ws"
+
 INSTALL_DIR="$HOME/netwatcher-agent"
-SERVICE_NAME="com.netwatcher.agent"
+SERVICE_NAME="io.netwatcher.agent"
 CONFIG_FILE="config.conf"
 LAUNCHD_PLIST="${SERVICE_NAME}.plist"
-BINARY_NAME="α2-agent"
-
-DEFAULT_HOST="api.α2.io"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
