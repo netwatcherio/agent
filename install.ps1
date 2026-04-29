@@ -643,14 +643,22 @@ AGENT_PIN=$Pin
         
         try {
             Start-Service -Name $Script:ServiceName
-            Start-Sleep -Seconds 2
             
-            $service = Get-Service -Name $Script:ServiceName
-            if ($service.Status -eq 'Running') {
-                Write-Success "Service is running"
+            $timeout = 30
+            $elapsed = 0
+            while ($elapsed -lt $timeout) {
+                $service = Get-Service -Name $Script:ServiceName
+                if ($service.Status -eq 'Running') {
+                    Write-Success "Service is running"
+                    break
+                }
+                Start-Sleep -Seconds 1
+                $elapsed++
             }
-            else {
-                Write-Warning "Service status: $($service.Status)"
+            
+            if ($elapsed -ge $timeout) {
+                $service = Get-Service -Name $Script:ServiceName
+                Write-Warning "Service did not start within $timeout seconds. Status: $($service.Status)"
                 Write-Info "Check logs with: Get-EventLog -LogName Application -Source $Script:ServiceName"
             }
         }
