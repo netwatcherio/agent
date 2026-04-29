@@ -5,6 +5,7 @@ package platform
 
 import (
 	"context"
+	"os"
 )
 
 // AgentRunner is the function signature for the main agent logic.
@@ -30,4 +31,11 @@ func RunService(name string, runner AgentRunner) error {
 func RequestServiceRestart() bool {
 	// On Unix, we just exit and let the init system restart us
 	return false
+}
+
+// WatchdogRestart on Unix exits with code 1 to trigger systemd/launchd restart.
+// Same behavior as auto_updater restart, but separate function for independent deployability.
+func WatchdogRestart() {
+	// On Unix, we just exit with code 1 and let the init system restart us
+	os.Exit(1)
 }

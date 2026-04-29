@@ -281,7 +281,7 @@ func runAgent(ctx context.Context) error {
 
 				if elapsed > watchdogTimeout {
 					log.Errorf("Watchdog: no successful activity for %v, forcing restart", elapsed.Round(time.Second))
-					os.Exit(1) // systemd/SCM will restart us
+					platform.WatchdogRestart()
 				}
 			}
 		}

@@ -208,6 +208,22 @@ func RequestServiceRestart() bool {
 	return true
 }
 
+// WatchdogRestart triggers a graceful service restart for watchdog-forced restarts.
+// Mirrors auto_updater restart pattern but uses exit code 1 (failure) instead of 0.
+// This ensures the restart script has time to initialize before the process exits.
+func WatchdogRestart() {
+	log.Info("Watchdog: initiating graceful restart...")
+
+	if RequestServiceRestart() {
+		log.Info("Watchdog: service restart requested, waiting for graceful shutdown...")
+		time.Sleep(6 * time.Second)
+		log.Warn("Watchdog: service restart did not complete, falling back to exit")
+	}
+
+	log.Info("Watchdog: exiting for restart...")
+	os.Exit(1)
+}
+
 // spawnRestartProcess creates a detached process that will restart the service
 // after the current process exits. This ensures the SCM sees a clean shutdown
 // before the service is restarted.
