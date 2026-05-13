@@ -3,7 +3,6 @@ package workers
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	nettime "github.com/netwatcherio/netwatcher-agent/nettime"
 	"github.com/netwatcherio/netwatcher-agent/probes"
