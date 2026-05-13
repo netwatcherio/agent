@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/netwatcherio/netwatcher-agent/web"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -263,7 +262,7 @@ func emitDNSResult(probe *Probe, dataChan chan ProbeData, target string, payload
 		Type:            ProbeType_DNS,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       web.AdjustedTime(),
+		CreatedAt:       nettime.AdjustedTime(),
 		SourceIP:        sourceIP,
 		SourceInterface: sourceIface,
 	}
