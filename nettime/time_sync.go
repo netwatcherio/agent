@@ -53,7 +53,7 @@ func SyncTime(ctx context.Context, apiURL string, workspaceID uint, agentID uint
 	}
 
 	var timeResp struct {
-		Time int64 `json:"time"` // Unix timestamp in milliseconds
+		Time int64 `json:"server_unix_ms"` // Unix timestamp in milliseconds
 	}
 	if err := json.Unmarshal(body, &timeResp); err != nil {
 		return fmt.Errorf("failed to parse time response: %w", err)
