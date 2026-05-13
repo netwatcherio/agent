@@ -24,7 +24,7 @@ func absDuration(d time.Duration) time.Duration {
 }
 
 // SyncTime fetches the controller's time and calculates the offset between local and server clocks
-func SyncTime(ctx context.Context, apiURL string) error {
+func SyncTime(ctx context.Context, apiURL string, workspaceID uint, agentID uint, psk string) error {
 	timeURL := apiURL + "/time"
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
@@ -32,6 +32,10 @@ func SyncTime(ctx context.Context, apiURL string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create time request: %w", err)
 	}
+
+	req.Header.Set("X-Workspace-ID", fmt.Sprintf("%d", workspaceID))
+	req.Header.Set("X-Agent-ID", fmt.Sprintf("%d", agentID))
+	req.Header.Set("X-Agent-PSK", psk)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
