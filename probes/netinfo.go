@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackpal/gateway"
+	"github.com/netwatcherio/netwatcher-agent/nettime"
 	"github.com/showwin/speedtest-go/speedtest"
 	log "github.com/sirupsen/logrus"
 )
@@ -229,7 +230,7 @@ func extractIP(cidr string) string {
 // Falls back to speedtest.FetchUserInfo() if controller is unavailable.
 func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (NetworkInfoResult, error) {
 	var n NetworkInfoResult
-	n.Timestamp = time.Now()
+	n.Timestamp = nettime.AdjustedTime()
 
 	// Try controller first if configured
 	if cfg != nil && cfg.Host != "" && cfg.PSK != "" {

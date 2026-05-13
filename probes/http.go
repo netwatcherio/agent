@@ -12,6 +12,8 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netwatcherio/netwatcher-agent/nettime"
 )
 
 type CertInfo struct {
@@ -123,7 +125,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 		targetURL = "https://" + targetURL
 	}
 
-	startTime := time.Now()
+	startTime := nettime.AdjustedTime()
 
 	var dnsStart, dnsEnd, connectStart, connectEnd, tlsStart, tlsEnd, firstByteTime time.Time
 	var tlsHandshakeDone bool
@@ -173,23 +175,23 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 			dnsStart = time.Now()
 		},
 		DNSDone: func(info httptrace.DNSDoneInfo) {
-			dnsEnd = time.Now()
+			dnsEnd = nettime.AdjustedTime()
 		},
 		ConnectStart: func(network, addr string) {
-			connectStart = time.Now()
+			connectStart = nettime.AdjustedTime()
 		},
 		ConnectDone: func(network, addr string, err error) {
-			connectEnd = time.Now()
+			connectEnd = nettime.AdjustedTime()
 		},
 		TLSHandshakeStart: func() {
-			tlsStart = time.Now()
+			tlsStart = nettime.AdjustedTime()
 		},
 		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
-			tlsEnd = time.Now()
+			tlsEnd = nettime.AdjustedTime()
 			tlsHandshakeDone = true
 		},
 		GotFirstResponseByte: func() {
-			firstByteTime = time.Now()
+			firstByteTime = nettime.AdjustedTime()
 		},
 	}
 
@@ -204,7 +206,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		result.Error = fmt.Sprintf("request failed: %v", err)
-		result.StopTimestamp = time.Now()
+		result.StopTimestamp = nettime.AdjustedTime()
 		result.TotalMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 		emitHTTPResult(probe, dataChan, result)
 		return err
@@ -275,7 +277,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 		}
 	}
 
-	result.StopTimestamp = time.Now()
+	result.StopTimestamp = nettime.AdjustedTime()
 
 	log.Infof("[http] %s %s -> %d (%.2fms)", method, targetURL, result.StatusCode, result.TotalMs)
 
@@ -316,7 +318,7 @@ func emitHTTPResult(probe *Probe, dataChan chan ProbeData, result HTTPPayload) {
 		Type:            ProbeType_HTTP,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       time.Now(),
+		CreatedAt:       nettime.AdjustedTime(),
 		SourceInterface: probe.BindInterface,
 	}
 }

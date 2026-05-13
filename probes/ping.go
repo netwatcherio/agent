@@ -8,6 +8,8 @@ import (
 
 	probing "github.com/prometheus-community/pro-bing"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netwatcherio/netwatcher-agent/nettime"
 )
 
 type PingPayload struct {
@@ -30,7 +32,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 	}
 	target := ac.Targets[0].Target
 
-	startTime := time.Now()
+	startTime := nettime.AdjustedTime()
 
 	pinger, err := probing.NewPinger(target)
 	if err != nil {
@@ -105,7 +107,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 		// NOTE: stats.* RTT fields are already time.Duration per pro-bing
 		pingR := PingPayload{
 			StartTimestamp:        startTime,
-			StopTimestamp:         time.Now(),
+			StopTimestamp:         nettime.AdjustedTime(),
 			PacketsRecv:           stats.PacketsRecv,
 			PacketsSent:           stats.PacketsSent,
 			PacketsRecvDuplicates: stats.PacketsRecvDuplicates,

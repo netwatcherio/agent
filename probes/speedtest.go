@@ -5,6 +5,7 @@ import (
 	"github.com/showwin/speedtest-go/speedtest"
 	"github.com/showwin/speedtest-go/speedtest/transport"
 	log "github.com/sirupsen/logrus"
+	"github.com/netwatcherio/netwatcher-agent/nettime"
 	"strconv"
 	"time"
 )
@@ -111,7 +112,7 @@ func SpeedTest(cd *Probe) (SpeedTestPayload, error) {
 
 	result := SpeedTestPayload{
 		TestData:  s1,
-		Timestamp: time.Now(),
+		Timestamp: nettime.AdjustedTime(),
 	}
 
 	marshal, err := json.Marshal(result)

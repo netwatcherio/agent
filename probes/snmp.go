@@ -11,6 +11,8 @@ import (
 
 	"github.com/gosnmp/gosnmp"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netwatcherio/netwatcher-agent/nettime"
 )
 
 type SNMPConfig struct {
@@ -153,7 +155,7 @@ func SNMPProbe(probe *Probe, dataChan chan ProbeData) error {
 		port = 161
 	}
 
-	startTime := time.Now()
+	startTime := nettime.AdjustedTime()
 
 	params := &gosnmp.GoSNMP{
 		Target:  host,
@@ -194,7 +196,7 @@ func SNMPProbe(probe *Probe, dataChan chan ProbeData) error {
 
 	if err := params.Connect(); err != nil {
 		result.Error = fmt.Sprintf("connect failed: %v", err)
-		result.StopTimestamp = time.Now()
+		result.StopTimestamp = nettime.AdjustedTime()
 		result.QueryTimeMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 		emitSNMPResult(probe, dataChan, result)
 		return err
@@ -209,13 +211,13 @@ func SNMPProbe(probe *Probe, dataChan chan ProbeData) error {
 	snmpResults, err := params.Get(oids)
 	if err != nil {
 		result.Error = fmt.Sprintf("get failed: %v", err)
-		result.StopTimestamp = time.Now()
+		result.StopTimestamp = nettime.AdjustedTime()
 		result.QueryTimeMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 		emitSNMPResult(probe, dataChan, result)
 		return err
 	}
 
-	result.StopTimestamp = time.Now()
+	result.StopTimestamp = nettime.AdjustedTime()
 	result.QueryTimeMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 
 	for _, variable := range snmpResults.Variables {
@@ -414,7 +416,7 @@ func emitSNMPResult(probe *Probe, dataChan chan ProbeData, result SNMPPayload) {
 		Type:            ProbeType_SNMP,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       time.Now(),
+		CreatedAt:       nettime.AdjustedTime(),
 		SourceInterface: probe.BindInterface,
 	}
 }
