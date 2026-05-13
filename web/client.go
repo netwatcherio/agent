@@ -115,6 +115,10 @@ type Config struct {
 	AgentID        uint
 	PIN            string
 	PSK            string
+
+	// Time synchronization offset (duration to add to local time to get server time)
+	// Positive means local clock is behind server, negative means ahead
+	TimeOffset time.Duration
 }
 
 func mustEnv(name string) string {

@@ -245,6 +245,12 @@ func runAgent(ctx context.Context) error {
 			sent := workers.FlushRetryQueue(wsClient)
 			log.Infof("OnReconnect: flushed %d/%d queued items", sent, queueSize)
 		}
+
+		// Sync time with controller on reconnection
+		if err := web.SyncTime(context.Background(), cfg.APIURL); err != nil {
+			log.Warnf("OnReconnect: time sync failed: %v", err)
+		}
+
 		updateActivity()
 	}
 
@@ -260,6 +266,11 @@ func runAgent(ctx context.Context) error {
 
 	workers.FetchProbesWorker(probeGetCh, probeDataCh, primitive.NewObjectID())
 	workers.ProbeDataWorker(wsClient, probeDataCh)
+
+	// Sync time with controller on startup before connecting
+	if err := web.SyncTime(agentCtx, cfg.APIURL); err != nil {
+		log.Warnf("Startup time sync failed: %v (will retry on reconnect)", err)
+	}
 
 	go wsClient.ConnectWithRetry(agentCtx)
 
