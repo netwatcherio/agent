@@ -3,6 +3,7 @@ package probes
 import (
 	"encoding/json"
 	"github.com/elastic/go-sysinfo"
+	"github.com/netwatcherio/netwatcher-agent/nettime"
 	"time"
 )
 
@@ -65,7 +66,7 @@ type HostMemoryInfo struct {
 
 func SystemInfo() (CompleteSystemInfo, error) {
 	var n CompleteSystemInfo
-	n.Timestamp = time.Now()
+	n.Timestamp = nettime.AdjustedTime()
 
 	host, err := sysinfo.Host()
 
