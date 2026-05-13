@@ -247,7 +247,7 @@ func runAgent(ctx context.Context) error {
 		}
 
 		// Sync time with controller on reconnection
-		if err := web.SyncTime(context.Background(), cfg.APIURL); err != nil {
+		if err := web.SyncTime(context.Background(), cfg.APIURL, cfg.WorkspaceID, cfg.AgentID, psk); err != nil {
 			log.Warnf("OnReconnect: time sync failed: %v", err)
 		}
 
@@ -268,7 +268,7 @@ func runAgent(ctx context.Context) error {
 	workers.ProbeDataWorker(wsClient, probeDataCh)
 
 	// Sync time with controller on startup before connecting
-	if err := web.SyncTime(agentCtx, cfg.APIURL); err != nil {
+	if err := web.SyncTime(agentCtx, cfg.APIURL, cfg.WorkspaceID, cfg.AgentID, psk); err != nil {
 		log.Warnf("Startup time sync failed: %v (will retry on reconnect)", err)
 	}
 
