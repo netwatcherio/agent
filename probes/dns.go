@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/netwatcherio/netwatcher-agent/web"
 	log "github.com/sirupsen/logrus"
 )
 
