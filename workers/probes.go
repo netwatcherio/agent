@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/netwatcherio/netwatcher-agent/probes"
+	"github.com/netwatcherio/netwatcher-agent/web"
 
 	log "github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -1151,7 +1152,7 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		Type:      probes.ProbeType_SYSTEMINFO,
 		Payload:   marshal,
 		ProbeID:   probe.ID,
-		CreatedAt: time.Now(),
+		CreatedAt: web.AdjustedTime(),
 	}
 }
 
@@ -1180,7 +1181,7 @@ func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		Type:      probes.ProbeType_MTR,
 		Payload:   payload,
 		ProbeID:   probe.ID,
-		CreatedAt: time.Now(),
+		CreatedAt: web.AdjustedTime(),
 	}
 }
 
@@ -1287,7 +1288,7 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 		Type:      probes.ProbeType_NETWORKINFO,
 		Payload:   marshal,
 		ProbeID:   probe.ID,
-		CreatedAt: time.Now(),
+		CreatedAt: web.AdjustedTime(),
 	}
 }
 

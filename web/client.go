@@ -115,6 +115,81 @@ type Config struct {
 	AgentID        uint
 	PIN            string
 	PSK            string
+
+	// Time synchronization offset (duration to add to local time to get server time)
+	// Positive means local clock is behind server, negative means ahead
+	TimeOffset time.Duration
+}
+
+// timeOffset is a global variable holding the time offset between agent and controller
+// Positive offset means local time is behind server time
+var timeOffset time.Duration
+
+// SyncTime fetches the controller's time and calculates the offset between local and server clocks
+func SyncTime(ctx context.Context, cfg Config) error {
+	timeURL := cfg.APIURL + "/time"
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, timeURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create time request: %w", err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch controller time: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("time endpoint returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read time response: %w", err)
+	}
+
+	var timeResp struct {
+		Time int64 `json:"time"` // Unix timestamp in milliseconds
+	}
+	if err := json.Unmarshal(body, &timeResp); err != nil {
+		return fmt.Errorf("failed to parse time response: %w", err)
+	}
+
+	serverTime := time.UnixMilli(timeResp.Time)
+	localTime := time.Now()
+	offset := serverTime.Sub(localTime)
+
+	timeOffset = offset
+
+	// Warn if offset is significant (> 30 seconds)
+	if absDuration(offset) > 30*time.Second {
+		log.Warnf("Time sync: significant offset detected: %v (server=%v, local=%v)", offset, serverTime, localTime)
+	} else {
+		log.Infof("Time sync: offset=%v (server=%v, local=%v)", offset, serverTime, localTime)
+	}
+
+	return nil
+}
+
+// absDuration returns the absolute value of a duration
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+// GetTimeOffset returns the current time offset
+func GetTimeOffset() time.Duration {
+	return timeOffset
+}
+
+// AdjustedTime returns time.Now() adjusted by the time offset
+// Use this instead of time.Now() when creating timestamps for probe data
+func AdjustedTime() time.Time {
+	return time.Now().Add(timeOffset)
 }
 
 func mustEnv(name string) string {
