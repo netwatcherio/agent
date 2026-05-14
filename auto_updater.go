@@ -457,8 +457,12 @@ func isArchMatch(assetArch, targetArch string) bool {
 	}
 
 	archAliases := map[string][]string{
-		"amd64": {"x86_64", "x64"},
-		"arm64": {"aarch64"},
+		"amd64":    {"x86_64", "x64"},
+		"arm64":    {"aarch64"},
+		"mips":     {"mips32"},
+		"mipsle":   {"mipsel"},
+		"mips64":   {},
+		"mips64le": {},
 	}
 
 	if aliases, ok := archAliases[targetArch]; ok {

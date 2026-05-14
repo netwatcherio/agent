@@ -61,7 +61,7 @@ jobs:
           mkdir -p bin
           
           # Linux builds
-          for arch in amd64 arm64 arm; do
+          for arch in amd64 arm64 arm mips mipsle mips64 mips64le; do
             echo "Building linux/$arch..."
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-linux-$arch .
             cd bin && zip netwatcher-${VERSION}-linux-$arch.zip netwatcher-linux-$arch && rm netwatcher-linux-$arch && cd ..
@@ -162,9 +162,9 @@ jobs:
           ls -la bin/
           ZIP_COUNT=$(ls bin/*.zip 2>/dev/null | wc -l)
           echo "Found $ZIP_COUNT zip files"
-          if [ "$ZIP_COUNT" -lt 7 ]; then
-            echo "ERROR: Expected 7 zip files (3 linux + 2 windows + 2 darwin), but found $ZIP_COUNT"
-            exit 1
+          if [ "$ZIP_COUNT" -lt 11 ]; then
+              echo "ERROR: Expected 11 zip files (7 linux + 2 windows + 2 darwin), but found $ZIP_COUNT"
+              exit 1
           fi
           
           VERSION="${{ needs.build-linux-windows.outputs.version }}"
@@ -172,7 +172,7 @@ jobs:
           echo "Verifying specific platform artifacts..."
           
           # Verify Linux artifacts
-          for arch in amd64 arm64 arm; do
+          for arch in amd64 arm64 arm mips mipsle mips64 mips64le; do
             if [ ! -f "bin/netwatcher-${VERSION}-linux-${arch}.zip" ]; then
               echo "ERROR: Missing Linux ${arch} artifact: netwatcher-${VERSION}-linux-${arch}.zip"
               exit 1
@@ -222,8 +222,8 @@ jobs:
             **Branch:** master
             
             ### Platforms
-            
-            - **Linux:** amd64, arm64, arm
+
+            - **Linux:** amd64, arm64, arm, mips, mipsle, mips64, mips64le
             - **Windows:** amd64, arm64
             - **macOS:** amd64, arm64
             

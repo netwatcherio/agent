@@ -202,6 +202,10 @@ func (d *DependencyDownloader) getPlatformAliases(platform PlatformInfo) []strin
 		aliases = append(aliases, "aarch64")
 	case "386":
 		aliases = append(aliases, "i386", "x86")
+	case "mips":
+		aliases = append(aliases, "mips32")
+	case "mipsle":
+		aliases = append(aliases, "mipsel")
 	}
 
 	return aliases

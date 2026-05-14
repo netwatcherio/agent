@@ -49,6 +49,26 @@ func IsARM64() bool {
 	return runtime.GOARCH == "arm64"
 }
 
+// IsMIPS returns true if running on MIPS (big-endian) architecture.
+func IsMIPS() bool {
+	return runtime.GOARCH == "mips"
+}
+
+// IsMIPSLE returns true if running on MIPS (little-endian) architecture.
+func IsMIPSLE() bool {
+	return runtime.GOARCH == "mipsle"
+}
+
+// IsMIPS64 returns true if running on MIPS64 (big-endian) architecture.
+func IsMIPS64() bool {
+	return runtime.GOARCH == "mips64"
+}
+
+// IsMIPS64LE returns true if running on MIPS64 (little-endian) architecture.
+func IsMIPS64LE() bool {
+	return runtime.GOARCH == "mips64le"
+}
+
 // -------------------- Binary Helpers --------------------
 
 // BinaryName returns the platform-appropriate binary name.
@@ -77,7 +97,7 @@ func BinaryPath(name string) string {
 var SupportedOS = []string{"windows", "darwin", "linux"}
 
 // SupportedArch contains the list of supported architectures.
-var SupportedArch = []string{"amd64", "arm64"}
+var SupportedArch = []string{"amd64", "arm64", "mips", "mipsle", "mips64", "mips64le"}
 
 // ErrUnsupportedOS is returned when the OS is not supported.
 type ErrUnsupportedOS struct {
@@ -105,10 +125,12 @@ func CheckSupported() error {
 	case "windows", "darwin":
 		return nil
 	case "linux":
-		if runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" {
+		switch runtime.GOARCH {
+		case "amd64", "arm64", "mips", "mipsle", "mips64", "mips64le":
 			return nil
+		default:
+			return ErrUnsupportedArch{OS: runtime.GOOS, Arch: runtime.GOARCH}
 		}
-		return ErrUnsupportedArch{OS: runtime.GOOS, Arch: runtime.GOARCH}
 	default:
 		return ErrUnsupportedOS{OS: runtime.GOOS}
 	}

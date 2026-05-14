@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# NetWatcher Agent Installation Script
-# This script downloads, installs, and configures the NetWatcher Agent as a systemd service
+# NetWatcher Agent Installation Script for EdgeRouter
+# This script downloads, installs, and configures the NetWatcher Agent on Ubiquiti EdgeRouter devices
 
-set -e  # Exit on any error
+set -e
 
 # Configuration
 GITHUB_REPO="netwatcherio/agent"
@@ -13,8 +13,12 @@ CONFIG_FILE="config.conf"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 BINARY_NAME="netwatcher-agent"
 
+# EdgeRouter-specific paths
+EDGEROUTER_CONF="/etc/config/netwatcher-agent.conf"
+CONFIG_DIR="/opt/netwatcher-agent/config"
+
 # Default values
-DEFAULT_HOST="https://api.netwatcher.io"
+DEFAULT_HOST="api.netwatcher.io"
 DEFAULT_HOST_WS="wss://api.netwatcher.io/agent_ws"
 
 # Colors for output
@@ -22,7 +26,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # Logging functions
 log_info() {
@@ -41,20 +45,14 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
-log_debug() {
-    if [[ "$DEBUG" == "true" ]]; then
-        echo -e "${BLUE}[DEBUG]${NC} $1" >&2
-    fi
-}
-
 # Show usage information
 show_usage() {
     cat << EOF
-NetWatcher Agent Installation Script
+NetWatcher Agent Installation Script for EdgeRouter
 
 Usage: $0 --workspace <WORKSPACE_ID> --id <AGENT_ID> --pin <AGENT_PIN> [OPTIONS]
-       $0 --uninstall [--force] [--install-dir <DIR>]
-       $0 --update [--version <VERSION>] [--install-dir <DIR>]
+       $0 --uninstall [--force]
+       $0 --update [--version <VERSION>]
 
 Required Arguments (for installation):
     --workspace, -w <WORKSPACE_ID>  Workspace ID
@@ -64,38 +62,27 @@ Required Arguments (for installation):
 Optional Arguments:
     --host <HOST>           Controller host (default: api.netwatcher.io)
     --ssl <true|false>      Use SSL/HTTPS (default: true)
-    --install-dir <DIR>     Installation directory (default: $INSTALL_DIR)
-    --force                 Force reinstallation or skip uninstall confirmation
+    --force                 Force reinstallation or skip confirmation
     --no-service            Skip systemd service creation
     --no-start              Don't start the service after installation
     --version <VERSION>     Install specific version (default: latest)
-    --uninstall             Uninstall the agent instead of installing
-    --update                Update only the binary (keeps config/service)
-    --debug                 Enable debug output
-    --help, -h              Show this help message
+    --uninstall             Uninstall the agent
+    --update                Update only the binary
+    --help, -h              Show this help
+
+EdgeRouter Specific:
+    --low-memory           Optimize for low-memory devices (ER-X, ER-4)
+    --detect-model         Detect and display EdgeRouter model
 
 Examples:
-    # Basic installation with netwatcher.io (default)
+    # Basic installation
     $0 --workspace 1 --id 42 --pin 123456789
 
-    # Custom host configuration
-    $0 --workspace 1 --id 42 --pin 123456789 \\
-       --host myserver.com --ssl true
+    # With custom host
+    $0 --workspace 1 --id 42 --pin 123456789 --host myserver.com
 
-    # Install to custom directory
-    $0 --workspace 1 --id 42 --pin 123456789 --install-dir /usr/local/netwatcher
-
-    # Update binary only (manual recovery from failed auto-update)
-    $0 --update
-
-    # Update to specific version
-    $0 --update --version v20260114-abc123
-
-    # Uninstall the agent
-    $0 --uninstall
-
-    # Force uninstall without confirmation
-    $0 --uninstall --force
+    # Low-memory optimization for ER-X/ER-4
+    $0 --workspace 1 --id 42 --pin 123456789 --low-memory
 
 EOF
 }
@@ -124,10 +111,6 @@ parse_arguments() {
                 CONTROLLER_SSL="$2"
                 shift 2
                 ;;
-            --install-dir)
-                INSTALL_DIR="$2"
-                shift 2
-                ;;
             --version)
                 VERSION="$2"
                 shift 2
@@ -144,16 +127,20 @@ parse_arguments() {
                 NO_START=true
                 shift
                 ;;
+            --low-memory)
+                LOW_MEMORY=true
+                shift
+                ;;
+            --detect-model)
+                DETECT_MODEL=true
+                shift
+                ;;
             --uninstall)
                 UNINSTALL_MODE=true
                 shift
                 ;;
             --update)
                 UPDATE_MODE=true
-                shift
-                ;;
-            --debug)
-                DEBUG=true
                 shift
                 ;;
             --help|-h)
@@ -168,15 +155,14 @@ parse_arguments() {
         esac
     done
 
-    # Set defaults if not provided
-    CONTROLLER_HOST=${CONTROLLER_HOST:-"api.netwatcher.io"}
+    CONTROLLER_HOST=${CONTROLLER_HOST:-"$DEFAULT_HOST"}
     CONTROLLER_SSL=${CONTROLLER_SSL:-"true"}
     FORCE_INSTALL=${FORCE_INSTALL:-false}
     NO_SERVICE=${NO_SERVICE:-false}
     NO_START=${NO_START:-false}
+    LOW_MEMORY=${LOW_MEMORY:-false}
     UNINSTALL_MODE=${UNINSTALL_MODE:-false}
     UPDATE_MODE=${UPDATE_MODE:-false}
-    DEBUG=${DEBUG:-false}
 }
 
 # Validate required arguments
@@ -199,7 +185,6 @@ validate_arguments() {
         exit 1
     fi
 
-    # Validate PIN format (should be numeric)
     if [[ ! "$AGENT_PIN" =~ ^[0-9]+$ ]]; then
         log_error "Invalid PIN format. Expected numeric value."
         exit 1
@@ -214,52 +199,53 @@ check_root() {
     fi
 }
 
-# Detect system architecture
+# Detect EdgeRouter model
+detect_edgerouter_model() {
+    local model="Unknown"
+
+    if [[ -f /usr/bin/ubnt-hal-id ]]; then
+        model=$(ubnt-hal-id 2>/dev/null | grep -oE 'EdgeRouter[_-][[:alnum:]]+' | head -1 || echo "Unknown")
+    elif [[ -f /tmp/hw_info.txt ]]; then
+        model=$(grep -i "model" /tmp/hw_info.txt 2>/dev/null | cut -d':' -f2 | xargs || echo "Unknown")
+    elif [[ -f /dev/mtd0 ]]; then
+        local board=$(cat /proc/device-tree/board-name 2>/dev/null || echo "")
+        if [[ -n "$board" ]]; then
+            model="$board"
+        fi
+    fi
+
+    echo "$model"
+}
+
+# Detect system architecture for MIPS
 detect_architecture() {
     local arch=$(uname -m)
     local os=$(uname -s | tr '[:upper:]' '[:lower:]')
 
     case $arch in
-        x86_64|amd64)
-            ARCH="amd64"
-            ;;
-        aarch64|arm64)
-            ARCH="arm64"
-            ;;
-        armv7l)
-            ARCH="arm"
-            ;;
         mips)
             ARCH="mips"
+            log_info "Detected MIPS (big-endian) architecture"
             ;;
         mipsel)
             ARCH="mipsle"
+            log_info "Detected MIPS (little-endian) architecture"
             ;;
         mips64)
             ARCH="mips64"
+            log_info "Detected MIPS64 (big-endian) architecture"
             ;;
         mips64el)
             ARCH="mips64le"
+            log_info "Detected MIPS64 (little-endian) architecture"
             ;;
         *)
-            log_error "Unsupported architecture: $arch"
+            log_error "Unsupported architecture: $arch (EdgeRouter requires MIPS)"
             exit 1
             ;;
     esac
 
-    case $os in
-        linux)
-            OS="linux"
-            ;;
-        darwin)
-            OS="darwin"
-            ;;
-        *)
-            log_error "Unsupported operating system: $os"
-            exit 1
-            ;;
-    esac
-
+    OS="linux"
     log_info "Detected platform: ${OS}-${ARCH}"
 }
 
@@ -280,11 +266,9 @@ get_latest_version() {
         exit 1
     fi
 
-    # Extract tag_name from the latest release
     if command -v jq > /dev/null 2>&1; then
         VERSION=$(echo "$response" | jq -r '.tag_name' 2>/dev/null)
     else
-        # Fallback: grab the tag_name from the response
         VERSION=$(echo "$response" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
 
@@ -300,8 +284,6 @@ get_latest_version() {
 get_release_assets() {
     local version="$1"
     local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${version}"
-
-    log_debug "Fetching release assets from: $api_url"
 
     local response
     local curl_exit_code
@@ -329,7 +311,6 @@ get_release_assets() {
         return 1
     fi
 
-    # Extract asset names - only output to stdout, no debug messages here
     if command -v jq > /dev/null 2>&1; then
         echo "$body" | jq -r '.assets[].name' 2>/dev/null
     else
@@ -342,37 +323,10 @@ find_matching_asset() {
     local version="$1"
     local assets="$2"
 
-    log_debug "Available assets:"
-    echo "$assets" | while read -r asset; do
-        log_debug "  - $asset"
-    done >&2
-
-    # Platform identifiers to look for
-    local os_patterns=()
+    local os_patterns=("linux" "Linux")
     local arch_patterns=()
 
-    case "$OS" in
-        "linux")
-            os_patterns=("linux" "Linux")
-            ;;
-        "darwin")
-            os_patterns=("darwin" "macos" "macOS" "mac" "osx")
-            ;;
-        "windows")
-            os_patterns=("windows" "win" "Windows")
-            ;;
-    esac
-
     case "$ARCH" in
-        "amd64")
-            arch_patterns=("amd64" "x86_64" "x64" "64bit" "64-bit")
-            ;;
-        "arm64")
-            arch_patterns=("arm64" "aarch64" "arm_64")
-            ;;
-        "arm")
-            arch_patterns=("arm" "armv7" "armhf")
-            ;;
         "mips")
             arch_patterns=("mips" "mips32")
             ;;
@@ -387,7 +341,6 @@ find_matching_asset() {
             ;;
     esac
 
-    # Score each asset based on how well it matches our platform
     local best_asset=""
     local best_score=0
 
@@ -397,7 +350,6 @@ find_matching_asset() {
         local score=0
         local asset_lower=$(echo "$asset" | tr '[:upper:]' '[:lower:]')
 
-        # Check OS patterns
         for pattern in "${os_patterns[@]}"; do
             if [[ "$asset_lower" == *"$(echo "$pattern" | tr '[:upper:]' '[:lower:]')"* ]]; then
                 score=$((score + 10))
@@ -405,7 +357,6 @@ find_matching_asset() {
             fi
         done
 
-        # Check architecture patterns
         for pattern in "${arch_patterns[@]}"; do
             if [[ "$asset_lower" == *"$(echo "$pattern" | tr '[:upper:]' '[:lower:]')"* ]]; then
                 score=$((score + 10))
@@ -413,21 +364,13 @@ find_matching_asset() {
             fi
         done
 
-        # Prefer certain file extensions
-        if [[ "$asset" == *.tar.gz ]]; then
-            score=$((score + 5))
-        elif [[ "$asset" == *.zip ]]; then
+        if [[ "$asset" == *.zip ]]; then
             score=$((score + 3))
-        elif [[ "$asset" == *.exe ]] && [[ "$OS" == "windows" ]]; then
-            score=$((score + 5))
         fi
 
-        # Avoid source code archives
-        if [[ "$asset" == *"source"* ]] || [[ "$asset" == *"src"* ]]; then
+        if [[ "$asset" == *"source"* ]]; then
             score=$((score - 5))
         fi
-
-        log_debug "Asset: $asset, Score: $score"
 
         if [[ $score -gt $best_score ]]; then
             best_score=$score
@@ -436,17 +379,15 @@ find_matching_asset() {
     done <<< "$assets"
 
     if [[ -n "$best_asset" ]]; then
-        log_debug "Best matching asset: $best_asset (score: $best_score)"
         echo "$best_asset"
         return 0
     else
-        log_debug "No suitable asset found"
         return 1
     fi
 }
 
+# Download and install the agent
 download_and_install() {
-    # First, get the list of available assets
     log_info "Fetching available assets for version $VERSION..."
     local assets=$(get_release_assets "$VERSION")
 
@@ -455,7 +396,6 @@ download_and_install() {
         exit 1
     fi
 
-    # Find the best matching asset for our platform
     local asset_name=$(find_matching_asset "$VERSION" "$assets")
 
     if [[ -z "$asset_name" ]]; then
@@ -469,14 +409,11 @@ download_and_install() {
 
     log_info "Selected asset: $asset_name"
 
-    # Construct the download URL
     local download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${asset_name}"
 
-    # Create installation directory
     log_info "Creating installation directory: $INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
 
-    # Download the release
     local temp_file=$(mktemp)
     log_info "Downloading NetWatcher Agent from: $download_url"
 
@@ -486,12 +423,9 @@ download_and_install() {
         exit 1
     fi
 
-    # Extract or copy based on file type
     local binary_path="${INSTALL_DIR}/${BINARY_NAME}"
 
-    # For updates, remove the old binary first so we can find the new one
     if [[ "$UPDATE_MODE" == true ]] && [[ -f "$binary_path" ]]; then
-        # Binary is already backed up, remove it so we can find the new one
         rm -f "$binary_path"
     fi
 
@@ -506,49 +440,32 @@ download_and_install() {
         cp "$temp_file" "$binary_path"
     fi
 
-    # Find the actual binary - it might be named differently
     local found_binary=""
-
-    # Search for executable files that might be the agent
-    log_debug "Searching for binary in $INSTALL_DIR..."
-
-    # Look for common variations of the binary name (excluding backup)
     for name in "netwatcher-agent" "netwatcher" "agent"; do
         local candidate=$(find "$INSTALL_DIR" -maxdepth 1 -name "$name" -type f 2>/dev/null | grep -v '\.backup' | head -1)
         if [[ -n "$candidate" ]]; then
             found_binary="$candidate"
-            log_debug "Found binary: $candidate"
             break
         fi
     done
 
-    # If still not found, look for any file containing "netwatcher" that's not a backup
     if [[ -z "$found_binary" ]]; then
-        found_binary=$(find "$INSTALL_DIR" -maxdepth 1 -type f -name "*netwatcher*" 2>/dev/null | grep -v '\.backup' | grep -v '\.conf$' | grep -v '\.json$' | grep -v '\.log' | head -1)
-        if [[ -n "$found_binary" ]]; then
-            log_debug "Found netwatcher file: $found_binary"
-        fi
+        found_binary=$(find "$INSTALL_DIR" -maxdepth 1 -type f -name "*netwatcher*" 2>/dev/null | grep -v '\.backup' | grep -v '\.conf$' | grep -v '\.json$' | head -1)
     fi
 
-    # Move the found binary to expected location if different
     if [[ -n "$found_binary" ]] && [[ "$found_binary" != "$binary_path" ]]; then
-        log_info "Moving $found_binary to $binary_path"
         mv "$found_binary" "$binary_path"
         found_binary="$binary_path"
     fi
 
-    # Make binary executable
     if [[ -n "$found_binary" ]]; then
         chmod +x "$found_binary"
     fi
 
-    # Clean up
     rm -f "$temp_file"
 
-    # Verify installation
     if [[ ! -f "$binary_path" ]]; then
         log_error "Binary not found after installation: $binary_path"
-        log_error "Contents of $INSTALL_DIR:"
         ls -la "$INSTALL_DIR" >&2
         exit 1
     fi
@@ -563,7 +480,6 @@ create_config() {
     log_info "Creating configuration file: $config_path"
 
     cat > "$config_path" << EOF
-# NetWatcher Agent Configuration
 CONTROLLER_HOST=$CONTROLLER_HOST
 CONTROLLER_SSL=$CONTROLLER_SSL
 WORKSPACE_ID=$WORKSPACE_ID
@@ -571,7 +487,6 @@ AGENT_ID=$AGENT_ID
 AGENT_PIN=$AGENT_PIN
 EOF
 
-    # Set appropriate permissions
     chmod 600 "$config_path"
 
     log_success "Configuration file created"
@@ -601,24 +516,18 @@ RestartSec=5
 User=root
 Group=root
 
-# Security settings
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=${INSTALL_DIR}
 
-# Environment
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # Reload systemd and enable service
-    log_info "Reloading systemd daemon..."
     systemctl daemon-reload
-
-    log_info "Enabling NetWatcher Agent service..."
     systemctl enable "$SERVICE_NAME"
 
     log_success "Systemd service created and enabled"
@@ -635,8 +544,6 @@ start_service() {
 
     if systemctl start "$SERVICE_NAME"; then
         log_success "NetWatcher Agent service started successfully"
-
-        # Wait a moment and check status
         sleep 2
         if systemctl is-active --quiet "$SERVICE_NAME"; then
             log_success "Service is running"
@@ -645,28 +552,20 @@ start_service() {
         fi
     else
         log_error "Failed to start NetWatcher Agent service"
-        log_info "Check logs with: journalctl -u $SERVICE_NAME"
         exit 1
     fi
 }
 
-# Check if already installed
+# Check existing installation
 check_existing_installation() {
     if [[ -f "${INSTALL_DIR}/${BINARY_NAME}" ]] && [[ "$FORCE_INSTALL" != true ]]; then
         log_warning "NetWatcher Agent is already installed at $INSTALL_DIR"
         log_info "Use --force to reinstall"
-
-        # Check if service is running
-        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            log_info "Service is currently running"
-            log_info "To restart: sudo systemctl restart $SERVICE_NAME"
-        fi
-
         exit 0
     fi
 }
 
-# Stop existing service if running
+# Stop existing service
 stop_existing_service() {
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         log_info "Stopping existing NetWatcher Agent service..."
@@ -674,11 +573,10 @@ stop_existing_service() {
     fi
 }
 
-# Install required dependencies
+# Install dependencies
 install_dependencies() {
     log_info "Checking dependencies..."
-
-    local deps=("curl" "tar" "unzip")
+    local deps=("curl" "unzip")
     local missing_deps=()
 
     for dep in "${deps[@]}"; do
@@ -689,19 +587,7 @@ install_dependencies() {
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         log_info "Installing missing dependencies: ${missing_deps[*]}"
-
-        if command -v apt-get > /dev/null 2>&1; then
-            apt-get update && apt-get install -y "${missing_deps[@]}"
-        elif command -v yum > /dev/null 2>&1; then
-            yum install -y "${missing_deps[@]}"
-        elif command -v dnf > /dev/null 2>&1; then
-            dnf install -y "${missing_deps[@]}"
-        elif command -v pacman > /dev/null 2>&1; then
-            pacman -S --noconfirm "${missing_deps[@]}"
-        else
-            log_error "Could not install dependencies. Please install manually: ${missing_deps[*]}"
-            exit 1
-        fi
+        apt-get update && apt-get install -y "${missing_deps[@]}"
     fi
 }
 
@@ -719,8 +605,6 @@ show_summary() {
     echo "  - Check status: sudo systemctl status $SERVICE_NAME"
     echo "  - View logs: sudo journalctl -u $SERVICE_NAME -f"
     echo "  - Restart: sudo systemctl restart $SERVICE_NAME"
-    echo "  - Stop: sudo systemctl stop $SERVICE_NAME"
-    echo "  - Disable: sudo systemctl disable $SERVICE_NAME"
     echo
     if [[ "$NO_SERVICE" != true ]]; then
         log_info "The NetWatcher Agent is now running and will start automatically on boot."
@@ -729,19 +613,17 @@ show_summary() {
 
 # Uninstall the agent
 uninstall_agent() {
-    echo "NetWatcher Agent Uninstallation"
-    echo "================================"
+    echo "NetWatcher Agent Uninstallation for EdgeRouter"
+    echo "=============================================="
     echo
 
     local has_service=false
     local has_files=false
 
-    # Check if service exists
     if systemctl list-unit-files "${SERVICE_NAME}.service" &>/dev/null; then
         has_service=true
     fi
 
-    # Check if installation directory exists
     if [[ -d "$INSTALL_DIR" ]]; then
         has_files=true
     fi
@@ -751,9 +633,8 @@ uninstall_agent() {
         return 0
     fi
 
-    # Confirm uninstallation
     if [[ "$FORCE_INSTALL" != true ]]; then
-        log_warning "This will completely remove NetWatcher Agent from your system."
+        log_warning "This will completely remove NetWatcher Agent from your EdgeRouter."
         echo "The following will be removed:"
         if [[ "$has_service" == true ]]; then
             echo "  - Systemd service: $SERVICE_NAME"
@@ -771,7 +652,6 @@ uninstall_agent() {
         fi
     fi
 
-    # Stop and disable the service
     if [[ "$has_service" == true ]]; then
         log_info "Stopping $SERVICE_NAME service..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
@@ -779,17 +659,12 @@ uninstall_agent() {
         log_info "Disabling $SERVICE_NAME service..."
         systemctl disable "$SERVICE_NAME" 2>/dev/null || true
         
-        # Remove the service file
-        log_info "Removing systemd service file..."
         rm -f "$SERVICE_FILE"
-        
-        # Reload systemd
         systemctl daemon-reload
         
         log_success "Systemd service removed"
     fi
 
-    # Remove installation directory
     if [[ "$has_files" == true ]]; then
         log_info "Removing installation directory: $INSTALL_DIR"
         rm -rf "$INSTALL_DIR"
@@ -800,64 +675,44 @@ uninstall_agent() {
     log_success "NetWatcher Agent has been uninstalled"
 }
 
-# Update agent binary only (keeps config and service)
+# Update agent binary
 update_agent() {
     echo "NetWatcher Agent Binary Update"
     echo "==============================="
     echo
 
-    # Check if agent is installed
     if [[ ! -d "$INSTALL_DIR" ]]; then
         log_error "NetWatcher Agent is not installed at $INSTALL_DIR"
-        log_info "Use the full installation command to install first."
         exit 1
     fi
 
     if [[ ! -f "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
         log_error "Binary not found at ${INSTALL_DIR}/${BINARY_NAME}"
-        log_info "Use the full installation command to install first."
         exit 1
     fi
 
-    # Get current version if possible
-    local current_version=""
-    if [[ -x "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
-        # Try --version flag first (added in v20260219+), fall back to strings for older binaries
-        current_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1)
-        if [[ -z "$current_version" ]]; then
-            current_version=$(strings "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1 || echo "unknown")
-        fi
-        log_info "Current version: $current_version"
-    fi
+    local current_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1 || echo "unknown")
+    log_info "Current version: $current_version"
 
     detect_architecture
     get_latest_version
 
     log_info "Updating to version: $VERSION"
 
-    # Stop service if running
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         log_info "Stopping $SERVICE_NAME service..."
         systemctl stop "$SERVICE_NAME"
     fi
 
-    # Backup current binary
     local backup_path="${INSTALL_DIR}/${BINARY_NAME}.backup"
     log_info "Backing up current binary to: $backup_path"
     cp "${INSTALL_DIR}/${BINARY_NAME}" "$backup_path"
 
-    # Download and install new binary
     download_and_install
 
-    # Verify new binary works
     if [[ -x "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
-        local new_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1)
-        if [[ -z "$new_version" ]]; then
-            new_version=$(strings "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1 || echo "unknown")
-        fi
+        local new_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null | grep -oE 'v[0-9]{8}-[a-f0-9]+' | head -1 || echo "unknown")
         log_success "New version installed: $new_version"
-        
-        # Remove backup
         rm -f "$backup_path"
     else
         log_error "New binary is not executable. Rolling back..."
@@ -866,7 +721,6 @@ update_agent() {
         exit 1
     fi
 
-    # Start service
     if [[ -f "$SERVICE_FILE" ]]; then
         log_info "Starting $SERVICE_NAME service..."
         systemctl start "$SERVICE_NAME"
@@ -886,36 +740,45 @@ update_agent() {
 
 # Main execution
 main() {
-    echo "NetWatcher Agent Installation Script"
-    echo "===================================="
+    echo "NetWatcher Agent Installation Script for EdgeRouter"
+    echo "===================================================="
     echo
 
     parse_arguments "$@"
     check_root
 
-    # Handle uninstall mode
+    if [[ "$DETECT_MODEL" == true ]]; then
+        local model=$(detect_edgerouter_model)
+        log_info "Detected EdgeRouter model: $model"
+        if [[ "$UNINSTALL_MODE" != true ]] && [[ "$UPDATE_MODE" != true ]]; then
+            exit 0
+        fi
+    fi
+
     if [[ "$UNINSTALL_MODE" == true ]]; then
         uninstall_agent
         return
     fi
 
-    # Handle update mode
     if [[ "$UPDATE_MODE" == true ]]; then
         install_dependencies
         update_agent
         return
     fi
 
-    # Normal installation flow
     validate_arguments
     detect_architecture
+
+    if [[ "$LOW_MEMORY" == true ]]; then
+        log_info "Low-memory mode enabled - optimizing for EdgeRouter X/ER-4"
+    fi
+
     install_dependencies
     check_existing_installation
     stop_existing_service
     get_latest_version
     download_and_install
 
-    # Remove stale auth and deactivation markers to allow fresh authentication
     local auth_file="${INSTALL_DIR}/agent_auth.json"
     if [[ -f "$auth_file" ]]; then
         log_info "Removing stale auth file to force re-authentication..."
@@ -934,5 +797,4 @@ main() {
     show_summary
 }
 
-# Run main function with all arguments
 main "$@"
