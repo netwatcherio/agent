@@ -230,7 +230,6 @@ func extractIP(cidr string) string {
 // Falls back to speedtest.FetchUserInfo() if controller is unavailable.
 func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (NetworkInfoResult, error) {
 	var n NetworkInfoResult
-	n.Timestamp = nettime.AdjustedTime()
 
 	// Try controller first if configured
 	if cfg != nil && cfg.Host != "" && cfg.PSK != "" {
@@ -328,6 +327,8 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 			n.LocalAddress = iface.String()
 		}
 	}
+
+	n.Timestamp = nettime.AdjustedTime()
 
 	return n, nil
 }
