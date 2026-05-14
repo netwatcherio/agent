@@ -209,10 +209,10 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: bin/
+          file: bin/*
           tag: ${{ needs.build-linux-windows.outputs.version }}
           overwrite: true
-          file_glob: false
+          file_glob: true
           release_name: "Release ${{ needs.build-linux-windows.outputs.version }}"
           body: |
             ## NetWatcher Release ${{ needs.build-linux-windows.outputs.version }}
