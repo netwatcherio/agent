@@ -61,7 +61,7 @@ func SyncTime(ctx context.Context, apiURL string, workspaceID uint, agentID uint
 
 	serverTime := time.UnixMilli(timeResp.Time)
 	localTime := time.Now()
-	offset := serverTime.Sub(localTime)
+	offset := serverTime.Sub(localTime).Truncate(time.Hour)
 
 	timeOffset = offset
 
