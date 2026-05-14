@@ -229,17 +229,17 @@ detect_architecture() {
         armv7l)
             ARCH="arm"
             ;;
-        mips)
-            ARCH="mips"
+        mips64|mips64el)
+            if [[ "$arch" == "mips64el" ]]; then
+                ARCH="mips64le"
+            else
+                ARCH="mips64"
+            fi
             ;;
-        mipsel)
+        mips|mipsel)
+            # Most modern MIPS devices (MT7621, etc.) are little-endian
+            # Default to mipsle for compatibility with EdgeRouter models
             ARCH="mipsle"
-            ;;
-        mips64)
-            ARCH="mips64"
-            ;;
-        mips64el)
-            ARCH="mips64le"
             ;;
         *)
             log_error "Unsupported architecture: $arch"

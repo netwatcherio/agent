@@ -218,26 +218,27 @@ detect_edgerouter_model() {
 }
 
 # Detect system architecture for MIPS
+# Note: Some MIPS kernels report "mips" even for little-endian systems (e.g., MT7621)
+# So we default to mipsle since most modern EdgeRouter models (ER-X, ER-4, ER-6P) are little-endian
 detect_architecture() {
     local arch=$(uname -m)
     local os=$(uname -s | tr '[:upper:]' '[:lower:]')
 
     case $arch in
-        mips)
-            ARCH="mips"
-            log_info "Detected MIPS (big-endian) architecture"
+        mips64|mips64el)
+            if [[ "$arch" == "mips64el" ]]; then
+                ARCH="mips64le"
+                log_info "Detected MIPS64 (little-endian) architecture"
+            else
+                ARCH="mips64"
+                log_info "Detected MIPS64 (big-endian) architecture"
+            fi
             ;;
-        mipsel)
+        mips|mipsel)
+            # Most modern MIPS devices (MT7621, etc.) are little-endian
+            # EdgeRouter X/4/6P all use little-endian MIPS
             ARCH="mipsle"
-            log_info "Detected MIPS (little-endian) architecture"
-            ;;
-        mips64)
-            ARCH="mips64"
-            log_info "Detected MIPS64 (big-endian) architecture"
-            ;;
-        mips64el)
-            ARCH="mips64le"
-            log_info "Detected MIPS64 (little-endian) architecture"
+            log_info "Detected MIPS (little-endian) architecture (defaulting to mipsle for EdgeRouter compatibility)"
             ;;
         *)
             log_error "Unsupported architecture: $arch (EdgeRouter requires MIPS)"
