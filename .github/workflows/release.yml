@@ -209,7 +209,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: bin/*.zip
+          file: bin/*.tar.gz bin/*.zip
           tag: ${{ needs.build-linux-windows.outputs.version }}
           overwrite: true
           file_glob: true
