@@ -78,12 +78,17 @@ for platform in "${platforms[@]}"; do
         codesign -s - -f "bin/${output_name}" 2>/dev/null || echo "  Warning: codesign not available (run on macOS to sign)"
     fi
 
-    # Create zip file for this platform
-    echo "Creating zip for $GOOS/$GOARCH..."
+    # Create zip file for this platform (except Linux which uses tar.gz)
+    echo "Creating archive for $GOOS/$GOARCH..."
     cd bin
-    zip_name="netwatcher-${VERSION}-${GOOS}-${GOARCH}.zip"
-    zip "$zip_name" "$output_name"
-    rm "$output_name"  # Remove the binary after zipping
+    if [ "$GOOS" = "linux" ]; then
+        archive_name="netwatcher-${VERSION}-${GOOS}-${GOARCH}.tar.gz"
+        tar -czf "$archive_name" "$output_name"
+    else
+        archive_name="netwatcher-${VERSION}-${GOOS}-${GOARCH}.zip"
+        zip "$archive_name" "$output_name"
+    fi
+    rm "$output_name"  # Remove the binary after archiving
     cd ..
 done
 
@@ -92,8 +97,8 @@ echo "Build complete! All binaries are in the bin/ directory"
 # Create a checksums file
 cd bin
 echo "Generating checksums..."
-if ls *.zip 1> /dev/null 2>&1; then
-    sha256sum *.zip > "netwatcher-${VERSION}-checksums.txt" 2>/dev/null || shasum -a 256 *.zip > "netwatcher-${VERSION}-checksums.txt"
+if ls *.tar.gz *.zip 1> /dev/null 2>&1; then
+    sha256sum *.tar.gz *.zip > "netwatcher-${VERSION}-checksums.txt" 2>/dev/null || shasum -a 256 *.tar.gz *.zip > "netwatcher-${VERSION}-checksums.txt"
 fi
 cd ..
 

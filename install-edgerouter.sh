@@ -364,7 +364,9 @@ find_matching_asset() {
             fi
         done
 
-        if [[ "$asset" == *.zip ]]; then
+        if [[ "$asset" == *.tar.gz ]]; then
+            score=$((score + 5))
+        elif [[ "$asset" == *.zip ]]; then
             score=$((score + 3))
         fi
 
@@ -576,7 +578,7 @@ stop_existing_service() {
 # Install dependencies
 install_dependencies() {
     log_info "Checking dependencies..."
-    local deps=("curl" "unzip")
+    local deps=("curl" "tar")
     local missing_deps=()
 
     for dep in "${deps[@]}"; do

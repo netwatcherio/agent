@@ -401,7 +401,9 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 func parseAssetName(name string) (os string, arch string, err error) {
 	// Remove extension (.zip, .tar.gz, .exe)
 	base := name
-	if idx := strings.LastIndex(base, "."); idx > 0 {
+	if strings.HasSuffix(base, ".tar.gz") {
+		base = base[:len(base)-7]
+	} else if idx := strings.LastIndex(base, "."); idx > 0 {
 		base = base[:idx]
 	}
 

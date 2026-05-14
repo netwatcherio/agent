@@ -678,7 +678,7 @@ stop_existing_service() {
 install_dependencies() {
     log_info "Checking dependencies..."
 
-    local deps=("curl" "tar" "unzip")
+    local deps=("curl" "tar")
     local missing_deps=()
 
     for dep in "${deps[@]}"; do

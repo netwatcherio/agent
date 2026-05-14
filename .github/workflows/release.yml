@@ -64,7 +64,7 @@ jobs:
           for arch in amd64 arm64 arm mips mipsle mips64 mips64le; do
             echo "Building linux/$arch..."
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-linux-$arch .
-            cd bin && zip netwatcher-${VERSION}-linux-$arch.zip netwatcher-linux-$arch && rm netwatcher-linux-$arch && cd ..
+            cd bin && tar czf netwatcher-${VERSION}-linux-$arch.tar.gz netwatcher-linux-$arch && rm netwatcher-linux-$arch && cd ..
           done
           
           # Windows builds
@@ -160,10 +160,10 @@ jobs:
         run: |
           echo "Listing downloaded artifacts:"
           ls -la bin/
-          ZIP_COUNT=$(ls bin/*.zip 2>/dev/null | wc -l)
-          echo "Found $ZIP_COUNT zip files"
-          if [ "$ZIP_COUNT" -lt 11 ]; then
-              echo "ERROR: Expected 11 zip files (7 linux + 2 windows + 2 darwin), but found $ZIP_COUNT"
+          ARCHIVE_COUNT=$(ls bin/*.tar.gz bin/*.zip 2>/dev/null | wc -l)
+          echo "Found $ARCHIVE_COUNT archive files"
+          if [ "$ARCHIVE_COUNT" -lt 11 ]; then
+              echo "ERROR: Expected 11 archive files (7 linux + 2 windows + 2 darwin), but found $ARCHIVE_COUNT"
               exit 1
           fi
           
@@ -171,10 +171,10 @@ jobs:
           
           echo "Verifying specific platform artifacts..."
           
-          # Verify Linux artifacts
+          # Verify Linux artifacts (tar.gz format)
           for arch in amd64 arm64 arm mips mipsle mips64 mips64le; do
-            if [ ! -f "bin/netwatcher-${VERSION}-linux-${arch}.zip" ]; then
-              echo "ERROR: Missing Linux ${arch} artifact: netwatcher-${VERSION}-linux-${arch}.zip"
+            if [ ! -f "bin/netwatcher-${VERSION}-linux-${arch}.tar.gz" ]; then
+              echo "ERROR: Missing Linux ${arch} artifact: netwatcher-${VERSION}-linux-${arch}.tar.gz"
               exit 1
             fi
             echo "  [OK] Linux ${arch}"
@@ -203,7 +203,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd bin
-          sha256sum *.zip > netwatcher-${{ needs.build-linux-windows.outputs.version }}-checksums.txt
+          sha256sum *.tar.gz *.zip > netwatcher-${{ needs.build-linux-windows.outputs.version }}-checksums.txt
 
       - name: Create Release and Upload Files
         uses: svenstaro/upload-release-action@v2
