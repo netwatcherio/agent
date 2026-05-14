@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/jackpal/gateway"
-	"github.com/netwatcherio/netwatcher-agent/nettime"
+
 	"github.com/showwin/speedtest-go/speedtest"
 	log "github.com/sirupsen/logrus"
 )
@@ -328,7 +328,7 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 		}
 	}
 
-	n.Timestamp = time.Now().Add(nettime.GetTimeOffset())
+	n.Timestamp = time.Now()
 
 	return n, nil
 }

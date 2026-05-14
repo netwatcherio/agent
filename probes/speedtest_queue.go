@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/netwatcherio/netwatcher-agent/nettime"
 	"github.com/showwin/speedtest-go/speedtest"
 	log "github.com/sirupsen/logrus"
 )
@@ -155,7 +154,7 @@ func RunSpeedtestForQueue(item SpeedtestQueueItem) SpeedtestResult {
 	// Package results
 	payload := SpeedTestPayload{
 		TestData:  results,
-		Timestamp: time.Now().Add(nettime.GetTimeOffset()),
+		Timestamp: time.Now(),
 	}
 
 	data, err := json.Marshal(payload)

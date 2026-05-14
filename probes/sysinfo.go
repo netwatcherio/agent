@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/elastic/go-sysinfo"
-	"github.com/netwatcherio/netwatcher-agent/nettime"
 )
 
 type CompleteSystemInfo struct {
@@ -119,8 +118,8 @@ func SystemInfo() (CompleteSystemInfo, error) {
 
 	n.CPUTimes = cpuTimeInfo
 
-	n.Timestamp = time.Now().Add(nettime.GetTimeOffset())
-	n.HostInfo.BootTime = n.HostInfo.BootTime.Add(nettime.GetTimeOffset())
+	n.Timestamp = time.Now()
+	n.HostInfo.BootTime = n.HostInfo.BootTime
 
 	return n, nil
 }

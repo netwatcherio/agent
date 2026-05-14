@@ -12,8 +12,6 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/netwatcherio/netwatcher-agent/nettime"
 )
 
 type CertInfo struct {
@@ -125,7 +123,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 		targetURL = "https://" + targetURL
 	}
 
-	startTime := time.Now().Add(nettime.GetTimeOffset())
+	startTime := time.Now()
 
 	var dnsStart, dnsEnd, connectStart, connectEnd, tlsStart, tlsEnd, firstByteTime time.Time
 	var tlsHandshakeDone bool
@@ -175,23 +173,23 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 			dnsStart = time.Now()
 		},
 		DNSDone: func(info httptrace.DNSDoneInfo) {
-			dnsEnd = time.Now().Add(nettime.GetTimeOffset())
+			dnsEnd = time.Now()
 		},
 		ConnectStart: func(network, addr string) {
-			connectStart = time.Now().Add(nettime.GetTimeOffset())
+			connectStart = time.Now()
 		},
 		ConnectDone: func(network, addr string, err error) {
-			connectEnd = time.Now().Add(nettime.GetTimeOffset())
+			connectEnd = time.Now()
 		},
 		TLSHandshakeStart: func() {
-			tlsStart = time.Now().Add(nettime.GetTimeOffset())
+			tlsStart = time.Now()
 		},
 		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
-			tlsEnd = time.Now().Add(nettime.GetTimeOffset())
+			tlsEnd = time.Now()
 			tlsHandshakeDone = true
 		},
 		GotFirstResponseByte: func() {
-			firstByteTime = time.Now().Add(nettime.GetTimeOffset())
+			firstByteTime = time.Now()
 		},
 	}
 
@@ -206,7 +204,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		result.Error = fmt.Sprintf("request failed: %v", err)
-		result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
+		result.StopTimestamp = time.Now()
 		result.TotalMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 		emitHTTPResult(probe, dataChan, result)
 		return err
@@ -277,7 +275,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 		}
 	}
 
-	result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
+	result.StopTimestamp = time.Now()
 
 	log.Infof("[http] %s %s -> %d (%.2fms)", method, targetURL, result.StatusCode, result.TotalMs)
 
@@ -318,7 +316,7 @@ func emitHTTPResult(probe *Probe, dataChan chan ProbeData, result HTTPPayload) {
 		Type:            ProbeType_HTTP,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       time.Now().Add(nettime.GetTimeOffset()),
+		CreatedAt:       time.Now(),
 		SourceInterface: probe.BindInterface,
 	}
 }

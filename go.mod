@@ -4,6 +4,7 @@ go 1.25.4
 
 require (
 	github.com/elastic/go-sysinfo v1.11.1
+	github.com/gosnmp/gosnmp v1.37.0
 	github.com/jackpal/gateway v1.0.13
 	github.com/joho/godotenv v1.5.1
 	github.com/kataras/iris/v12 v12.2.8
@@ -39,7 +40,6 @@ require (
 	github.com/google/uuid v1.4.0 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
-	github.com/gosnmp/gosnmp v1.37.0 // indirect
 	github.com/iris-contrib/go.uuid v2.0.0+incompatible // indirect
 	github.com/iris-contrib/schema v0.0.6 // indirect
 	github.com/joeshaw/multierror v0.0.0-20140124173710-69b34d4ec901 // indirect

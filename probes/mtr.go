@@ -10,8 +10,6 @@ import (
 	"github.com/nxtrace/NTrace-core/trace"
 	"github.com/nxtrace/NTrace-core/util"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/netwatcherio/netwatcher-agent/nettime"
 )
 
 type MtrPayload struct {
@@ -46,7 +44,7 @@ type MtrPayload struct {
 // Mtr runs MTR-style traceroute using NTrace-core
 func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	var mtrResult MtrPayload
-	mtrResult.StartTimestamp = time.Now().Add(nettime.GetTimeOffset())
+	mtrResult.StartTimestamp = time.Now()
 
 	numMeasurements := cd.Count
 	if numMeasurements <= 0 {
@@ -131,7 +129,7 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 
 	// Transform NTrace result to MtrPayload format
 	mtrResult.Report.Hops = transformHops(result, numMeasurements)
-	mtrResult.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
+	mtrResult.StopTimestamp = time.Now()
 
 	log.WithFields(log.Fields{
 		"target": target,

@@ -2,12 +2,12 @@ package probes
 
 import (
 	"encoding/json"
-	"github.com/netwatcherio/netwatcher-agent/nettime"
+	"strconv"
+	"time"
+
 	"github.com/showwin/speedtest-go/speedtest"
 	"github.com/showwin/speedtest-go/speedtest/transport"
 	log "github.com/sirupsen/logrus"
-	"strconv"
-	"time"
 )
 
 type SpeedTestPayload struct {
@@ -112,7 +112,7 @@ func SpeedTest(cd *Probe) (SpeedTestPayload, error) {
 
 	result := SpeedTestPayload{
 		TestData:  s1,
-		Timestamp: time.Now().Add(nettime.GetTimeOffset()),
+		Timestamp: time.Now(),
 	}
 
 	marshal, err := json.Marshal(result)

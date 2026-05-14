@@ -9,8 +9,6 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/netwatcherio/netwatcher-agent/nettime"
 )
 
 // InterfaceSnapshot represents the current state of network interfaces for change detection.
@@ -209,7 +207,7 @@ func (w *InterfaceWatcher) check() {
 func takeSnapshot() *InterfaceSnapshot {
 	snap := &InterfaceSnapshot{
 		Interfaces: make(map[string]string),
-		Timestamp:  time.Now().Add(nettime.GetTimeOffset()),
+		Timestamp:  time.Now(),
 	}
 
 	ifaces, err := DiscoverInterfaces()

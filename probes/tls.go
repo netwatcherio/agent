@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"crypto/x509/pkix"
-	"github.com/netwatcherio/netwatcher-agent/nettime"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -94,7 +94,7 @@ func TLSProbe(probe *Probe, dataChan chan ProbeData) error {
 		target = target + ":443"
 	}
 
-	startTime := time.Now().Add(nettime.GetTimeOffset())
+	startTime := time.Now()
 
 	result := TLSPayload{
 		StartTimestamp: startTime,
@@ -103,7 +103,7 @@ func TLSProbe(probe *Probe, dataChan chan ProbeData) error {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
 		result.Error = fmt.Sprintf("invalid target: %v", err)
-		result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
+		result.StopTimestamp = time.Now()
 		emitTLSResult(probe, dataChan, result)
 		return err
 	}
@@ -124,7 +124,7 @@ func TLSProbe(probe *Probe, dataChan chan ProbeData) error {
 
 	if err != nil {
 		result.Error = fmt.Sprintf("tls dial failed: %v", err)
-		result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
+		result.StopTimestamp = time.Now()
 		emitTLSResult(probe, dataChan, result)
 		return err
 	}
@@ -148,7 +148,7 @@ func TLSProbe(probe *Probe, dataChan chan ProbeData) error {
 			SANs:            leaf.DNSNames,
 		}
 		result.DaysUntilExpiry = result.Certificate.DaysUntilExpiry
-		result.IsExpired = time.Now().Add(nettime.GetTimeOffset()).After(leaf.NotAfter)
+		result.IsExpired = time.Now().After(leaf.NotAfter)
 		result.IsExpiringSoon = result.DaysUntilExpiry <= 30 && !result.IsExpired
 
 		result.IssuerOrg = getOrgFromSubject(leaf.Issuer)
@@ -181,7 +181,7 @@ func TLSProbe(probe *Probe, dataChan chan ProbeData) error {
 		}
 	}
 
-	result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
+	result.StopTimestamp = time.Now()
 
 	log.Infof("[tls] %s -> %s, version=%s, cipher=%s, expires_in=%d days",
 		target, result.TLSVersion, result.TLSVersion, result.TLSCipherSuite, result.DaysUntilExpiry)
@@ -223,7 +223,7 @@ func emitTLSResult(probe *Probe, dataChan chan ProbeData, result TLSPayload) {
 		Type:            ProbeType_TLS,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       time.Now().Add(nettime.GetTimeOffset()),
+		CreatedAt:       time.Now(),
 		SourceInterface: probe.BindInterface,
 	}
 }
