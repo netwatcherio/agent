@@ -263,7 +263,7 @@ func emitDNSResult(probe *Probe, dataChan chan ProbeData, target string, payload
 		Type:            ProbeType_DNS,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       nettime.AdjustedTime(),
+		CreatedAt:       time.Now().Add(nettime.GetTimeOffset()),
 		SourceIP:        sourceIP,
 		SourceInterface: sourceIface,
 	}

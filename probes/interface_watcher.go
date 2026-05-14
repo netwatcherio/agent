@@ -209,7 +209,7 @@ func (w *InterfaceWatcher) check() {
 func takeSnapshot() *InterfaceSnapshot {
 	snap := &InterfaceSnapshot{
 		Interfaces: make(map[string]string),
-		Timestamp:  nettime.AdjustedTime(),
+		Timestamp:  time.Now().Add(nettime.GetTimeOffset()),
 	}
 
 	ifaces, err := DiscoverInterfaces()

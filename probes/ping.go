@@ -32,7 +32,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 	}
 	target := ac.Targets[0].Target
 
-	startTime := nettime.AdjustedTime()
+	startTime := time.Now().Add(nettime.GetTimeOffset())
 
 	pinger, err := probing.NewPinger(target)
 	if err != nil {
@@ -107,7 +107,7 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 		// NOTE: stats.* RTT fields are already time.Duration per pro-bing
 		pingR := PingPayload{
 			StartTimestamp:        startTime,
-			StopTimestamp:         nettime.AdjustedTime(),
+			StopTimestamp:         time.Now().Add(nettime.GetTimeOffset()),
 			PacketsRecv:           stats.PacketsRecv,
 			PacketsSent:           stats.PacketsSent,
 			PacketsRecvDuplicates: stats.PacketsRecvDuplicates,

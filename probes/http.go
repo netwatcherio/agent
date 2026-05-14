@@ -125,7 +125,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 		targetURL = "https://" + targetURL
 	}
 
-	startTime := nettime.AdjustedTime()
+	startTime := time.Now().Add(nettime.GetTimeOffset())
 
 	var dnsStart, dnsEnd, connectStart, connectEnd, tlsStart, tlsEnd, firstByteTime time.Time
 	var tlsHandshakeDone bool
@@ -175,23 +175,23 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 			dnsStart = time.Now()
 		},
 		DNSDone: func(info httptrace.DNSDoneInfo) {
-			dnsEnd = nettime.AdjustedTime()
+			dnsEnd = time.Now().Add(nettime.GetTimeOffset())
 		},
 		ConnectStart: func(network, addr string) {
-			connectStart = nettime.AdjustedTime()
+			connectStart = time.Now().Add(nettime.GetTimeOffset())
 		},
 		ConnectDone: func(network, addr string, err error) {
-			connectEnd = nettime.AdjustedTime()
+			connectEnd = time.Now().Add(nettime.GetTimeOffset())
 		},
 		TLSHandshakeStart: func() {
-			tlsStart = nettime.AdjustedTime()
+			tlsStart = time.Now().Add(nettime.GetTimeOffset())
 		},
 		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
-			tlsEnd = nettime.AdjustedTime()
+			tlsEnd = time.Now().Add(nettime.GetTimeOffset())
 			tlsHandshakeDone = true
 		},
 		GotFirstResponseByte: func() {
-			firstByteTime = nettime.AdjustedTime()
+			firstByteTime = time.Now().Add(nettime.GetTimeOffset())
 		},
 	}
 
@@ -206,7 +206,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		result.Error = fmt.Sprintf("request failed: %v", err)
-		result.StopTimestamp = nettime.AdjustedTime()
+		result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
 		result.TotalMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 		emitHTTPResult(probe, dataChan, result)
 		return err
@@ -277,7 +277,7 @@ func HTTPProbe(probe *Probe, dataChan chan ProbeData) error {
 		}
 	}
 
-	result.StopTimestamp = nettime.AdjustedTime()
+	result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
 
 	log.Infof("[http] %s %s -> %d (%.2fms)", method, targetURL, result.StatusCode, result.TotalMs)
 
@@ -318,7 +318,7 @@ func emitHTTPResult(probe *Probe, dataChan chan ProbeData, result HTTPPayload) {
 		Type:            ProbeType_HTTP,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       nettime.AdjustedTime(),
+		CreatedAt:       time.Now().Add(nettime.GetTimeOffset()),
 		SourceInterface: probe.BindInterface,
 	}
 }

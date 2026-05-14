@@ -79,9 +79,3 @@ func SyncTime(ctx context.Context, apiURL string, workspaceID uint, agentID uint
 func GetTimeOffset() time.Duration {
 	return timeOffset
 }
-
-// AdjustedTime returns time.Now() adjusted by the time offset
-// Use this instead of time.Now() when creating timestamps for probe data
-func AdjustedTime() time.Time {
-	return time.Now().Add(timeOffset)
-}

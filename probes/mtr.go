@@ -46,7 +46,7 @@ type MtrPayload struct {
 // Mtr runs MTR-style traceroute using NTrace-core
 func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	var mtrResult MtrPayload
-	mtrResult.StartTimestamp = nettime.AdjustedTime()
+	mtrResult.StartTimestamp = time.Now().Add(nettime.GetTimeOffset())
 
 	numMeasurements := cd.Count
 	if numMeasurements <= 0 {
@@ -131,7 +131,7 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 
 	// Transform NTrace result to MtrPayload format
 	mtrResult.Report.Hops = transformHops(result, numMeasurements)
-	mtrResult.StopTimestamp = nettime.AdjustedTime()
+	mtrResult.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
 
 	log.WithFields(log.Fields{
 		"target": target,

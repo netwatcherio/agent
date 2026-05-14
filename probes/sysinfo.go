@@ -119,7 +119,7 @@ func SystemInfo() (CompleteSystemInfo, error) {
 
 	n.CPUTimes = cpuTimeInfo
 
-	n.Timestamp = nettime.AdjustedTime()
+	n.Timestamp = time.Now().Add(nettime.GetTimeOffset())
 	n.HostInfo.BootTime = n.HostInfo.BootTime.Add(nettime.GetTimeOffset())
 
 	return n, nil

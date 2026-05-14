@@ -155,7 +155,7 @@ func SNMPProbe(probe *Probe, dataChan chan ProbeData) error {
 		port = 161
 	}
 
-	startTime := nettime.AdjustedTime()
+	startTime := time.Now().Add(nettime.GetTimeOffset())
 
 	params := &gosnmp.GoSNMP{
 		Target:  host,
@@ -196,7 +196,7 @@ func SNMPProbe(probe *Probe, dataChan chan ProbeData) error {
 
 	if err := params.Connect(); err != nil {
 		result.Error = fmt.Sprintf("connect failed: %v", err)
-		result.StopTimestamp = nettime.AdjustedTime()
+		result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
 		result.QueryTimeMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 		emitSNMPResult(probe, dataChan, result)
 		return err
@@ -211,13 +211,13 @@ func SNMPProbe(probe *Probe, dataChan chan ProbeData) error {
 	snmpResults, err := params.Get(oids)
 	if err != nil {
 		result.Error = fmt.Sprintf("get failed: %v", err)
-		result.StopTimestamp = nettime.AdjustedTime()
+		result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
 		result.QueryTimeMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 		emitSNMPResult(probe, dataChan, result)
 		return err
 	}
 
-	result.StopTimestamp = nettime.AdjustedTime()
+	result.StopTimestamp = time.Now().Add(nettime.GetTimeOffset())
 	result.QueryTimeMs = float64(result.StopTimestamp.Sub(startTime).Microseconds()) / 1000.0
 
 	for _, variable := range snmpResults.Variables {
@@ -416,7 +416,7 @@ func emitSNMPResult(probe *Probe, dataChan chan ProbeData, result SNMPPayload) {
 		Type:            ProbeType_SNMP,
 		Payload:         raw,
 		Target:          target,
-		CreatedAt:       nettime.AdjustedTime(),
+		CreatedAt:       time.Now().Add(nettime.GetTimeOffset()),
 		SourceInterface: probe.BindInterface,
 	}
 }

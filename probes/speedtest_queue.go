@@ -155,7 +155,7 @@ func RunSpeedtestForQueue(item SpeedtestQueueItem) SpeedtestResult {
 	// Package results
 	payload := SpeedTestPayload{
 		TestData:  results,
-		Timestamp: nettime.AdjustedTime(),
+		Timestamp: time.Now().Add(nettime.GetTimeOffset()),
 	}
 
 	data, err := json.Marshal(payload)

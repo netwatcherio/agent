@@ -3,6 +3,7 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	nettime "github.com/netwatcherio/netwatcher-agent/nettime"
 	"github.com/netwatcherio/netwatcher-agent/probes"
@@ -27,7 +28,7 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 
 	go func(cn *web.WSClient, c chan probes.ProbeData) {
 		for p := range ch {
-			p.CreatedAt = nettime.AdjustedTime()
+			p.CreatedAt = time.Now().Add(nettime.GetTimeOffset())
 			marshal, err := json.Marshal(p)
 			if err != nil {
 				log.Errorf("ProbeDataWorker: failed to marshal probe data: %v", err)

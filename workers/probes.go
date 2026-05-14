@@ -1152,7 +1152,7 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		Type:      probes.ProbeType_SYSTEMINFO,
 		Payload:   marshal,
 		ProbeID:   probe.ID,
-		CreatedAt: nettime.AdjustedTime(),
+		CreatedAt: time.Now().Add(nettime.GetTimeOffset()),
 	}
 }
 
@@ -1181,7 +1181,7 @@ func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		Type:      probes.ProbeType_MTR,
 		Payload:   payload,
 		ProbeID:   probe.ID,
-		CreatedAt: nettime.AdjustedTime(),
+		CreatedAt: time.Now().Add(nettime.GetTimeOffset()),
 	}
 }
 
@@ -1288,7 +1288,7 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 		Type:      probes.ProbeType_NETWORKINFO,
 		Payload:   marshal,
 		ProbeID:   probe.ID,
-		CreatedAt: nettime.AdjustedTime(),
+		CreatedAt: time.Now().Add(nettime.GetTimeOffset()),
 	}
 }
 

@@ -328,7 +328,7 @@ func NetworkInfoWithController(ctx context.Context, cfg *ControllerConfig) (Netw
 		}
 	}
 
-	n.Timestamp = nettime.AdjustedTime()
+	n.Timestamp = time.Now().Add(nettime.GetTimeOffset())
 
 	return n, nil
 }
