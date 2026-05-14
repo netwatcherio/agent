@@ -78,7 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-windows-builds
-          path: bin/*.tar.gz bin/*.zip
+          path: bin/
 
   # Build macOS on macOS runner (requires CGO for pcap support)
   build-darwin:
@@ -134,7 +134,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: darwin-builds
-          path: bin/*.zip
+          path: bin/
 
   # Create release with all artifacts
   release:
