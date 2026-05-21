@@ -982,6 +982,20 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, cycle *CycleTracker)
 	}
 }
 
+func percentile(vals []float64, pct int) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(vals))
+	copy(sorted, vals)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := (len(sorted) * pct) / 100
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
 func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{} {
 	cycle.mu.RLock()
 	defer cycle.mu.RUnlock()
@@ -1033,14 +1047,33 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 		duplicatePercent = (float64(cycle.duplicates) / float64(received)) * 100
 	}
 
+	// Latency percentiles
+	medianRTT := percentile(rtts, 50)
+	p95RTT := percentile(rtts, 95)
+	p99RTT := percentile(rtts, 99)
+
+	// Jitter: RFC 3550 style - mean absolute deviation of inter-packet delays
+	var jitterVals []float64
+	for i := 1; i < len(rtts); i++ {
+		jitterVals = append(jitterVals, math.Abs(rtts[i]-rtts[i-1]))
+	}
+	jitterMedian := percentile(jitterVals, 50)
+	jitterP95 := percentile(jitterVals, 95)
+
 	return map[string]interface{}{
 		"lostPackets":       lost,
 		"lossPercentage":    lossPercent,
 		"totalPackets":      total,
 		"averageRTT":        avgRTT,
+		"medianRTT":         medianRTT,
+		"p95RTT":            p95RTT,
+		"p99RTT":            p99RTT,
 		"minRTT":            minRTT,
 		"maxRTT":            maxRTT,
 		"stdDevRTT":         stdDev,
+		"jitterAvg":         stdDev,
+		"jitterMedian":      jitterMedian,
+		"jitterP95":         jitterP95,
 		"outOfOrder":        cycle.outOfOrder,
 		"outOfOrderPercent": outOfOrderPercent,
 		"duplicates":        cycle.duplicates,
