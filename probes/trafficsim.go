@@ -1052,10 +1052,18 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	p95RTT := percentile(rtts, 95)
 	p99RTT := percentile(rtts, 99)
 
-	// Jitter: RFC 3550 style - mean absolute deviation of inter-packet delays
+	// Jitter: mean absolute deviation of inter-packet delays
 	var jitterVals []float64
 	for i := 1; i < len(rtts); i++ {
 		jitterVals = append(jitterVals, math.Abs(rtts[i]-rtts[i-1]))
+	}
+	jitterAvg := float64(0)
+	if len(jitterVals) > 0 {
+		var sum float64
+		for _, j := range jitterVals {
+			sum += j
+		}
+		jitterAvg = sum / float64(len(jitterVals))
 	}
 	jitterMedian := percentile(jitterVals, 50)
 	jitterP95 := percentile(jitterVals, 95)
@@ -1071,7 +1079,7 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 		"minRTT":            minRTT,
 		"maxRTT":            maxRTT,
 		"stdDevRTT":         stdDev,
-		"jitterAvg":         stdDev,
+		"jitterAvg":         jitterAvg,
 		"jitterMedian":      jitterMedian,
 		"jitterP95":         jitterP95,
 		"outOfOrder":        cycle.outOfOrder,
