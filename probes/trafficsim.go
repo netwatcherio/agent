@@ -799,6 +799,7 @@ func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker) bool {
 	cycle.mu.Lock()
 	cycle.PacketSeqs = append(cycle.PacketSeqs, seq)
 	cycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	log.Infof("[trafficsim] CLIENT sent seq=%d cycleSeq=%d cyclePacketCount=%d", seq, ts.sequence, len(cycle.PacketSeqs))
 	cycle.mu.Unlock()
 
 	// Also track in client stats
@@ -929,6 +930,11 @@ func (ts *TrafficSim) handleAck(data TrafficSimData) {
 		if pt, ok := ts.currentCycle.PacketTimes[seq]; ok && pt.Received == 0 {
 			pt.Received = recvTime
 			ts.currentCycle.PacketTimes[seq] = pt
+			log.Infof("[trafficsim] CLIENT handleAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(ts.currentCycle.PacketTimes))
+		} else if pt, ok := ts.currentCycle.PacketTimes[seq]; ok {
+			log.Infof("[trafficsim] CLIENT handleAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
+		} else {
+			log.Infof("[trafficsim] CLIENT handleAck seq=%d NOT FOUND in PacketTimes (current size=%d)", seq, len(ts.currentCycle.PacketTimes))
 		}
 		ts.currentCycle.mu.Unlock()
 	}
@@ -962,6 +968,21 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, cycle *CycleTracker)
 		now := time.Now().UnixMilli()
 
 		cycle.mu.Lock()
+		receivedCount := 0
+		timedOutCount := 0
+		for _, seq := range cycle.PacketSeqs {
+			if pt, ok := cycle.PacketTimes[seq]; ok {
+				if pt.Received > 0 {
+					receivedCount++
+				} else if pt.TimedOut {
+					timedOutCount++
+				}
+			}
+		}
+		if receivedCount > 0 || len(cycle.PacketSeqs) > 0 {
+			log.Infof("[trafficsim] CLIENT waitForResponses: received=%d timedOut=%d total=%d",
+				receivedCount, timedOutCount, len(cycle.PacketSeqs))
+		}
 		for _, seq := range cycle.PacketSeqs {
 			if pt, ok := cycle.PacketTimes[seq]; ok {
 				if pt.Received == 0 && !pt.TimedOut {
@@ -1068,6 +1089,9 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	jitterMedian := percentile(jitterVals, 50)
 	jitterP95 := percentile(jitterVals, 95)
 
+	log.Infof("[trafficsim] calculateStats: totalPacketSeqs=%d receivedRtts=%d lost=%d jitterVals=%d outOfOrder=%d duplicates=%d",
+		total, len(rtts), lost, len(jitterVals), cycle.outOfOrder, cycle.duplicates)
+
 	return map[string]interface{}{
 		"lostPackets":       lost,
 		"lossPercentage":    lossPercent,
@@ -1095,11 +1119,15 @@ func (ts *TrafficSim) reportStats(stats map[string]interface{}, mtrProbe *Probe)
 		return
 	}
 
+	log.Infof("[trafficsim] CLIENT stats map before marshal: %+v", stats)
+
 	payload, err := json.Marshal(stats)
 	if err != nil {
 		log.Printf("[trafficsim] Error marshaling stats: %v", err)
 		return
 	}
+
+	log.Infof("[trafficsim] CLIENT JSON payload: %s", string(payload))
 
 	target := fmt.Sprintf("%s:%d", ts.IPAddress, ts.Port)
 
@@ -1378,6 +1406,7 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 	connection.ReverseCycle.mu.Lock()
 	connection.ReverseCycle.PacketSeqs = append(connection.ReverseCycle.PacketSeqs, seq)
 	connection.ReverseCycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	log.Infof("[trafficsim] REVERSE sent seq=%d reverseSeq=%d cyclePacketCount=%d", seq, connection.ReverseSequence, len(connection.ReverseCycle.PacketSeqs))
 	connection.ReverseCycle.mu.Unlock()
 
 	// Build DATA message
@@ -1406,6 +1435,18 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 
 	// Check if cycle is complete
 	if len(connection.ReverseCycle.PacketSeqs) >= TrafficSimReportSeq {
+		// Count how many were actually received (for debugging)
+		// Use connection.ReverseCycle directly since completedCycle not yet assigned
+		receivedCount := 0
+		for _, pt := range connection.ReverseCycle.PacketTimes {
+			if pt.Received > 0 {
+				receivedCount++
+			}
+		}
+		log.Infof("[trafficsim] REVERSE CYCLE COMPLETE: sent=%d received=%d PacketTimes=%d outOfOrder=%d duplicates=%d",
+			len(connection.ReverseCycle.PacketSeqs), receivedCount, len(connection.ReverseCycle.PacketTimes),
+			connection.ReverseCycle.outOfOrder, connection.ReverseCycle.duplicates)
+
 		// Rotate cycle synchronously to prevent race conditions
 		completedCycle := connection.ReverseCycle
 
@@ -1448,6 +1489,11 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 {
 		pt.Received = recvTime
 		cycle.PacketTimes[seq] = pt
+		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(cycle.PacketTimes))
+	} else if pt, ok := cycle.PacketTimes[seq]; ok {
+		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
+	} else {
+		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d)", seq, len(cycle.PacketTimes))
 	}
 }
 
@@ -1460,11 +1506,15 @@ func (ts *TrafficSim) reportCycleStats(cycle *CycleTracker, probeID uint, agentI
 	// Calculate stats using the same method as client
 	stats := ts.calculateStats(cycle)
 
+	log.Infof("[trafficsim] REVERSE stats map before marshal: %+v", stats)
+
 	payload, err := json.Marshal(stats)
 	if err != nil {
 		log.Printf("[trafficsim] Error marshaling reverse stats: %v", err)
 		return
 	}
+
+	log.Infof("[trafficsim] REVERSE JSON payload: %s", string(payload))
 
 	// Report with the client probe ID for this connection
 	select {
