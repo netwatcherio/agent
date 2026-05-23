@@ -1017,6 +1017,14 @@ func percentile(vals []float64, pct int) float64 {
 	return sorted[idx]
 }
 
+func mapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{} {
 	cycle.mu.RLock()
 	defer cycle.mu.RUnlock()
@@ -1073,6 +1081,8 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	p95RTT := percentile(rtts, 95)
 	p99RTT := percentile(rtts, 99)
 
+	log.Printf("[trafficsim] DEBUG percentile: rtts.len=%d medianRTT=%v p95RTT=%v p99RTT=%v", len(rtts), medianRTT, p95RTT, p99RTT)
+
 	// Jitter: mean absolute deviation of inter-packet delays
 	var jitterVals []float64
 	for i := 1; i < len(rtts); i++ {
@@ -1089,8 +1099,13 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	jitterMedian := percentile(jitterVals, 50)
 	jitterP95 := percentile(jitterVals, 95)
 
+	log.Printf("[trafficsim] DEBUG jitter percentile: jitterVals.len=%d jitterMedian=%v jitterP95=%v", len(jitterVals), jitterMedian, jitterP95)
+
 	log.Infof("[trafficsim] calculateStats: totalPacketSeqs=%d receivedRtts=%d lost=%d jitterVals=%d outOfOrder=%d duplicates=%d",
 		total, len(rtts), lost, len(jitterVals), cycle.outOfOrder, cycle.duplicates)
+
+	log.Printf("[trafficsim] DEBUG calculateStats RETURNING: medianRTT=%v p95RTT=%v p99RTT=%v jitterMedian=%v jitterP95=%v jitterAvg=%v",
+		medianRTT, p95RTT, p99RTT, jitterMedian, jitterP95, jitterAvg)
 
 	return map[string]interface{}{
 		"lostPackets":       lost,
@@ -1474,6 +1489,9 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	cycle.mu.Lock()
 	defer cycle.mu.Unlock()
 
+	log.Printf("[trafficsim] REVERSE handleReverseAck START: seq=%d ReverseSequence=%d cycle.StartSeq=%d len(PacketSeqs)=%d len(PacketTimes)=%d",
+		seq, connection.ReverseSequence, cycle.StartSeq, len(cycle.PacketSeqs), len(cycle.PacketTimes))
+
 	// Track duplicate/out-of-order
 	cycle.receivedSeqs[seq]++
 	receiveCount := cycle.receivedSeqs[seq]
@@ -1489,24 +1507,27 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 {
 		pt.Received = recvTime
 		cycle.PacketTimes[seq] = pt
-		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(cycle.PacketTimes))
+		log.Printf("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(cycle.PacketTimes))
 	} else if pt, ok := cycle.PacketTimes[seq]; ok {
-		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
+		log.Printf("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
 	} else {
-		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d)", seq, len(cycle.PacketTimes))
+		log.Printf("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d) - may be from rotated cycle", seq, len(cycle.PacketTimes))
 	}
 }
 
 // reportCycleStats calculates and reports stats for a completed reverse cycle
 func (ts *TrafficSim) reportCycleStats(cycle *CycleTracker, probeID uint, agentID uint, target string) {
 	if ts.DataChan == nil || !ts.isRunning() {
+		log.Printf("[trafficsim] REVERSE reportCycleStats skipped: DataChan=%v running=%v", ts.DataChan, ts.isRunning())
 		return
 	}
 
 	// Calculate stats using the same method as client
 	stats := ts.calculateStats(cycle)
 
-	log.Infof("[trafficsim] REVERSE stats map before marshal: %+v", stats)
+	log.Printf("[trafficsim] REVERSE reportCycleStats: probeID=%d agentID=%d target=%s statsLen=%d", probeID, agentID, target, len(stats))
+	log.Printf("[trafficsim] REVERSE stats map keys: %v", mapKeys(stats))
+	log.Debugf("[trafficsim] REVERSE stats map before marshal: %+v", stats)
 
 	payload, err := json.Marshal(stats)
 	if err != nil {
