@@ -330,7 +330,7 @@ func (ts *TrafficSim) SetAllProbes(probes []Probe) {
 	ts.allProbesMu.Lock()
 	defer ts.allProbesMu.Unlock()
 	ts.allProbes = probes
-	log.Printf("[trafficsim] Server loaded %d probes for bidirectional detection", len(probes))
+	log.Infof("[trafficsim] Server loaded %d probes for bidirectional detection", len(probes))
 }
 
 // UpdateAllowedAgents replaces the allowed agents list on a running server.
@@ -340,7 +340,7 @@ func (ts *TrafficSim) UpdateAllowedAgents(agents []uint) {
 	defer ts.allowedAgentsMu.Unlock()
 	old := ts.AllowedAgents
 	ts.AllowedAgents = agents
-	log.Printf("[trafficsim] Updated allowed agents: %v -> %v", old, agents)
+	log.Infof("[trafficsim] Updated allowed agents: %v -> %v", old, agents)
 }
 
 // initBidirectional checks if this server has a TRAFFICSIM client probe for the
@@ -357,12 +357,13 @@ func (ts *TrafficSim) initBidirectional(connection *AgentConnection) {
 			PacketTimes:  make(map[int]PacketTime),
 			receivedSeqs: make(map[int]int),
 		}
-		log.Infof("[trafficsim] Bidirectional mode enabled for agent %d using client probe %d",
+		log.Infof("[trafficsim] Bidirectional mode ENABLED for agent %d using client probe %d",
 			connection.AgentID, clientProbe.ID)
 	} else {
 		// Bidirectional not available (or no longer available after probe change)
 		connection.ClientProbeID = 0
 		connection.ReverseCycle = nil
+		log.Infof("[trafficsim] Bidirectional mode DISABLED for agent %d - no client probe found", connection.AgentID)
 	}
 }
 
@@ -425,12 +426,13 @@ func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 		if p.Type == ProbeType_TRAFFICSIM && !p.Server {
 			for _, t := range p.Targets {
 				if t.AgentID != nil && *t.AgentID == targetAgentID {
-					log.Debugf("[trafficsim] Found TRAFFICSIM probe %d for connected agent %d (bidirectional enabled)", p.ID, targetAgentID)
+					log.Infof("[trafficsim] GetClientProbeForAgent: FOUND probe %d for agent %d (Server=%v)", p.ID, targetAgentID, p.Server)
 					return p
 				}
 			}
 		}
 	}
+	log.Infof("[trafficsim] GetClientProbeForAgent: NO probe found for agent %d", targetAgentID)
 	return nil
 }
 
@@ -481,7 +483,7 @@ func (ts *TrafficSim) reconnectUDP() error {
 	shouldLog := shouldLogNetworkError()
 
 	if shouldLog {
-		log.Printf("[trafficsim] Reconnecting due to network change...")
+		log.Infof("[trafficsim] Reconnecting due to network change...")
 	}
 
 	// Close old connection
@@ -495,7 +497,7 @@ func (ts *TrafficSim) reconnectUDP() error {
 	// Establish new connection
 	if err := ts.dialUDP(); err != nil {
 		if shouldLog {
-			log.Printf("[trafficsim] Reconnection failed: %v", err)
+			log.Infof("[trafficsim] Reconnection failed: %v", err)
 		}
 		return err
 	}
@@ -553,7 +555,7 @@ func (ts *TrafficSim) Start(mtrProbe *Probe) {
 	ts.stopChan = make(chan struct{})
 
 	defer func() {
-		log.Printf("[trafficsim] Start() exiting for probe %d", ts.Probe.ID)
+		log.Infof("[trafficsim] Start() exiting for probe %d", ts.Probe.ID)
 		atomic.StoreInt32(&ts.running, 0)
 		if ts.conn != nil {
 			ts.conn.Close()
@@ -571,7 +573,7 @@ func (ts *TrafficSim) Start(mtrProbe *Probe) {
 		}
 
 		if err != nil {
-			log.Printf("[trafficsim] Error: %v. Retrying in %v...", err, TrafficSimRetryInterval)
+			log.Infof("[trafficsim] Error: %v. Retrying in %v...", err, TrafficSimRetryInterval)
 			select {
 			case <-time.After(TrafficSimRetryInterval):
 			case <-ts.stopChan:
@@ -663,7 +665,7 @@ func (ts *TrafficSim) handshake() bool {
 		Seq:  seq,
 	})
 	if err != nil {
-		log.Printf("[trafficsim] Error building HELLO: %v", err)
+		log.Infof("[trafficsim] Error building HELLO: %v", err)
 		return false
 	}
 
@@ -674,7 +676,7 @@ func (ts *TrafficSim) handshake() bool {
 
 	conn.SetWriteDeadline(time.Now().Add(TrafficSimTimeout))
 	if _, err := conn.Write(msg); err != nil {
-		log.Printf("[trafficsim] Failed to send HELLO: %v", err)
+		log.Infof("[trafficsim] Failed to send HELLO: %v", err)
 		return false
 	}
 
@@ -683,13 +685,13 @@ func (ts *TrafficSim) handshake() bool {
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, err := conn.Read(buf)
 	if err != nil {
-		log.Printf("[trafficsim] No HELLO response: %v", err)
+		log.Infof("[trafficsim] No HELLO response: %v", err)
 		return false
 	}
 
 	var resp TrafficSimMsg
 	if err := json.Unmarshal(buf[:n], &resp); err != nil {
-		log.Printf("[trafficsim] Invalid HELLO response: %v", err)
+		log.Infof("[trafficsim] Invalid HELLO response: %v", err)
 		return false
 	}
 
@@ -734,7 +736,7 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 					// Still send packet (will fail, recording loss)
 					// Only log occasionally to prevent spam when network is down
 					if shouldLogNetworkError() {
-						log.Printf("[trafficsim] Reconnection failed, packet %d will fail", i+1)
+						log.Infof("[trafficsim] Reconnection failed, packet %d will fail", i+1)
 					}
 				}
 			}
@@ -812,7 +814,7 @@ func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker) bool {
 		Seq:  seq,
 	})
 	if err != nil {
-		log.Printf("[trafficsim] Error building DATA: %v", err)
+		log.Infof("[trafficsim] Error building DATA: %v", err)
 		return false
 	}
 
@@ -823,7 +825,7 @@ func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker) bool {
 
 	conn.SetWriteDeadline(time.Now().Add(time.Second))
 	if _, err := conn.Write(msg); err != nil {
-		log.Printf("[trafficsim] Send error for seq %d: %v", seq, err)
+		log.Infof("[trafficsim] Send error for seq %d: %v", seq, err)
 		// Check if this is a network change error
 		if isNetworkChangeError(err) {
 			ts.setConnectionValid(false)
@@ -864,7 +866,7 @@ func (ts *TrafficSim) receiveLoop(ctx context.Context) {
 			// Check for network change errors
 			if isNetworkChangeError(err) {
 				if shouldLogNetworkError() {
-					log.Printf("[trafficsim] Network change detected in receive loop: %v", err)
+					log.Infof("[trafficsim] Network change detected in receive loop: %v", err)
 				}
 				ts.setConnectionValid(false)
 				time.Sleep(100 * time.Millisecond)
@@ -872,7 +874,7 @@ func (ts *TrafficSim) receiveLoop(ctx context.Context) {
 			}
 			// Only log non-network errors (closed connection during shutdown is expected)
 			if !strings.Contains(err.Error(), "use of closed network connection") {
-				log.Printf("[trafficsim] Read error: %v", err)
+				log.Infof("[trafficsim] Read error: %v", err)
 			}
 			continue
 		}
@@ -1081,7 +1083,7 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	p95RTT := percentile(rtts, 95)
 	p99RTT := percentile(rtts, 99)
 
-	log.Printf("[trafficsim] DEBUG percentile: rtts.len=%d medianRTT=%v p95RTT=%v p99RTT=%v", len(rtts), medianRTT, p95RTT, p99RTT)
+	log.Infof("[trafficsim] DEBUG percentile: rtts.len=%d medianRTT=%v p95RTT=%v p99RTT=%v", len(rtts), medianRTT, p95RTT, p99RTT)
 
 	// Jitter: mean absolute deviation of inter-packet delays
 	var jitterVals []float64
@@ -1099,12 +1101,12 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	jitterMedian := percentile(jitterVals, 50)
 	jitterP95 := percentile(jitterVals, 95)
 
-	log.Printf("[trafficsim] DEBUG jitter percentile: jitterVals.len=%d jitterMedian=%v jitterP95=%v", len(jitterVals), jitterMedian, jitterP95)
+	log.Infof("[trafficsim] DEBUG jitter percentile: jitterVals.len=%d jitterMedian=%v jitterP95=%v", len(jitterVals), jitterMedian, jitterP95)
 
 	log.Infof("[trafficsim] calculateStats: totalPacketSeqs=%d receivedRtts=%d lost=%d jitterVals=%d outOfOrder=%d duplicates=%d",
 		total, len(rtts), lost, len(jitterVals), cycle.outOfOrder, cycle.duplicates)
 
-	log.Printf("[trafficsim] DEBUG calculateStats RETURNING: medianRTT=%v p95RTT=%v p99RTT=%v jitterMedian=%v jitterP95=%v jitterAvg=%v",
+	log.Infof("[trafficsim] DEBUG calculateStats RETURNING: medianRTT=%v p95RTT=%v p99RTT=%v jitterMedian=%v jitterP95=%v jitterAvg=%v",
 		medianRTT, p95RTT, p99RTT, jitterMedian, jitterP95, jitterAvg)
 
 	return map[string]interface{}{
@@ -1138,7 +1140,7 @@ func (ts *TrafficSim) reportStats(stats map[string]interface{}, mtrProbe *Probe)
 
 	payload, err := json.Marshal(stats)
 	if err != nil {
-		log.Printf("[trafficsim] Error marshaling stats: %v", err)
+		log.Infof("[trafficsim] Error marshaling stats: %v", err)
 		return
 	}
 
@@ -1157,7 +1159,7 @@ func (ts *TrafficSim) reportStats(stats map[string]interface{}, mtrProbe *Probe)
 		TargetAgent: ts.OtherAgent,
 	}:
 	default:
-		log.Printf("[trafficsim] DataChan full, dropping stats")
+		log.Infof("[trafficsim] DataChan full, dropping stats")
 	}
 }
 
@@ -1249,7 +1251,7 @@ func (ts *TrafficSim) runServer() error {
 		// Staleness watchdog: if no valid packets for 2 min, force rebind
 		if time.Since(lastValidPacket) > serverStaleTimeout {
 			if shouldLogNetworkError() {
-				log.Printf("[trafficsim] Server stale for %v, forcing rebind", time.Since(lastValidPacket).Round(time.Second))
+				log.Infof("[trafficsim] Server stale for %v, forcing rebind", time.Since(lastValidPacket).Round(time.Second))
 			}
 			return fmt.Errorf("server stale, no packets for %v", serverStaleTimeout)
 		}
@@ -1264,11 +1266,11 @@ func (ts *TrafficSim) runServer() error {
 			// Check for network-change errors (Windows: wsarecv, WSAEINVAL, etc.)
 			if isNetworkChangeError(err) {
 				if shouldLogNetworkError() {
-					log.Printf("[trafficsim] Server network change detected: %v. Rebinding...", err)
+					log.Infof("[trafficsim] Server network change detected: %v. Rebinding...", err)
 				}
 				return fmt.Errorf("network change: %w", err)
 			}
-			log.Printf("[trafficsim] Server read error: %v", err)
+			log.Infof("[trafficsim] Server read error: %v", err)
 			continue
 		}
 
@@ -1279,7 +1281,7 @@ func (ts *TrafficSim) runServer() error {
 
 		// Check if agent is allowed
 		if !ts.isAgentAllowed(msg.SrcAgent) {
-			log.Printf("[trafficsim] Rejected packet from unauthorized agent %d", msg.SrcAgent)
+			log.Infof("[trafficsim] Rejected packet from unauthorized agent %d", msg.SrcAgent)
 			continue
 		}
 
@@ -1310,6 +1312,8 @@ func (ts *TrafficSim) isAgentAllowed(agentID uint) bool {
 func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, msg TrafficSimMsg) {
 	// Update or create connection tracking
 	ts.connectionsMu.Lock()
+
+	log.Infof("[trafficsim] handleServerMessage ENTRY: SrcAgent=%d Type=%s Seq=%d", msg.SrcAgent, msg.Type, msg.Data.Seq)
 	connection, exists := ts.connections[msg.SrcAgent]
 	if !exists {
 		// Brand new connection
@@ -1370,13 +1374,13 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		if _, err := conn.WriteToUDP(ack, addr); err != nil {
 			if isNetworkChangeError(err) {
 				if shouldLogNetworkError() {
-					log.Printf("[trafficsim] Server network change on ACK send: %v", err)
+					log.Infof("[trafficsim] Server network change on ACK send: %v", err)
 				}
 				// Close socket to force the read loop to exit and trigger rebind
 				conn.Close()
 				return
 			}
-			log.Printf("[trafficsim] Failed to send ACK: %v", err)
+			log.Infof("[trafficsim] Failed to send ACK: %v", err)
 		}
 
 		ts.connectionsMu.Lock()
@@ -1384,14 +1388,22 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		ts.connectionsMu.Unlock()
 
 		// If bidirectional (has client probe for this agent), send test data back
+		log.Infof("[trafficsim] REVERSE path check: ClientProbeID=%d ReverseCycle=%v",
+			connection.ClientProbeID, connection.ReverseCycle != nil)
 		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
+			log.Infof("[trafficsim] REVERSE calling sendReverseDataPacket for agent %d", connection.AgentID)
 			ts.sendReverseDataPacket(conn, addr, connection)
 		}
 
 	case MsgAck:
 		// Client ACK'd our reverse data packet - record the response time
+		log.Infof("[trafficsim] REVERSE MsgAck received: ClientProbeID=%d ReverseCycle=%v data.Seq=%d",
+			connection.ClientProbeID, connection.ReverseCycle != nil, msg.Data.Seq)
 		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
 			ts.handleReverseAck(connection, msg.Data)
+		} else {
+			log.Infof("[trafficsim] REVERSE MsgAck SKIPPED: ClientProbeID=%d ReverseCycle=%v",
+				connection.ClientProbeID, connection.ReverseCycle != nil)
 		}
 	}
 }
@@ -1413,9 +1425,12 @@ func (ts *TrafficSim) buildAckMessage(data TrafficSimData) ([]byte, error) {
 
 // sendReverseDataPacket sends a test data packet from server to client for bidirectional measurement
 func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr, connection *AgentConnection) {
+	log.Infof("[trafficsim] REVERSE sendReverseDataPacket ENTRY: AgentID=%d ReverseSequence=%d", connection.AgentID, connection.ReverseSequence)
 	connection.ReverseSequence++
 	seq := connection.ReverseSequence
 	sentTime := time.Now().UnixMilli()
+
+	log.Infof("[trafficsim] REVERSE sendReverseDataPacket: assigned seq=%d ReverseSequence=%d", seq, connection.ReverseSequence)
 
 	// Track in reverse cycle
 	connection.ReverseCycle.mu.Lock()
@@ -1438,12 +1453,12 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("[trafficsim] Error building reverse DATA: %v", err)
+		log.Infof("[trafficsim] Error building reverse DATA: %v", err)
 		return
 	}
 
 	if _, err := conn.WriteToUDP(msgBytes, addr); err != nil {
-		log.Printf("[trafficsim] Failed to send reverse DATA to agent %d: %v", connection.AgentID, err)
+		log.Infof("[trafficsim] Failed to send reverse DATA to agent %d: %v", connection.AgentID, err)
 	}
 
 	connection.PacketsSent++
@@ -1489,7 +1504,7 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	cycle.mu.Lock()
 	defer cycle.mu.Unlock()
 
-	log.Printf("[trafficsim] REVERSE handleReverseAck START: seq=%d ReverseSequence=%d cycle.StartSeq=%d len(PacketSeqs)=%d len(PacketTimes)=%d",
+	log.Infof("[trafficsim] REVERSE handleReverseAck START: seq=%d ReverseSequence=%d cycle.StartSeq=%d len(PacketSeqs)=%d len(PacketTimes)=%d",
 		seq, connection.ReverseSequence, cycle.StartSeq, len(cycle.PacketSeqs), len(cycle.PacketTimes))
 
 	// Track duplicate/out-of-order
@@ -1507,31 +1522,31 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 {
 		pt.Received = recvTime
 		cycle.PacketTimes[seq] = pt
-		log.Printf("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(cycle.PacketTimes))
+		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(cycle.PacketTimes))
 	} else if pt, ok := cycle.PacketTimes[seq]; ok {
-		log.Printf("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
+		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
 	} else {
-		log.Printf("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d) - may be from rotated cycle", seq, len(cycle.PacketTimes))
+		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d) - may be from rotated cycle", seq, len(cycle.PacketTimes))
 	}
 }
 
 // reportCycleStats calculates and reports stats for a completed reverse cycle
 func (ts *TrafficSim) reportCycleStats(cycle *CycleTracker, probeID uint, agentID uint, target string) {
 	if ts.DataChan == nil || !ts.isRunning() {
-		log.Printf("[trafficsim] REVERSE reportCycleStats skipped: DataChan=%v running=%v", ts.DataChan, ts.isRunning())
+		log.Infof("[trafficsim] REVERSE reportCycleStats skipped: DataChan=%v running=%v", ts.DataChan, ts.isRunning())
 		return
 	}
 
 	// Calculate stats using the same method as client
 	stats := ts.calculateStats(cycle)
 
-	log.Printf("[trafficsim] REVERSE reportCycleStats: probeID=%d agentID=%d target=%s statsLen=%d", probeID, agentID, target, len(stats))
-	log.Printf("[trafficsim] REVERSE stats map keys: %v", mapKeys(stats))
+	log.Infof("[trafficsim] REVERSE reportCycleStats: probeID=%d agentID=%d target=%s statsLen=%d", probeID, agentID, target, len(stats))
+	log.Infof("[trafficsim] REVERSE stats map keys: %v", mapKeys(stats))
 	log.Debugf("[trafficsim] REVERSE stats map before marshal: %+v", stats)
 
 	payload, err := json.Marshal(stats)
 	if err != nil {
-		log.Printf("[trafficsim] Error marshaling reverse stats: %v", err)
+		log.Infof("[trafficsim] Error marshaling reverse stats: %v", err)
 		return
 	}
 
@@ -1551,7 +1566,7 @@ func (ts *TrafficSim) reportCycleStats(cycle *CycleTracker, probeID uint, agentI
 		log.Infof("[trafficsim] probe=%d (reverse) agent=%d loss=%.1f%% avgRTT=%.1fms",
 			probeID, agentID, stats["lossPercentage"], stats["averageRTT"])
 	default:
-		log.Printf("[trafficsim] DataChan full, dropping reverse stats")
+		log.Infof("[trafficsim] DataChan full, dropping reverse stats")
 	}
 }
 
@@ -1559,7 +1574,7 @@ func (ts *TrafficSim) reportCycleStats(cycle *CycleTracker, probeID uint, agentI
 
 // Stop gracefully stops the TrafficSim
 func (ts *TrafficSim) Stop() {
-	log.Printf("[trafficsim] Stop requested for probe %d", ts.Probe.ID)
+	log.Infof("[trafficsim] Stop requested for probe %d", ts.Probe.ID)
 
 	atomic.StoreInt32(&ts.stopping, 1)
 
@@ -1585,9 +1600,9 @@ func (ts *TrafficSim) Stop() {
 
 	select {
 	case <-done:
-		log.Printf("[trafficsim] Stopped probe %d", ts.Probe.ID)
+		log.Infof("[trafficsim] Stopped probe %d", ts.Probe.ID)
 	case <-time.After(5 * time.Second):
-		log.Printf("[trafficsim] Timeout waiting for goroutines, probe %d", ts.Probe.ID)
+		log.Infof("[trafficsim] Timeout waiting for goroutines, probe %d", ts.Probe.ID)
 	}
 }
 
