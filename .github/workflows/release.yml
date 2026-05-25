@@ -60,11 +60,11 @@ jobs:
           LDFLAGS="-s -w -X 'main.VERSION=$VERSION' -X 'main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)' -X 'main.gitCommit=$(git rev-parse --short HEAD)'"
           mkdir -p bin
           
-          # Linux builds
+          # Linux builds - produce both .tar.gz and .zip for backward compatibility
           for arch in amd64 arm64 arm mips mipsle mips64 mips64le; do
             echo "Building linux/$arch..."
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -ldflags "$LDFLAGS" -o bin/netwatcher-linux-$arch .
-            cd bin && tar czf netwatcher-${VERSION}-linux-$arch.tar.gz netwatcher-linux-$arch && rm netwatcher-linux-$arch && cd ..
+            cd bin && tar czf netwatcher-${VERSION}-linux-$arch.tar.gz netwatcher-linux-$arch && zip netwatcher-${VERSION}-linux-$arch.zip netwatcher-linux-$arch && rm netwatcher-linux-$arch && cd ..
           done
           
           # Windows builds
@@ -162,8 +162,8 @@ jobs:
           ls -la bin/
           ARCHIVE_COUNT=$(ls bin/*.tar.gz bin/*.zip 2>/dev/null | wc -l)
           echo "Found $ARCHIVE_COUNT archive files"
-          if [ "$ARCHIVE_COUNT" -lt 11 ]; then
-              echo "ERROR: Expected 11 archive files (7 linux + 2 windows + 2 darwin), but found $ARCHIVE_COUNT"
+          if [ "$ARCHIVE_COUNT" -lt 18 ]; then
+              echo "ERROR: Expected 18 archive files (7 linux * 2 formats + 2 windows + 2 darwin = 18), but found $ARCHIVE_COUNT"
               exit 1
           fi
           
@@ -171,13 +171,17 @@ jobs:
           
           echo "Verifying specific platform artifacts..."
           
-          # Verify Linux artifacts (tar.gz format)
+          # Verify Linux artifacts (both .tar.gz and .zip)
           for arch in amd64 arm64 arm mips mipsle mips64 mips64le; do
             if [ ! -f "bin/netwatcher-${VERSION}-linux-${arch}.tar.gz" ]; then
-              echo "ERROR: Missing Linux ${arch} artifact: netwatcher-${VERSION}-linux-${arch}.tar.gz"
+              echo "ERROR: Missing Linux ${arch} tar.gz artifact"
               exit 1
             fi
-            echo "  [OK] Linux ${arch}"
+            if [ ! -f "bin/netwatcher-${VERSION}-linux-${arch}.zip" ]; then
+              echo "ERROR: Missing Linux ${arch} zip artifact"
+              exit 1
+            fi
+            echo "  [OK] Linux ${arch} (.tar.gz and .zip)"
           done
           
           # Verify Windows artifacts

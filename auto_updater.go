@@ -332,7 +332,9 @@ func (u *AutoUpdater) fetchChecksumFromRelease(release *GitHubRelease, assetName
 	return "", fmt.Errorf("checksum for %s not found in checksums file", assetName)
 }
 
-// findAssetForPlatform finds the appropriate release asset for current platform
+// findAssetForPlatform finds the appropriate release asset for current platform.
+// For Linux, prefers .tar.gz over .zip for backward compatibility with older releases.
+// Returns the first matching asset (preferring .tar.gz on Linux).
 func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
@@ -345,6 +347,11 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 		"goarch": goarch,
 		"assets": len(release.Assets),
 	}).Debug("findAssetForPlatform: searching for matching asset")
+
+	var preferredAsset, fallbackAsset *struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	}
 
 	for _, asset := range release.Assets {
 		name := strings.ToLower(asset.Name)
@@ -380,12 +387,35 @@ func (u *AutoUpdater) findAssetForPlatform(release *GitHubRelease) *struct {
 			continue
 		}
 
-		log.WithFields(log.Fields{
-			"asset":       asset.Name,
-			"matchedOS":   goos,
-			"matchedArch": goarch,
-		}).Info("Found matching asset")
-		return &asset
+		isTarGz := strings.HasSuffix(name, ".tar.gz")
+		if goos == "linux" && isTarGz && preferredAsset == nil {
+			preferredAsset = &asset
+			log.WithFields(log.Fields{
+				"asset":       asset.Name,
+				"matchedOS":   goos,
+				"matchedArch": goarch,
+				"preferred":   true,
+			}).Info("Found matching asset (.tar.gz preferred for Linux)")
+		} else if fallbackAsset == nil {
+			fallbackAsset = &asset
+			log.WithFields(log.Fields{
+				"asset":       asset.Name,
+				"matchedOS":   goos,
+				"matchedArch": goarch,
+				"fallback":    true,
+			}).Info("Found matching asset (fallback)")
+		}
+
+		if preferredAsset != nil && fallbackAsset != nil {
+			break
+		}
+	}
+
+	if preferredAsset != nil {
+		return preferredAsset
+	}
+	if fallbackAsset != nil {
+		return fallbackAsset
 	}
 
 	log.WithFields(log.Fields{
