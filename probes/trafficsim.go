@@ -540,12 +540,20 @@ func extractVoIPOptions(metadata json.RawMessage) TrafficSimOptions {
 		return opts
 	}
 
-	// Check for nested trafficsim config
+	// Check for top-level bidirectional flag first (new format)
+	// This is the primary flag going forward
+	if bidir, ok := metadataMap["bidirectional"]; ok {
+		if b, ok := bidir.(bool); ok && b {
+			opts.Bidirectional = true
+		}
+	}
+
+	// Check for nested trafficsim config (legacy/backward compat)
 	var tsConfig map[string]interface{}
 	if tc, ok := metadataMap["trafficsim"].(map[string]interface{}); ok {
 		tsConfig = tc
 	} else {
-		tsConfig = metadataMap
+		tsConfig = metadataMap // Fall back to top-level for legacy
 	}
 
 	// Parse VoIP mode
@@ -572,10 +580,12 @@ func extractVoIPOptions(metadata json.RawMessage) TrafficSimOptions {
 			opts.PayloadSize = int(f)
 		}
 	}
-	// Parse bidirectional flag
-	if bidirectional, ok := tsConfig["bidirectional"]; ok {
-		if b, ok := bidirectional.(bool); ok {
-			opts.Bidirectional = b
+	// Parse bidirectional flag (only if top-level not already set)
+	if !opts.Bidirectional {
+		if bidirectional, ok := tsConfig["bidirectional"]; ok {
+			if b, ok := bidirectional.(bool); ok {
+				opts.Bidirectional = b
+			}
 		}
 	}
 
