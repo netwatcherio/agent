@@ -19,7 +19,7 @@ import (
 // -------------------- Constants --------------------
 
 const (
-	TrafficSimReportSeq        = 60   // Packets per cycle before reporting
+	TrafficSimReportSeq        = 60   // Packets per cycle before reporting (legacy 1-second interval mode)
 	TrafficSimDataInterval     = 1000 // Milliseconds between packets (default 1 second)
 	TrafficSimTimeout          = 2 * time.Second
 	TrafficSimRetryInterval    = 5 * time.Second
@@ -30,6 +30,10 @@ const (
 	VoIPPayloadSize  = 160 // Bytes (matches G.711 PCM payload)
 	VoIPBitrate      = 64000
 	VoIPClockRate    = 8000
+
+	// VoIP reporting: report every 60 seconds worth of data
+	// At 50 pps × 60 sec = 3000 packets per report cycle
+	VoIPReportIntervalSec = 60
 
 	// DSCP markings (for QoS simulation)
 	DSCPDefault = 0  // Best effort
@@ -269,8 +273,10 @@ func NewTrafficSim(probe *Probe, dataChan chan ProbeData) *TrafficSim {
 		}
 	}
 
-	// Apply VoIP defaults if enabled
-	if ts.Options.VoIPMode {
+	// Apply VoIP defaults if enabled or inferred from interval
+	// If interval is <= 50ms (50 pps or faster), treat as VoIP mode
+	if ts.Options.VoIPMode || (ts.Options.IntervalMs > 0 && ts.Options.IntervalMs <= 50) {
+		ts.Options.VoIPMode = true // Ensure VoIP mode is set for <= 50ms intervals
 		if ts.Options.PayloadSize == 0 {
 			ts.Options.PayloadSize = VoIPPayloadSize
 		}
@@ -934,11 +940,22 @@ func (ts *TrafficSim) handshake() bool {
 }
 
 func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
+	// Determine reporting mode based on VoIP settings
+	// In VoIP mode, we report based on time (every VoIPReportIntervalSec seconds)
+	// In legacy mode (1 second interval), we report every 60 packets (60 seconds)
+	useTimeBasedReporting := ts.Options.VoIPMode && ts.Options.IntervalMs <= 50
+	reportInterval := time.Duration(VoIPReportIntervalSec) * time.Second
+
 	for ts.isRunning() && !ts.isStopping() {
 		// Start new cycle
 		cycle := ts.startCycle()
+		cycleStartTime := time.Now()
 
-		log.Debugf("[trafficsim] Starting cycle, %d packets", TrafficSimReportSeq)
+		if useTimeBasedReporting {
+			log.Infof("[trafficsim] Starting VoIP cycle, will report every %v", reportInterval)
+		} else {
+			log.Debugf("[trafficsim] Starting cycle, %d packets", TrafficSimReportSeq)
+		}
 
 		// Pre-cycle check: validate the socket's bound IP is still on a live interface.
 		// This catches silent socket death (Windows rebinding to a dead interface)
@@ -949,8 +966,10 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 			ts.setConnectionValid(false)
 		}
 
-		// Send packets
-		for i := 0; i < TrafficSimReportSeq && ts.isRunning() && !ts.isStopping(); i++ {
+		// Send packets in a loop, checking both packet count (legacy) and time (VoIP)
+		packetsSent := 0
+		for (useTimeBasedReporting && time.Since(cycleStartTime) < reportInterval) ||
+			(!useTimeBasedReporting && packetsSent < TrafficSimReportSeq) {
 			select {
 			case <-ctx.Done():
 				return
@@ -965,12 +984,13 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 					// Still send packet (will fail, recording loss)
 					// Only log occasionally to prevent spam when network is down
 					if shouldLogNetworkError() {
-						log.Infof("[trafficsim] Reconnection failed, packet %d will fail", i+1)
+						log.Infof("[trafficsim] Reconnection failed, packet %d will fail", packetsSent+1)
 					}
 				}
 			}
 
 			ts.sendDataPacket(cycle)
+			packetsSent++
 
 			// Wait for interval (use configurable interval in milliseconds)
 			select {
@@ -981,6 +1001,9 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 				return
 			}
 		}
+
+		log.Infof("[trafficsim] VoIP cycle complete: sent=%d packets over %v",
+			packetsSent, time.Since(cycleStartTime).Round(time.Second))
 
 		// Wait for responses
 		ts.waitForResponses(ctx, cycle)
