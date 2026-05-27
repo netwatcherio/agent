@@ -191,16 +191,15 @@ type AgentConnection struct {
 	PacketsSent int
 
 	// Reverse direction tracking (for bidirectional mode)
-	// ClientProbeID is the ID of this agent's TrafficSim client probe targeting the connected agent
-	// Used to report reverse direction stats with the correct probe ID
+	// ClientProbeID is the ID of the client's TrafficSim probe targeting this agent
+	// When bidirectional=true, server reports reverse stats using ClientProbeID (same probe ID)
+	// but with SrcAgent = this server's ID to indicate reverse direction
 	ClientProbeID   uint
 	ReverseCycle    *CycleTracker
 	ReverseSequence int
 	LastReportTime  time.Time
 
 	// ReverseTrafficOptions stores the client's VoIP settings for reverse traffic
-	// This allows the server to use the client's configuration (VoIP mode, DSCP, etc.)
-	// when sending reverse direction test packets
 	ReverseTrafficOptions TrafficSimOptions
 }
 
