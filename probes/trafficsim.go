@@ -801,7 +801,7 @@ func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker) bool {
 	cycle.mu.Lock()
 	cycle.PacketSeqs = append(cycle.PacketSeqs, seq)
 	cycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
-	log.Infof("[trafficsim] CLIENT sent seq=%d cycleSeq=%d cyclePacketCount=%d", seq, ts.sequence, len(cycle.PacketSeqs))
+	log.Debugf("[trafficsim] CLIENT sent seq=%d", seq)
 	cycle.mu.Unlock()
 
 	// Also track in client stats
@@ -932,11 +932,11 @@ func (ts *TrafficSim) handleAck(data TrafficSimData) {
 		if pt, ok := ts.currentCycle.PacketTimes[seq]; ok && pt.Received == 0 {
 			pt.Received = recvTime
 			ts.currentCycle.PacketTimes[seq] = pt
-			log.Infof("[trafficsim] CLIENT handleAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(ts.currentCycle.PacketTimes))
-		} else if pt, ok := ts.currentCycle.PacketTimes[seq]; ok {
-			log.Infof("[trafficsim] CLIENT handleAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
+			log.Debugf("[trafficsim] CLIENT handleAck seq=%d rtt=%d", seq, recvTime-pt.Sent)
+		} else if _, ok := ts.currentCycle.PacketTimes[seq]; ok {
+			log.Debugf("[trafficsim] CLIENT handleAck seq=%d ALREADY RECEIVED", seq)
 		} else {
-			log.Infof("[trafficsim] CLIENT handleAck seq=%d NOT FOUND in PacketTimes (current size=%d)", seq, len(ts.currentCycle.PacketTimes))
+			log.Debugf("[trafficsim] CLIENT handleAck seq=%d NOT FOUND", seq)
 		}
 		ts.currentCycle.mu.Unlock()
 	}
@@ -982,7 +982,7 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, cycle *CycleTracker)
 			}
 		}
 		if receivedCount > 0 || len(cycle.PacketSeqs) > 0 {
-			log.Infof("[trafficsim] CLIENT waitForResponses: received=%d timedOut=%d total=%d",
+			log.Debugf("[trafficsim] CLIENT waitForResponses: received=%d timedOut=%d total=%d",
 				receivedCount, timedOutCount, len(cycle.PacketSeqs))
 		}
 		for _, seq := range cycle.PacketSeqs {
@@ -1388,22 +1388,19 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 		ts.connectionsMu.Unlock()
 
 		// If bidirectional (has client probe for this agent), send test data back
-		log.Infof("[trafficsim] REVERSE path check: ClientProbeID=%d ReverseCycle=%v",
-			connection.ClientProbeID, connection.ReverseCycle != nil)
+		log.Debugf("[trafficsim] REVERSE path check: ClientProbeID=%d", connection.ClientProbeID)
 		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
-			log.Infof("[trafficsim] REVERSE calling sendReverseDataPacket for agent %d", connection.AgentID)
+			log.Debugf("[trafficsim] REVERSE calling sendReverseDataPacket for agent %d", connection.AgentID)
 			ts.sendReverseDataPacket(conn, addr, connection)
 		}
 
 	case MsgAck:
 		// Client ACK'd our reverse data packet - record the response time
-		log.Infof("[trafficsim] REVERSE MsgAck received: ClientProbeID=%d ReverseCycle=%v data.Seq=%d",
-			connection.ClientProbeID, connection.ReverseCycle != nil, msg.Data.Seq)
+		log.Debugf("[trafficsim] REVERSE MsgAck received: data.Seq=%d", msg.Data.Seq)
 		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
 			ts.handleReverseAck(connection, msg.Data)
 		} else {
-			log.Infof("[trafficsim] REVERSE MsgAck SKIPPED: ClientProbeID=%d ReverseCycle=%v",
-				connection.ClientProbeID, connection.ReverseCycle != nil)
+			log.Debugf("[trafficsim] REVERSE MsgAck SKIPPED: ClientProbeID=%d", connection.ClientProbeID)
 		}
 	}
 }
@@ -1425,18 +1422,18 @@ func (ts *TrafficSim) buildAckMessage(data TrafficSimData) ([]byte, error) {
 
 // sendReverseDataPacket sends a test data packet from server to client for bidirectional measurement
 func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr, connection *AgentConnection) {
-	log.Infof("[trafficsim] REVERSE sendReverseDataPacket ENTRY: AgentID=%d ReverseSequence=%d", connection.AgentID, connection.ReverseSequence)
+	log.Debugf("[trafficsim] REVERSE sendReverseDataPacket ENTRY: AgentID=%d ReverseSequence=%d", connection.AgentID, connection.ReverseSequence)
 	connection.ReverseSequence++
 	seq := connection.ReverseSequence
 	sentTime := time.Now().UnixMilli()
 
-	log.Infof("[trafficsim] REVERSE sendReverseDataPacket: assigned seq=%d ReverseSequence=%d", seq, connection.ReverseSequence)
+	log.Debugf("[trafficsim] REVERSE sendReverseDataPacket: assigned seq=%d", seq)
 
 	// Track in reverse cycle
 	connection.ReverseCycle.mu.Lock()
 	connection.ReverseCycle.PacketSeqs = append(connection.ReverseCycle.PacketSeqs, seq)
 	connection.ReverseCycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
-	log.Infof("[trafficsim] REVERSE sent seq=%d reverseSeq=%d cyclePacketCount=%d", seq, connection.ReverseSequence, len(connection.ReverseCycle.PacketSeqs))
+	log.Debugf("[trafficsim] REVERSE sent seq=%d cyclePacketCount=%d", seq, len(connection.ReverseCycle.PacketSeqs))
 	connection.ReverseCycle.mu.Unlock()
 
 	// Build DATA message
@@ -1463,19 +1460,19 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 
 	connection.PacketsSent++
 
-	// Check if cycle is complete
+	// Check if cycle is complete (requires all 60 ACKs received OR timeout)
 	if len(connection.ReverseCycle.PacketSeqs) >= TrafficSimReportSeq {
 		// Count how many were actually received (for debugging)
-		// Use connection.ReverseCycle directly since completedCycle not yet assigned
 		receivedCount := 0
 		for _, pt := range connection.ReverseCycle.PacketTimes {
 			if pt.Received > 0 {
 				receivedCount++
 			}
 		}
-		log.Infof("[trafficsim] REVERSE CYCLE COMPLETE: sent=%d received=%d PacketTimes=%d outOfOrder=%d duplicates=%d",
-			len(connection.ReverseCycle.PacketSeqs), receivedCount, len(connection.ReverseCycle.PacketTimes),
-			connection.ReverseCycle.outOfOrder, connection.ReverseCycle.duplicates)
+		log.Infof("[trafficsim] REVERSE CYCLE COMPLETE (sending done): sent=%d received=%d", len(connection.ReverseCycle.PacketSeqs), receivedCount)
+
+		// Wait for all ACKs before rotating cycle (fixes ~1.7% loss from premature rotation)
+		ts.waitForReverseResponses(connection)
 
 		// Rotate cycle synchronously to prevent race conditions
 		completedCycle := connection.ReverseCycle
@@ -1494,6 +1491,55 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 	}
 }
 
+func (ts *TrafficSim) waitForReverseResponses(connection *AgentConnection) {
+	deadline := time.Now().Add(TrafficSimTimeout + 500*time.Millisecond)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ts.stopChan:
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		allDone := true
+		now := time.Now().UnixMilli()
+
+		connection.ReverseCycle.mu.Lock()
+		receivedCount := 0
+		timedOutCount := 0
+		for _, seq := range connection.ReverseCycle.PacketSeqs {
+			if pt, ok := connection.ReverseCycle.PacketTimes[seq]; ok {
+				if pt.Received > 0 {
+					receivedCount++
+				} else if pt.TimedOut {
+					timedOutCount++
+				}
+			}
+		}
+		if receivedCount > 0 || len(connection.ReverseCycle.PacketSeqs) > 0 {
+			log.Infof("[trafficsim] SERVER waitForReverseResponses: received=%d timedOut=%d total=%d",
+				receivedCount, timedOutCount, len(connection.ReverseCycle.PacketSeqs))
+		}
+		for _, seq := range connection.ReverseCycle.PacketSeqs {
+			if pt, ok := connection.ReverseCycle.PacketTimes[seq]; ok {
+				if pt.Received == 0 && !pt.TimedOut {
+					if now-pt.Sent > int64(TrafficSimTimeout.Milliseconds()) {
+						pt.TimedOut = true
+						connection.ReverseCycle.PacketTimes[seq] = pt
+					} else {
+						allDone = false
+					}
+				}
+			}
+		}
+		connection.ReverseCycle.mu.Unlock()
+
+		if allDone {
+			break
+		}
+	}
+}
+
 // handleReverseAck processes ACK from client for server's reverse DATA packet
 func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data TrafficSimData) {
 	seq := data.Seq
@@ -1504,8 +1550,7 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	cycle.mu.Lock()
 	defer cycle.mu.Unlock()
 
-	log.Infof("[trafficsim] REVERSE handleReverseAck START: seq=%d ReverseSequence=%d cycle.StartSeq=%d len(PacketSeqs)=%d len(PacketTimes)=%d",
-		seq, connection.ReverseSequence, cycle.StartSeq, len(cycle.PacketSeqs), len(cycle.PacketTimes))
+	log.Debugf("[trafficsim] REVERSE handleReverseAck START: seq=%d", seq)
 
 	// Track duplicate/out-of-order
 	cycle.receivedSeqs[seq]++
@@ -1522,9 +1567,9 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 {
 		pt.Received = recvTime
 		cycle.PacketTimes[seq] = pt
-		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms PacketTimes.count=%d", seq, recvTime-pt.Sent, len(cycle.PacketTimes))
-	} else if pt, ok := cycle.PacketTimes[seq]; ok {
-		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED rtt=%dms", seq, recvTime-pt.Sent)
+		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms", seq, recvTime-pt.Sent)
+	} else if _, ok := cycle.PacketTimes[seq]; ok {
+		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED", seq)
 	} else {
 		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d) - may be from rotated cycle", seq, len(cycle.PacketTimes))
 	}
