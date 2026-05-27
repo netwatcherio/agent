@@ -193,23 +193,24 @@ func makeProbeKey(probe probes.Probe) string {
 func trafficSimConfigChanged(oldprobe, newprobe probes.Probe) bool {
 	// For server probes, we need special handling
 	if oldprobe.Server && newprobe.Server {
-		// Check if the server address/port changed (always at index 0)
-		/*if len(oldprobe.Target) > 0 && len(newprobe.Target) > 0 {
-			if oldprobe.Target[0].Target != newprobe.Target[0].Target {
+		// Check if server address/port changed
+		if len(oldprobe.Targets) > 0 && len(newprobe.Targets) > 0 {
+			if oldprobe.Targets[0].Target != newprobe.Targets[0].Target {
 				return true
 			}
-			if oldprobe.Target[0].Agent != newprobe.Target[0].Agent {
-				return true
-			}
-		}*/
+		}
 
-		// For server configs, compare allowed agents regardless of order
-		/*oldAgents := extractAllowedAgents(oldprobe.Target)
-		newAgents := extractAllowedAgents(newprobe.Target)
-
+		// Check if allowed agents list changed
+		oldAgents := extractAllowedAgents(oldprobe.Targets)
+		newAgents := extractAllowedAgents(newprobe.Targets)
 		if !sameAgentSets(oldAgents, newAgents) {
 			return true
-		}*/
+		}
+
+		// Check if metadata changed (e.g., VoIP settings)
+		if !metadataEqual(oldprobe.Metadata, newprobe.Metadata) {
+			return true
+		}
 
 		return false
 	}
@@ -217,14 +218,17 @@ func trafficSimConfigChanged(oldprobe, newprobe probes.Probe) bool {
 	// For client probes
 	if !oldprobe.Server && !newprobe.Server {
 		// Check if target address/port changed
-		/*if len(oldprobe.Target) > 0 && len(newprobe.Target) > 0 {
-			if oldprobe.Target[0].Target != newprobe.Target[0].Target {
+		if len(oldprobe.Targets) > 0 && len(newprobe.Targets) > 0 {
+			if oldprobe.Targets[0].Target != newprobe.Targets[0].Target {
 				return true
 			}
-			if oldprobe.Target[0].Agent != newprobe.Target[0].Agent {
-				return true
-			}
-		}*/
+		}
+
+		// Check if metadata changed (e.g., VoIP settings, DSCP, interval)
+		if !metadataEqual(oldprobe.Metadata, newprobe.Metadata) {
+			return true
+		}
+
 		return false
 	}
 
@@ -232,31 +236,103 @@ func trafficSimConfigChanged(oldprobe, newprobe probes.Probe) bool {
 	return oldprobe.Server != newprobe.Server
 }
 
-// Helper function to extract allowed agents from targets (skipping index 0)
-func extractAllowedAgents(targets []probes.ProbeTarget) map[primitive.ObjectID]bool {
-	agents := make(map[primitive.ObjectID]bool)
-	/*if len(targets) > 1 {
-		for i := 1; i < len(targets); i++ {
-			if targets[i].AgentID != primitive.NilObjectID {
-				agents[targets[i].AgentID] = true
-			}
-		} todo
-	}*/
-	return agents
-}
-
-// Helper function to compare two agent sets
-func sameAgentSets(set1, set2 map[primitive.ObjectID]bool) bool {
-	if len(set1) != len(set2) {
+// metadataEqual compares two metadata JSON fields for equality
+func metadataEqual(m1, m2 json.RawMessage) bool {
+	if len(m1) == 0 && len(m2) == 0 {
+		return true
+	}
+	if len(m1) == 0 || len(m2) == 0 {
 		return false
 	}
+	// Unmarshal and compare as generic maps
+	var a, b map[string]interface{}
+	if err := json.Unmarshal(m1, &a); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(m2, &b); err != nil {
+		return false
+	}
+	// Compare trafficsim section specifically
+	aTS := getNestedMap(a, "trafficsim")
+	bTS := getNestedMap(b, "trafficsim")
+	return mapsEqual(aTS, bTS)
+}
 
-	for agent := range set1 {
-		if !set2[agent] {
+// getNestedMap safely gets a nested map from a map
+func getNestedMap(m map[string]interface{}, key string) map[string]interface{} {
+	if v, ok := m[key].(map[string]interface{}); ok {
+		return v
+	}
+	return nil
+}
+
+// mapsEqual compares two maps for equality (shallow comparison of keys and values)
+func mapsEqual(a, b map[string]interface{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok {
+			return false
+		} else if !interfaceEqual(v, bv) {
 			return false
 		}
 	}
+	return true
+}
 
+// interfaceEqual compares two interface{} values for equality
+func interfaceEqual(a, b interface{}) bool {
+	// Handle numeric types (JSON unmarshals numbers as float64)
+	if an, ok := a.(float64); ok {
+		if bn, ok := b.(float64); ok {
+			return an == bn
+		}
+		return false
+	}
+	if ab, ok := a.(bool); ok {
+		if bb, ok := b.(bool); ok {
+			return ab == bb
+		}
+		return false
+	}
+	if as, ok := a.(string); ok {
+		if bs, ok := b.(string); ok {
+			return as == bs
+		}
+		return false
+	}
+	// For nested maps
+	if am, ok := a.(map[string]interface{}); ok {
+		if bm, ok := b.(map[string]interface{}); ok {
+			return mapsEqual(am, bm)
+		}
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+// extractAllowedAgents extracts the allowed agent IDs from server probe targets
+func extractAllowedAgents(targets []probes.ProbeTarget) map[uint]bool {
+	agents := make(map[uint]bool)
+	// First target is the server bind address, rest are allowed agents
+	for i := 1; i < len(targets); i++ {
+		if targets[i].AgentID != nil {
+			agents[*targets[i].AgentID] = true
+		}
+	}
+	return agents
+}
+
+// sameAgentSets compares two agent ID maps
+func sameAgentSets(a, b map[uint]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
 	return true
 }
 

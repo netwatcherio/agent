@@ -11,7 +11,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -19,11 +21,22 @@ import (
 // -------------------- Constants --------------------
 
 const (
-	TrafficSimReportSeq        = 60 // Packets per cycle before reporting
-	TrafficSimDataInterval     = 1  // Seconds between packets
+	TrafficSimReportSeq        = 60   // Packets per cycle before reporting
+	TrafficSimDataInterval     = 1000 // Milliseconds between packets (default 1 second)
 	TrafficSimTimeout          = 2 * time.Second
 	TrafficSimRetryInterval    = 5 * time.Second
 	TrafficSimGracefulShutdown = 70 * time.Second
+
+	// VoIP simulation constants (G.711-like) - configurable via probe options
+	VoIPDataInterval = 20  // Milliseconds between packets (50 pps, matches G.711)
+	VoIPPayloadSize  = 160 // Bytes (matches G.711 PCM payload)
+	VoIPBitrate      = 64000
+	VoIPClockRate    = 8000
+
+	// DSCP markings (for QoS simulation)
+	DSCPDefault = 0  // Best effort
+	DSCPEF      = 46 // Expedited Forwarding (voice traffic)
+	DSCPAf41    = 34 // High priority, low loss (video)
 )
 
 // -------------------- Message Types --------------------
@@ -78,6 +91,17 @@ type CycleTracker struct {
 	duplicates      int         // Count of duplicate packets received
 	receivedSeqs    map[int]int // Track how many times each seq was received
 	mu              sync.RWMutex
+
+	// Burst loss tracking (VoIP quality assessment)
+	consecutiveLoss    int // Current streak of consecutive lost packets
+	maxConsecutiveLoss int // Maximum burst loss encountered
+	totalBursts        int // Number of distinct burst loss events
+
+	// RFC 3550 jitter calculation
+	lastTransit     int64   // Last transit time (R - S) for RFC 3550 jitter
+	lastArrivalTime int64   // Last packet arrival time (R)
+	lastSentTime    int64   // Last packet sent time (S)
+	rfc3550Jitter   float64 // Smoothed jitter in microseconds
 }
 
 // ClientStats tracks client-side statistics
@@ -87,6 +111,16 @@ type ClientStats struct {
 }
 
 // -------------------- TrafficSim Main Struct --------------------
+
+// TrafficSimOptions holds configurable options for traffic simulation
+type TrafficSimOptions struct {
+	VoIPMode      bool // Enable VoIP simulation mode (20ms interval, 160-byte payload)
+	PayloadSize   int  // Fixed payload size (0 = variable JSON)
+	DSCPValue     int  // DSCP marking value (0-63, 46 for EF/voice)
+	IntervalMs    int  // Packet interval in milliseconds
+	PacketsPerSec int  // Computed from IntervalMs
+	Bidirectional bool // Enable bidirectional mode (client also receives reverse traffic)
+}
 
 // TrafficSim handles UDP traffic simulation between agents
 type TrafficSim struct {
@@ -106,6 +140,9 @@ type TrafficSim struct {
 	IPAddress string
 	Port      int64
 	IsServer  bool
+
+	// Simulation options
+	Options TrafficSimOptions
 
 	// Server mode: allowed agents
 	AllowedAgents   []uint
@@ -162,6 +199,11 @@ type AgentConnection struct {
 	ReverseCycle    *CycleTracker
 	ReverseSequence int
 	LastReportTime  time.Time
+
+	// ReverseTrafficOptions stores the client's VoIP settings for reverse traffic
+	// This allows the server to use the client's configuration (VoIP mode, DSCP, etc.)
+	// when sending reverse direction test packets
+	ReverseTrafficOptions TrafficSimOptions
 }
 
 // -------------------- Constructor --------------------
@@ -175,6 +217,71 @@ func NewTrafficSim(probe *Probe, dataChan chan ProbeData) *TrafficSim {
 		connections:   make(map[uint]*AgentConnection),
 		clientStats:   &ClientStats{PacketTimes: make(map[int]PacketTime)},
 	}
+
+	ts.Options = TrafficSimOptions{
+		VoIPMode:    false,
+		PayloadSize: 0,
+		DSCPValue:   DSCPDefault,
+		IntervalMs:  TrafficSimDataInterval,
+	}
+
+	// Parse VoIP mode and other options from probe metadata
+	// Support both nested format (trafficsim: {voip_mode, dscp, ...}) and flat format for flexibility
+	if len(probe.Metadata) > 0 {
+		var metadata map[string]interface{}
+		if err := json.Unmarshal(probe.Metadata, &metadata); err == nil {
+			// First, check for nested trafficsim config (from AGENT probe inheritance)
+			var tsConfig map[string]interface{}
+			if tc, ok := metadata["trafficsim"].(map[string]interface{}); ok {
+				tsConfig = tc
+			} else {
+				// Fall back to top-level for direct TRAFFICSIM probes
+				tsConfig = metadata
+			}
+
+			// Parse VoIP mode
+			if voipMode, ok := tsConfig["voip_mode"]; ok {
+				if b, ok := voipMode.(bool); ok {
+					ts.Options.VoIPMode = b
+				}
+			}
+			// Parse payload size
+			if payloadSize, ok := tsConfig["payload_size"]; ok {
+				if f, ok := payloadSize.(float64); ok {
+					ts.Options.PayloadSize = int(f)
+				}
+			}
+			// Parse DSCP value
+			if dscp, ok := tsConfig["dscp"]; ok {
+				if f, ok := dscp.(float64); ok {
+					ts.Options.DSCPValue = int(f)
+				}
+			}
+			// Parse interval
+			if intervalMs, ok := tsConfig["interval_ms"]; ok {
+				if f, ok := intervalMs.(float64); ok {
+					ts.Options.IntervalMs = int(f)
+				}
+			}
+			// Parse bidirectional flag
+			if bidirectional, ok := tsConfig["bidirectional"]; ok {
+				if b, ok := bidirectional.(bool); ok {
+					ts.Options.Bidirectional = b
+				}
+			}
+		}
+	}
+
+	// Apply VoIP defaults if enabled
+	if ts.Options.VoIPMode {
+		if ts.Options.PayloadSize == 0 {
+			ts.Options.PayloadSize = VoIPPayloadSize
+		}
+		if ts.Options.IntervalMs == TrafficSimDataInterval {
+			ts.Options.IntervalMs = VoIPDataInterval
+		}
+	}
+	ts.Options.PacketsPerSec = 1000 / ts.Options.IntervalMs
 
 	// Parse probe configuration
 	if probe.Server {
@@ -349,22 +456,110 @@ func (ts *TrafficSim) UpdateAllowedAgents(agents []uint) {
 func (ts *TrafficSim) initBidirectional(connection *AgentConnection) {
 	clientProbe := ts.GetClientProbeForAgent(connection.AgentID)
 	if clientProbe != nil {
-		connection.ClientProbeID = clientProbe.ID
-		connection.ReverseCycle = &CycleTracker{
-			StartSeq:     1,
-			StartTime:    time.Now(),
-			PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
-			PacketTimes:  make(map[int]PacketTime),
-			receivedSeqs: make(map[int]int),
+		// Extract client's VoIP settings from metadata for reverse traffic
+		connection.ReverseTrafficOptions = extractVoIPOptions(clientProbe.Metadata)
+
+		// Enable bidirectional reverse traffic if:
+		// 1. NEW: The bidirectional flag is set in metadata
+		// 2. LEGACY: The target has ":bidir" suffix (dual-probe approach)
+		if shouldEnableBidirectional(clientProbe) {
+			connection.ClientProbeID = clientProbe.ID
+			connection.ReverseCycle = &CycleTracker{
+				StartSeq:     1,
+				StartTime:    time.Now(),
+				PacketSeqs:   make([]int, 0, TrafficSimReportSeq),
+				PacketTimes:  make(map[int]PacketTime),
+				receivedSeqs: make(map[int]int),
+			}
+			log.Infof("[trafficsim] Bidirectional mode ENABLED for agent %d using client probe %d (VoIP: %v, DSCP: %d, Interval: %dms, BiDir flag: %v)",
+				connection.AgentID, clientProbe.ID, connection.ReverseTrafficOptions.VoIPMode,
+				connection.ReverseTrafficOptions.DSCPValue, connection.ReverseTrafficOptions.IntervalMs,
+				connection.ReverseTrafficOptions.Bidirectional)
+		} else {
+			// No bidirectional flag - this is a unidirectional probe
+			connection.ClientProbeID = 0
+			connection.ReverseCycle = nil
+			log.Infof("[trafficsim] Unidirectional probe for agent %d - reverse disabled (no bidirectional flag)",
+				connection.AgentID)
 		}
-		log.Infof("[trafficsim] Bidirectional mode ENABLED for agent %d using client probe %d",
-			connection.AgentID, clientProbe.ID)
 	} else {
-		// Bidirectional not available (or no longer available after probe change)
+		// No client probe found
 		connection.ClientProbeID = 0
 		connection.ReverseCycle = nil
+		connection.ReverseTrafficOptions = TrafficSimOptions{}
 		log.Infof("[trafficsim] Bidirectional mode DISABLED for agent %d - no client probe found", connection.AgentID)
 	}
+}
+
+// extractVoIPOptions extracts VoIP/trafficsim options from probe metadata
+func extractVoIPOptions(metadata json.RawMessage) TrafficSimOptions {
+	opts := TrafficSimOptions{
+		VoIPMode:      false,
+		DSCPValue:     DSCPDefault,
+		IntervalMs:    TrafficSimDataInterval,
+		Bidirectional: false,
+	}
+
+	if len(metadata) == 0 {
+		return opts
+	}
+
+	var metadataMap map[string]interface{}
+	if err := json.Unmarshal(metadata, &metadataMap); err != nil {
+		return opts
+	}
+
+	// Check for nested trafficsim config
+	var tsConfig map[string]interface{}
+	if tc, ok := metadataMap["trafficsim"].(map[string]interface{}); ok {
+		tsConfig = tc
+	} else {
+		tsConfig = metadataMap
+	}
+
+	// Parse VoIP mode
+	if voipMode, ok := tsConfig["voip_mode"]; ok {
+		if b, ok := voipMode.(bool); ok {
+			opts.VoIPMode = b
+		}
+	}
+	// Parse DSCP value
+	if dscp, ok := tsConfig["dscp"]; ok {
+		if f, ok := dscp.(float64); ok {
+			opts.DSCPValue = int(f)
+		}
+	}
+	// Parse interval
+	if intervalMs, ok := tsConfig["interval_ms"]; ok {
+		if f, ok := intervalMs.(float64); ok {
+			opts.IntervalMs = int(f)
+		}
+	}
+	// Parse payload size
+	if payloadSize, ok := tsConfig["payload_size"]; ok {
+		if f, ok := payloadSize.(float64); ok {
+			opts.PayloadSize = int(f)
+		}
+	}
+	// Parse bidirectional flag
+	if bidirectional, ok := tsConfig["bidirectional"]; ok {
+		if b, ok := bidirectional.(bool); ok {
+			opts.Bidirectional = b
+		}
+	}
+
+	// Apply VoIP defaults if enabled
+	if opts.VoIPMode {
+		if opts.PayloadSize == 0 {
+			opts.PayloadSize = VoIPPayloadSize
+		}
+		if opts.IntervalMs == TrafficSimDataInterval {
+			opts.IntervalMs = VoIPDataInterval
+		}
+	}
+	opts.PacketsPerSec = 1000 / opts.IntervalMs
+
+	return opts
 }
 
 // RefreshBidirectional re-checks all existing connections for bidirectional probe support.
@@ -378,12 +573,14 @@ func (ts *TrafficSim) RefreshBidirectional() {
 	refreshed := 0
 	for _, connection := range ts.connections {
 		// Skip if bidirectional already enabled
-		if connection.ClientProbeID != 0 {
+		if connection.ClientProbeID != 0 && connection.ReverseCycle != nil {
 			continue
 		}
 		// Re-check if we now have a client probe for this agent
 		clientProbe := ts.GetClientProbeForAgent(connection.AgentID)
-		if clientProbe != nil {
+		if clientProbe != nil && shouldEnableBidirectional(clientProbe) {
+			// Extract VoIP options including bidirectional flag
+			opts := extractVoIPOptions(clientProbe.Metadata)
 			connection.ClientProbeID = clientProbe.ID
 			connection.ReverseCycle = &CycleTracker{
 				StartSeq:     1,
@@ -392,8 +589,9 @@ func (ts *TrafficSim) RefreshBidirectional() {
 				PacketTimes:  make(map[int]PacketTime),
 				receivedSeqs: make(map[int]int),
 			}
-			log.Infof("[trafficsim] Bidirectional mode (refresh) enabled for agent %d using client probe %d",
-				connection.AgentID, clientProbe.ID)
+			connection.ReverseTrafficOptions = opts
+			log.Infof("[trafficsim] Bidirectional mode (refresh) enabled for agent %d using client probe %d (VoIP: %v, BiDir: %v)",
+				connection.AgentID, clientProbe.ID, opts.VoIPMode, opts.Bidirectional)
 			refreshed++
 		}
 	}
@@ -434,6 +632,31 @@ func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 	}
 	log.Infof("[trafficsim] GetClientProbeForAgent: NO probe found for agent %d", targetAgentID)
 	return nil
+}
+
+// shouldEnableBidirectional checks if bidirectional mode should be enabled for a probe.
+// Returns true if:
+// 1. The probe has bidirectional=true in metadata (NEW single-probe approach)
+// 2. The probe's target contains ":bidir" suffix (LEGACY dual-probe approach)
+func shouldEnableBidirectional(probe *Probe) bool {
+	if probe == nil {
+		return false
+	}
+
+	// Check metadata for bidirectional flag
+	opts := extractVoIPOptions(probe.Metadata)
+	if opts.Bidirectional {
+		return true
+	}
+
+	// Check for legacy ":bidir" suffix in targets
+	for _, t := range probe.Targets {
+		if t.Target != "" && strings.HasSuffix(t.Target, ":bidir") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // nextReverseSequence returns the next sequence number for reverse direction
@@ -643,6 +866,15 @@ func (ts *TrafficSim) dialUDP() error {
 		return err
 	}
 
+	// Apply DSCP marking if configured
+	if ts.Options.DSCPValue > 0 {
+		if err := ts.setDSCPMarking(conn, ts.Options.DSCPValue); err != nil {
+			log.Warnf("[trafficsim] probe=%d: failed to set DSCP %d: %v", ts.Probe.ID, ts.Options.DSCPValue, err)
+		} else {
+			log.Infof("[trafficsim] probe=%d: DSCP marking set to %d (0x%02x)", ts.Probe.ID, ts.Options.DSCPValue, ts.Options.DSCPValue<<2)
+		}
+	}
+
 	// Capture the local IP the OS actually bound us to.
 	// We'll check this before each cycle — if this IP is no longer
 	// assigned to any active interface, the socket is stale.
@@ -654,6 +886,43 @@ func (ts *TrafficSim) dialUDP() error {
 
 	ts.setConn(conn)
 	return nil
+}
+
+// setDSCPMarking sets the IP DSCP (ToS) field on the UDP socket
+// DSCP value is left-shifted by 2 to form the ToS byte (low 2 bits are ECN)
+func (ts *TrafficSim) setDSCPMarking(conn *net.UDPConn, dscp int) error {
+	if conn == nil {
+		return fmt.Errorf("nil connection")
+	}
+
+	// Get the underlying raw connection to set socket option
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("getting syscall conn: %w", err)
+	}
+
+	var sysErr error
+	err = rawConn.Control(func(fd uintptr) {
+		// IP_TOS is socket option for setting Type of Service byte
+		// On Unix: IPPROTO_IP, IP_TOS
+		// DSCP is upper 6 bits of ToS byte, lower 2 bits are ECN
+		tos := uint8(dscp << 2)
+		_, _, err := syscall.Syscall6(
+			syscall.SYS_SETSOCKOPT,
+			fd,
+			syscall.IPPROTO_IP,
+			syscall.IP_TOS,
+			uintptr(unsafe.Pointer(&tos)),
+			uintptr(1),
+			0)
+		if err != 0 {
+			sysErr = fmt.Errorf("setsockopt IP_TOS: %v", err)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("rawConn.Control: %w", err)
+	}
+	return sysErr
 }
 
 func (ts *TrafficSim) handshake() bool {
@@ -743,9 +1012,9 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 
 			ts.sendDataPacket(cycle)
 
-			// Wait for interval
+			// Wait for interval (use configurable interval in milliseconds)
 			select {
-			case <-time.After(time.Duration(TrafficSimDataInterval) * time.Second):
+			case <-time.After(time.Duration(ts.Options.IntervalMs) * time.Millisecond):
 			case <-ctx.Done():
 				return
 			case <-ts.stopChan:
@@ -919,6 +1188,14 @@ func (ts *TrafficSim) handleAck(data TrafficSimData) {
 		if receiveCount > 1 {
 			// This is a duplicate packet
 			ts.currentCycle.duplicates++
+			// Reset consecutive loss counter when we receive a packet (even duplicate)
+			if ts.currentCycle.consecutiveLoss > 0 {
+				if ts.currentCycle.consecutiveLoss > ts.currentCycle.maxConsecutiveLoss {
+					ts.currentCycle.maxConsecutiveLoss = ts.currentCycle.consecutiveLoss
+				}
+				ts.currentCycle.totalBursts++
+				ts.currentCycle.consecutiveLoss = 0
+			}
 		} else {
 			// First time receiving this seq - check for out-of-order
 			if ts.currentCycle.lastReceivedSeq > 0 && seq < ts.currentCycle.lastReceivedSeq {
@@ -926,13 +1203,38 @@ func (ts *TrafficSim) handleAck(data TrafficSimData) {
 				ts.currentCycle.outOfOrder++
 			}
 			ts.currentCycle.lastReceivedSeq = seq
+			// Reset consecutive loss counter on successful receipt
+			if ts.currentCycle.consecutiveLoss > 0 {
+				if ts.currentCycle.consecutiveLoss > ts.currentCycle.maxConsecutiveLoss {
+					ts.currentCycle.maxConsecutiveLoss = ts.currentCycle.consecutiveLoss
+				}
+				ts.currentCycle.totalBursts++
+				ts.currentCycle.consecutiveLoss = 0
+			}
 		}
 
 		// Update packet timing (only first receipt)
 		if pt, ok := ts.currentCycle.PacketTimes[seq]; ok && pt.Received == 0 {
 			pt.Received = recvTime
 			ts.currentCycle.PacketTimes[seq] = pt
-			log.Debugf("[trafficsim] CLIENT handleAck seq=%d rtt=%d", seq, recvTime-pt.Sent)
+
+			// RFC 3550 jitter calculation
+			// J(i) = J(i-1) + (|D(i,i-1)| - J(i-1))/16
+			// D(i,j) = (Rj - Ri) - (Sj - Si) = difference between inter-arrival and inter-transit time
+			if ts.currentCycle.lastTransit > 0 {
+				interArrival := float64(recvTime - ts.currentCycle.lastArrivalTime)
+				interTransit := float64(pt.Sent - ts.currentCycle.lastSentTime)
+				D := math.Abs(interArrival - interTransit)
+				// Update smoothed jitter using RFC 3550 formula
+				ts.currentCycle.rfc3550Jitter = ts.currentCycle.rfc3550Jitter + (D-ts.currentCycle.rfc3550Jitter)/16.0
+			}
+			// Update last transit time for next calculation
+			transit := recvTime - pt.Sent
+			ts.currentCycle.lastTransit = transit
+			ts.currentCycle.lastArrivalTime = recvTime
+			ts.currentCycle.lastSentTime = pt.Sent
+
+			log.Debugf("[trafficsim] CLIENT handleAck seq=%d rtt=%d jitter=%.2f", seq, recvTime-pt.Sent, ts.currentCycle.rfc3550Jitter)
 		} else if _, ok := ts.currentCycle.PacketTimes[seq]; ok {
 			log.Debugf("[trafficsim] CLIENT handleAck seq=%d ALREADY RECEIVED", seq)
 		} else {
@@ -991,6 +1293,8 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, cycle *CycleTracker)
 					if now-pt.Sent > int64(TrafficSimTimeout.Milliseconds()) {
 						pt.TimedOut = true
 						cycle.PacketTimes[seq] = pt
+						// Track burst loss
+						cycle.consecutiveLoss++
 					} else {
 						allDone = false
 					}
@@ -1101,7 +1405,79 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	jitterMedian := percentile(jitterVals, 50)
 	jitterP95 := percentile(jitterVals, 95)
 
+	// Estimate one-way delay as half of RTT
+	oneWayLatency := avgRTT / 2.0
+
+	// Playout buffer recommendation based on jitter
+	// RFC 3438 guidelines: buffer should be 2-3x the measured jitter
+	// For G.711: minimum 20ms + jitter, typical 40-80ms
+	playoutBufferMin := jitterMedian * 2
+	if playoutBufferMin < 20 {
+		playoutBufferMin = 20
+	}
+	playoutBufferMax := jitterP95 * 2
+	if playoutBufferMax < playoutBufferMin {
+		playoutBufferMax = playoutBufferMin * 2
+	}
+
+	// MOS calculation using simplified E-Model (G.107)
+	// R = 94.2 - Id - Ie - Is
+	// For G.711: Ie = 0 (best effort codec)
+	// Id depends on delay: Id = 0.024 * oneWayDelay + 0.11 * oneWayDelay * (oneWayDelay/10)
+	// Is is for simultaneous impairments (simplified to 0 for our test)
+	// Packet loss impact: Ip = 30 * ln(1 + 0.8 * lossPercent)
+	// Burst loss amplification: effectiveLoss = lossPercent * (1 + burstFactor * 0.1)
+	// For burst loss, we amplify the loss impact
+	burstFactor := float64(0)
+	if cycle.totalBursts > 0 {
+		// More bursts = higher burst factor (0-4 scale)
+		burstFactor = math.Min(float64(cycle.totalBursts)/10.0, 4.0)
+	}
+	effectiveLossPercent := lossPercent * (1.0 + burstFactor*0.1)
+
+	// Calculate impairment components
+	Ie := float64(0)                                    // Equipment impairment for G.711
+	Ip := 30.0 * math.Log(1.0+0.8*effectiveLossPercent) // Packet loss impairment
+	oneWayDelayMs := oneWayLatency
+	Id := 0.024*oneWayDelayMs + 0.11*oneWayDelayMs*(oneWayDelayMs/10.0) // Delay impairment
+
+	// R-factor (0-100 scale)
+	R := 94.2 - Id - Ie - Ip
+
+	// Clamp R to valid range
+	if R < 0 {
+		R = 0
+	}
+	if R > 100 {
+		R = 100
+	}
+
+	// Convert R-factor to MOS (1.0-5.0)
+	// MOS = 1.0 + 0.035*R + R*(R-60)*(100-R)*7e-6
+	MOS := 1.0 + 0.035*R + R*(R-60.0)*(100.0-R)*7e-6
+	if MOS < 1.0 {
+		MOS = 1.0
+	}
+	if MOS > 5.0 {
+		MOS = 5.0
+	}
+
+	// MOS quality classification
+	mosQuality := "unknown"
+	if MOS >= 4.3 {
+		mosQuality = "excellent"
+	} else if MOS >= 4.0 {
+		mosQuality = "good"
+	} else if MOS >= 3.6 {
+		mosQuality = "acceptable"
+	} else if MOS >= 3.0 {
+		mosQuality = "poor"
+	} else {
+		mosQuality = "bad"
+	}
+
 	log.Infof("[trafficsim] DEBUG jitter percentile: jitterVals.len=%d jitterMedian=%v jitterP95=%v", len(jitterVals), jitterMedian, jitterP95)
+	log.Infof("[trafficsim] DEBUG MOS: R=%.1f MOS=%.2f Id=%.2f Ip=%.2f oneWayLatency=%.1fms", R, MOS, Id, Ip, oneWayLatency)
 
 	log.Infof("[trafficsim] calculateStats: totalPacketSeqs=%d receivedRtts=%d lost=%d jitterVals=%d outOfOrder=%d duplicates=%d",
 		total, len(rtts), lost, len(jitterVals), cycle.outOfOrder, cycle.duplicates)
@@ -1109,26 +1485,159 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	log.Infof("[trafficsim] DEBUG calculateStats RETURNING: medianRTT=%v p95RTT=%v p99RTT=%v jitterMedian=%v jitterP95=%v jitterAvg=%v",
 		medianRTT, p95RTT, p99RTT, jitterMedian, jitterP95, jitterAvg)
 
-	return map[string]interface{}{
+	// Calculate cycle duration
+	cycleDurationMs := float64(0)
+	if !cycle.StartTime.IsZero() {
+		cycleDurationMs = float64(time.Since(cycle.StartTime).Milliseconds())
+	}
+
+	// Calculate actual packet rate achieved
+	packetsPerSecond := float64(0)
+	if cycleDurationMs > 0 && total > 0 {
+		packetsPerSecond = (float64(total) / cycleDurationMs) * 1000.0
+	}
+
+	// Calculate network efficiency (packets that were useful - not lost/duplicate/out-of-order)
+	networkEfficiency := float64(100)
+	if total > 0 {
+		badPackets := lost + cycle.duplicates + cycle.outOfOrder
+		networkEfficiency = float64(total-badPackets) / float64(total) * 100.0
+	}
+
+	// Latency quality classification (based on one-way latency)
+	latencyQuality := "unknown"
+	latencyQualityScore := float64(100)
+	estOneWayLat := avgRTT / 2.0
+	if estOneWayLat < 50 {
+		latencyQuality = "excellent"
+		latencyQualityScore = 100
+	} else if estOneWayLat < 100 {
+		latencyQuality = "good"
+		latencyQualityScore = 80
+	} else if estOneWayLat < 200 {
+		latencyQuality = "acceptable"
+		latencyQualityScore = 60
+	} else if estOneWayLat < 300 {
+		latencyQuality = "poor"
+		latencyQualityScore = 40
+	} else {
+		latencyQuality = "bad"
+		latencyQualityScore = 20
+	}
+
+	// Jitter quality score (lower jitter = higher quality)
+	jitterQualityScore := float64(100)
+	if jitterMedian < 10 {
+		jitterQualityScore = 100
+	} else if jitterMedian < 20 {
+		jitterQualityScore = 80
+	} else if jitterMedian < 30 {
+		jitterQualityScore = 60
+	} else if jitterMedian < 50 {
+		jitterQualityScore = 40
+	} else {
+		jitterQualityScore = 20
+	}
+
+	// Loss quality score
+	lossQualityScore := float64(100)
+	if lossPercent < 0.1 {
+		lossQualityScore = 100
+	} else if lossPercent < 0.5 {
+		lossQualityScore = 90
+	} else if lossPercent < 1.0 {
+		lossQualityScore = 80
+	} else if lossPercent < 2.0 {
+		lossQualityScore = 60
+	} else if lossPercent < 5.0 {
+		lossQualityScore = 40
+	} else {
+		lossQualityScore = 20
+	}
+
+	// Composite network health score (0-100)
+	networkHealthScore := (latencyQualityScore*0.4 + jitterQualityScore*0.3 + lossQualityScore*0.3)
+
+	// Build stats map with backward-compatible base metrics
+	stats := map[string]interface{}{
+		// Basic loss and packet metrics
 		"lostPackets":       lost,
 		"lossPercentage":    lossPercent,
 		"totalPackets":      total,
-		"averageRTT":        avgRTT,
-		"medianRTT":         medianRTT,
-		"p95RTT":            p95RTT,
-		"p99RTT":            p99RTT,
-		"minRTT":            minRTT,
-		"maxRTT":            maxRTT,
-		"stdDevRTT":         stdDev,
-		"jitterAvg":         jitterAvg,
-		"jitterMedian":      jitterMedian,
-		"jitterP95":         jitterP95,
-		"outOfOrder":        cycle.outOfOrder,
-		"outOfOrderPercent": outOfOrderPercent,
+		"receivedPackets":   received,
 		"duplicates":        cycle.duplicates,
 		"duplicatePercent":  duplicatePercent,
-		"timestamp":         time.Now(),
+		"outOfOrder":        cycle.outOfOrder,
+		"outOfOrderPercent": outOfOrderPercent,
+
+		// Latency metrics (RTT in ms)
+		"averageRTT": avgRTT,
+		"medianRTT":  medianRTT,
+		"p95RTT":     p95RTT,
+		"p99RTT":     p99RTT,
+		"minRTT":     minRTT,
+		"maxRTT":     maxRTT,
+		"stdDevRTT":  stdDev,
+
+		// Jitter metrics (ms)
+		"jitterAvg":    jitterAvg,
+		"jitterMedian": jitterMedian,
+		"jitterP95":    jitterP95,
+
+		// Network quality metrics
+		"networkEfficiency":   networkEfficiency,
+		"latencyQuality":      latencyQuality,
+		"latencyQualityScore": latencyQualityScore,
+		"jitterQualityScore":  jitterQualityScore,
+		"lossQualityScore":    lossQualityScore,
+		"networkHealthScore":  networkHealthScore,
+
+		// Timing metrics
+		"cycleDurationMs":  cycleDurationMs,
+		"packetsPerSecond": packetsPerSecond,
+
+		"timestamp": time.Now(),
 	}
+
+	// Add RFC 3550 jitter (computed for all traffic, useful for network characterization)
+	if cycle.rfc3550Jitter > 0 {
+		stats["rfc3550Jitter"] = cycle.rfc3550Jitter
+	}
+
+	// Add VoIP-specific metrics when in VoIP mode
+	if ts.Options.VoIPMode {
+		// Estimated one-way latency
+		stats["oneWayLatency"] = oneWayLatency
+
+		// Playout buffer recommendations (ms)
+		stats["playoutBufferMin"] = playoutBufferMin
+		stats["playoutBufferMax"] = playoutBufferMax
+
+		// Burst loss metrics
+		stats["maxConsecutiveLoss"] = cycle.maxConsecutiveLoss
+		stats["totalBursts"] = cycle.totalBursts
+
+		// MOS/quality metrics
+		stats["MOS"] = MOS
+		stats["RFactor"] = R
+		stats["mosQuality"] = mosQuality
+		stats["delayImp"] = Id
+		stats["lossImp"] = Ip
+
+		// Config info
+		stats["dscpValue"] = ts.Options.DSCPValue
+		stats["payloadSize"] = ts.Options.PayloadSize
+		stats["intervalMs"] = ts.Options.IntervalMs
+
+		// Estimated bandwidth in kbps (payload + protocol overhead)
+		// Total overhead: RTP(12) + UDP(8) + IP(20) = 40 bytes
+		if ts.Options.PayloadSize > 0 && ts.Options.IntervalMs > 0 {
+			packetSize := ts.Options.PayloadSize + 40
+			stats["estimatedBandwidthKbps"] = float64(packetSize) * 8.0 * 1000.0 / float64(ts.Options.IntervalMs)
+		}
+	}
+
+	return stats
 }
 
 func (ts *TrafficSim) reportStats(stats map[string]interface{}, mtrProbe *Probe) {
@@ -1454,6 +1963,15 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 		return
 	}
 
+	// Log VoIP settings being used for reverse traffic (first packet of new cycle)
+	if len(connection.ReverseCycle.PacketSeqs) == 1 && connection.ReverseTrafficOptions.VoIPMode {
+		log.Infof("[trafficsim] REVERSE: Sending reverse with VoIP settings - VoIPMode=%v DSCP=%d Interval=%dms Payload=%d",
+			connection.ReverseTrafficOptions.VoIPMode,
+			connection.ReverseTrafficOptions.DSCPValue,
+			connection.ReverseTrafficOptions.IntervalMs,
+			connection.ReverseTrafficOptions.PayloadSize)
+	}
+
 	if _, err := conn.WriteToUDP(msgBytes, addr); err != nil {
 		log.Infof("[trafficsim] Failed to send reverse DATA to agent %d: %v", connection.AgentID, err)
 	}
@@ -1526,6 +2044,8 @@ func (ts *TrafficSim) waitForReverseResponses(connection *AgentConnection) {
 					if now-pt.Sent > int64(TrafficSimTimeout.Milliseconds()) {
 						pt.TimedOut = true
 						connection.ReverseCycle.PacketTimes[seq] = pt
+						// Track burst loss
+						connection.ReverseCycle.consecutiveLoss++
 					} else {
 						allDone = false
 					}
@@ -1552,22 +2072,43 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 
 	log.Debugf("[trafficsim] REVERSE handleReverseAck START: seq=%d", seq)
 
-	// Track duplicate/out-of-order
+	// Track duplicate/out-of-order and burst loss
 	cycle.receivedSeqs[seq]++
 	receiveCount := cycle.receivedSeqs[seq]
 
 	if receiveCount > 1 {
 		cycle.duplicates++
+		// Reset consecutive loss counter when we receive a packet (even duplicate)
+		if cycle.consecutiveLoss > 0 {
+			if cycle.consecutiveLoss > cycle.maxConsecutiveLoss {
+				cycle.maxConsecutiveLoss = cycle.consecutiveLoss
+			}
+			cycle.totalBursts++
+			cycle.consecutiveLoss = 0
+		}
 	} else if cycle.lastReceivedSeq > 0 && seq < cycle.lastReceivedSeq {
 		cycle.outOfOrder++
 	}
 	cycle.lastReceivedSeq = seq
 
-	// Update packet timing
+	// Update packet timing and RFC 3550 jitter
 	if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 {
 		pt.Received = recvTime
 		cycle.PacketTimes[seq] = pt
-		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms", seq, recvTime-pt.Sent)
+
+		// RFC 3550 jitter calculation for reverse direction
+		if cycle.lastTransit > 0 {
+			interArrival := float64(recvTime - cycle.lastArrivalTime)
+			interTransit := float64(pt.Sent - cycle.lastSentTime)
+			D := math.Abs(interArrival - interTransit)
+			cycle.rfc3550Jitter = cycle.rfc3550Jitter + (D-cycle.rfc3550Jitter)/16.0
+		}
+		transit := recvTime - pt.Sent
+		cycle.lastTransit = transit
+		cycle.lastArrivalTime = recvTime
+		cycle.lastSentTime = pt.Sent
+
+		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms jitter=%.2f", seq, recvTime-pt.Sent, cycle.rfc3550Jitter)
 	} else if _, ok := cycle.PacketTimes[seq]; ok {
 		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED", seq)
 	} else {
