@@ -122,6 +122,12 @@ type TrafficSimOptions struct {
 	IntervalMs    int  // Packet interval in milliseconds
 	PacketsPerSec int  // Computed from IntervalMs
 	Bidirectional bool // Enable bidirectional mode (client also receives reverse traffic)
+
+	// Bidirectional server (server side): this probe tells server to enable reverse
+	BidirectionalServer   bool // True if this probe is for the server to enable bidirectional
+	BidirectionalReceiver bool // True if this probe is a bidirectional receiver for the server (legacy)
+	ClientProbeID         uint // The client probe ID for attribution
+	ClientAgentID         uint // The client agent ID that will connect
 }
 
 // TrafficSim handles UDP traffic simulation between agents
@@ -268,6 +274,28 @@ func NewTrafficSim(probe *Probe, dataChan chan ProbeData) *TrafficSim {
 			if bidirectional, ok := tsConfig["bidirectional"]; ok {
 				if b, ok := bidirectional.(bool); ok {
 					ts.Options.Bidirectional = b
+				}
+			}
+			// Parse bidirectional server mode (for server side)
+			if bidirServer, ok := tsConfig["bidirectional_server"]; ok {
+				if b, ok := bidirServer.(bool); ok {
+					ts.Options.BidirectionalServer = b
+				}
+			}
+			// Parse bidirectional receiver fields (for server side - legacy)
+			if bidirRecv, ok := tsConfig["bidirectional_receiver"]; ok {
+				if b, ok := bidirRecv.(bool); ok {
+					ts.Options.BidirectionalReceiver = b
+				}
+			}
+			if clientProbeID, ok := tsConfig["client_probe_id"]; ok {
+				if f, ok := clientProbeID.(float64); ok {
+					ts.Options.ClientProbeID = uint(f)
+				}
+			}
+			if clientAgentID, ok := tsConfig["client_agent_id"]; ok {
+				if f, ok := clientAgentID.(float64); ok {
+					ts.Options.ClientAgentID = uint(f)
 				}
 			}
 		}
@@ -605,8 +633,8 @@ func (ts *TrafficSim) RefreshBidirectional() {
 
 // GetClientProbeForAgent finds a TRAFFICSIM probe targeting the given agent for bidirectional testing.
 // The controller creates TRAFFICSIM probes when:
-// 1. Target agent has a server (client mode)
-// 2. Owner agent has a server (bidirectional mode - target marked with ":bidir")
+// 1. Target agent has a server (client mode) - looks for client probe
+// 2. Owner agent has a server (bidirectional mode with bidirectional_receiver marker)
 // Returns the probe if found, nil otherwise
 func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 	// First try using dynamic probe retrieval if available (preferred for freshest data)
@@ -620,14 +648,34 @@ func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 		ts.allProbesMu.RUnlock()
 	}
 
+	// Look for either:
+	// 1. Client probe (not server) targeting this agent
+	// 2. Bidirectional receiver probe (server=true) with client_agent_id matching this agent
 	for i := range probesToCheck {
 		p := &probesToCheck[i]
 
-		// Check for TRAFFICSIM client probes (not server) targeting the connected agent
-		if p.Type == ProbeType_TRAFFICSIM && !p.Server {
-			for _, t := range p.Targets {
-				if t.AgentID != nil && *t.AgentID == targetAgentID {
-					log.Infof("[trafficsim] GetClientProbeForAgent: FOUND probe %d for agent %d (Server=%v)", p.ID, targetAgentID, p.Server)
+		if p.Type == ProbeType_TRAFFICSIM {
+			opts := extractVoIPOptions(p.Metadata)
+
+			// Check for client probe targeting this agent
+			if !p.Server {
+				for _, t := range p.Targets {
+					if t.AgentID != nil && *t.AgentID == targetAgentID {
+						// Check if this probe has bidirectional enabled
+						if shouldEnableBidirectional(p) {
+							log.Infof("[trafficsim] GetClientProbeForAgent: FOUND client probe %d for agent %d (bidirectional)", p.ID, targetAgentID)
+							return p
+						}
+					}
+				}
+			}
+
+			// Check for bidirectional receiver/server probe (server) with matching client_agent_id
+			if p.Server {
+				// Check both bidirectional_server (new) and bidirectional_receiver (legacy)
+				if (opts.BidirectionalServer || opts.BidirectionalReceiver) && opts.ClientAgentID == targetAgentID {
+					log.Infof("[trafficsim] GetClientProbeForAgent: FOUND bidirectional probe %d for client agent %d (clientProbeID=%d, bidirectional_server=%v)",
+						p.ID, targetAgentID, opts.ClientProbeID, opts.BidirectionalServer)
 					return p
 				}
 			}
