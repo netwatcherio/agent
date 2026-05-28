@@ -588,6 +588,22 @@ func extractVoIPOptions(metadata json.RawMessage) TrafficSimOptions {
 			}
 		}
 	}
+	// Parse bidirectional server fields (for GetClientProbeForAgent search)
+	if bidirServer, ok := tsConfig["bidirectional_server"]; ok {
+		if b, ok := bidirServer.(bool); ok {
+			opts.BidirectionalServer = b
+		}
+	}
+	if clientProbeID, ok := tsConfig["client_probe_id"]; ok {
+		if f, ok := clientProbeID.(float64); ok {
+			opts.ClientProbeID = uint(f)
+		}
+	}
+	if clientAgentID, ok := tsConfig["client_agent_id"]; ok {
+		if f, ok := clientAgentID.(float64); ok {
+			opts.ClientAgentID = uint(f)
+		}
+	}
 
 	// Apply VoIP defaults if enabled
 	if opts.VoIPMode {
