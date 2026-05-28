@@ -1863,7 +1863,7 @@ func (ts *TrafficSim) handleServerMessage(conn *net.UDPConn, addr *net.UDPAddr, 
 	// Update or create connection tracking
 	ts.connectionsMu.Lock()
 
-	log.Infof("[trafficsim] handleServerMessage ENTRY: SrcAgent=%d Type=%s Seq=%d", msg.SrcAgent, msg.Type, msg.Data.Seq)
+	log.Debugf("[trafficsim] handleServerMessage ENTRY: SrcAgent=%d Type=%s Seq=%d", msg.SrcAgent, msg.Type, msg.Data.Seq)
 	connection, exists := ts.connections[msg.SrcAgent]
 	if !exists {
 		// Brand new connection
