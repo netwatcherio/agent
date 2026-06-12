@@ -494,7 +494,7 @@ func (ts *TrafficSim) initBidirectional(connection *AgentConnection) {
 		// 1. NEW: The bidirectional flag is set in metadata
 		// 2. LEGACY: The target has ":bidir" suffix (dual-probe approach)
 		if shouldEnableBidirectional(clientProbe) {
-			connection.ClientProbeID = clientProbe.ID
+			connection.ClientProbeID = resolveClientProbeID(clientProbe, connection.ReverseTrafficOptions)
 			connection.ReverseCycle = &CycleTracker{
 				StartSeq:     1,
 				StartTime:    time.Now(),
@@ -503,7 +503,7 @@ func (ts *TrafficSim) initBidirectional(connection *AgentConnection) {
 				receivedSeqs: make(map[int]int),
 			}
 			log.Infof("[trafficsim] Bidirectional mode ENABLED for agent %d using client probe %d (VoIP: %v, DSCP: %d, Interval: %dms, BiDir flag: %v)",
-				connection.AgentID, clientProbe.ID, connection.ReverseTrafficOptions.VoIPMode,
+				connection.AgentID, connection.ClientProbeID, connection.ReverseTrafficOptions.VoIPMode,
 				connection.ReverseTrafficOptions.DSCPValue, connection.ReverseTrafficOptions.IntervalMs,
 				connection.ReverseTrafficOptions.Bidirectional)
 		} else {
@@ -594,6 +594,12 @@ func extractVoIPOptions(metadata json.RawMessage) TrafficSimOptions {
 			opts.BidirectionalServer = b
 		}
 	}
+	// Legacy bidirectional receiver marker (dual-probe approach)
+	if bidirRecv, ok := tsConfig["bidirectional_receiver"]; ok {
+		if b, ok := bidirRecv.(bool); ok {
+			opts.BidirectionalReceiver = b
+		}
+	}
 	if clientProbeID, ok := tsConfig["client_probe_id"]; ok {
 		if f, ok := clientProbeID.(float64); ok {
 			opts.ClientProbeID = uint(f)
@@ -605,8 +611,10 @@ func extractVoIPOptions(metadata json.RawMessage) TrafficSimOptions {
 		}
 	}
 
-	// Apply VoIP defaults if enabled
-	if opts.VoIPMode {
+	// Apply VoIP defaults if enabled or inferred from interval, mirroring NewTrafficSim
+	// so reverse traffic paces the same as the client's forward traffic.
+	if opts.VoIPMode || (opts.IntervalMs > 0 && opts.IntervalMs <= 50) {
+		opts.VoIPMode = true
 		if opts.PayloadSize == 0 {
 			opts.PayloadSize = VoIPPayloadSize
 		}
@@ -638,7 +646,7 @@ func (ts *TrafficSim) RefreshBidirectional() {
 		if clientProbe != nil && shouldEnableBidirectional(clientProbe) {
 			// Extract VoIP options including bidirectional flag
 			opts := extractVoIPOptions(clientProbe.Metadata)
-			connection.ClientProbeID = clientProbe.ID
+			connection.ClientProbeID = resolveClientProbeID(clientProbe, opts)
 			connection.ReverseCycle = &CycleTracker{
 				StartSeq:     1,
 				StartTime:    time.Now(),
@@ -648,7 +656,7 @@ func (ts *TrafficSim) RefreshBidirectional() {
 			}
 			connection.ReverseTrafficOptions = opts
 			log.Infof("[trafficsim] Bidirectional mode (refresh) enabled for agent %d using client probe %d (VoIP: %v, BiDir: %v)",
-				connection.AgentID, clientProbe.ID, opts.VoIPMode, opts.Bidirectional)
+				connection.AgentID, connection.ClientProbeID, opts.VoIPMode, opts.Bidirectional)
 			refreshed++
 		}
 	}
@@ -709,6 +717,19 @@ func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 	}
 	log.Infof("[trafficsim] GetClientProbeForAgent: NO probe found for agent %d", targetAgentID)
 	return nil
+}
+
+// resolveClientProbeID returns the probe ID to use for reverse-path attribution.
+// For dynamically generated bidirectional SERVER probes the probe itself is virtual
+// (ID=0) and the client's real probe ID is carried in metadata as client_probe_id —
+// that ID must be used so reverse stats land on the same probe as the client's
+// forward stats. For real client probes (mutual-server / legacy) the probe's own ID
+// is already the correct one.
+func resolveClientProbeID(probe *Probe, opts TrafficSimOptions) uint {
+	if (opts.BidirectionalServer || opts.BidirectionalReceiver) && opts.ClientProbeID != 0 {
+		return opts.ClientProbeID
+	}
+	return probe.ID
 }
 
 // shouldEnableBidirectional checks if bidirectional mode should be enabled for a probe.

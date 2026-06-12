@@ -124,8 +124,10 @@ func makeContinuityKey(probe probes.Probe) string {
 
 func makeProbeKey(probe probes.Probe) string {
 	// For TrafficSim servers, we want to treat allowed agent changes as updates, not new probes
-	// So we'll exclude the allowed agents from the key for server probes
-	if probe.Type == probes.ProbeType_TRAFFICSIM {
+	// So we'll exclude the allowed agents from the key for server probes.
+	// CLIENT TrafficSim probes fall through to the generic key below, which includes
+	// targets — a target IP change must stop the old worker and start a new one.
+	if probe.Type == probes.ProbeType_TRAFFICSIM && probe.Server {
 		// For server probes, only include the server address/port in the key
 		// This ensures that changes to allowed agents don't create a new probe
 		normalizedConfig := struct {
@@ -786,30 +788,37 @@ func stopProbeWorker(worker *ProbeWorkerS) {
 }
 
 func updateServerAllowedAgents(probe probes.Probe) {
-	// Extract allowed agent IDs from the probe targets.
-	// Target[0] is the server address; targets at index 1+ carry AgentIDs.
-	var allowedAgents []uint
-	if len(probe.Targets) > 1 {
-		for i := 1; i < len(probe.Targets); i++ {
-			if probe.Targets[i].AgentID != nil {
-				allowedAgents = append(allowedAgents, *probe.Targets[i].AgentID)
-			}
-		}
-	}
-
 	activeTrafficSimServerMu.RLock()
 	server := activeTrafficSimServer
 	activeTrafficSimServerMu.RUnlock()
 
-	if server != nil {
+	if server == nil {
+		log.Debugf("[trafficsim] Server not running yet, allowed agents will be set on startup")
+		return
+	}
+
+	// Per-client bidirectional server probes (Target[0] carries the client AgentID)
+	// share the same worker key as the generic server probe but have no allowed-agents
+	// list — they must not wipe the list maintained by the generic server probe.
+	isPerClientBidirProbe := len(probe.Targets) > 0 && probe.Targets[0].AgentID != nil
+	if !isPerClientBidirProbe {
+		// Extract allowed agent IDs from the probe targets.
+		// Target[0] is the server address; targets at index 1+ carry AgentIDs.
+		var allowedAgents []uint
+		if len(probe.Targets) > 1 {
+			for i := 1; i < len(probe.Targets); i++ {
+				if probe.Targets[i].AgentID != nil {
+					allowedAgents = append(allowedAgents, *probe.Targets[i].AgentID)
+				}
+			}
+		}
 		server.UpdateAllowedAgents(allowedAgents)
 		log.Infof("[trafficsim] Updated allowed agents for server probe %d: %v", probe.ID, allowedAgents)
-		// Refresh bidirectional for all connections - the probe list may have updated
-		// and connections that were established before the list was populated need re-checking
-		server.RefreshBidirectional()
-	} else {
-		log.Debugf("[trafficsim] Server not running yet, allowed agents will be set on startup")
 	}
+
+	// Refresh bidirectional for all connections - the probe list may have updated
+	// and connections that were established before the list was populated need re-checking
+	server.RefreshBidirectional()
 }
 
 func containsKey(keys []string, key string) bool {
