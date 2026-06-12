@@ -206,8 +206,11 @@ type AgentConnection struct {
 	// but with SrcAgent = this server's ID to indicate reverse direction
 	ClientProbeID   uint
 	ReverseCycle    *CycleTracker
-	ReverseSequence int
-	LastReportTime  time.Time
+	// PrevReverseCycle holds the most recently completed cycle so ACKs that
+	// arrive after rotation still land in the right cycle (routed by seq).
+	PrevReverseCycle *CycleTracker
+	ReverseSequence  int
+	LastReportTime   time.Time
 
 	// ReverseTrafficOptions stores the client's VoIP settings for reverse traffic
 	ReverseTrafficOptions TrafficSimOptions
@@ -2056,23 +2059,23 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 
 	connection.PacketsSent++
 
-	// Check if cycle is complete (requires all 60 ACKs received OR timeout)
-	if len(connection.ReverseCycle.PacketSeqs) >= TrafficSimReportSeq {
-		// Count how many were actually received (for debugging)
-		receivedCount := 0
-		for _, pt := range connection.ReverseCycle.PacketTimes {
-			if pt.Received > 0 {
-				receivedCount++
-			}
-		}
-		log.Infof("[trafficsim] REVERSE CYCLE COMPLETE (sending done): sent=%d received=%d", len(connection.ReverseCycle.PacketSeqs), receivedCount)
-
-		// Wait for all ACKs before rotating cycle (fixes ~1.7% loss from premature rotation)
-		ts.waitForReverseResponses(connection)
-
-		// Rotate cycle synchronously to prevent race conditions
+	// Rotate the reverse cycle when complete. VoIP mode reports on a time basis
+	// (mirroring the client's VoIPReportIntervalSec reporting); non-VoIP rotates
+	// per TrafficSimReportSeq packets.
+	var cycleDone bool
+	if connection.ReverseTrafficOptions.VoIPMode {
+		cycleDone = time.Since(connection.ReverseCycle.StartTime) >= time.Duration(VoIPReportIntervalSec)*time.Second
+	} else {
+		cycleDone = len(connection.ReverseCycle.PacketSeqs) >= TrafficSimReportSeq
+	}
+	if cycleDone {
 		completedCycle := connection.ReverseCycle
 
+		// Rotate immediately — NEVER block here waiting for ACKs. This code runs
+		// on the server's single read-loop goroutine: blocking stalls ACK
+		// processing for BOTH directions, which shows up on the client as huge
+		// false loss and inflated RTT on the forward path.
+		connection.PrevReverseCycle = completedCycle
 		connection.ReverseCycle = &CycleTracker{
 			StartSeq:     connection.ReverseSequence + 1,
 			StartTime:    time.Now(),
@@ -2082,59 +2085,32 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 		}
 		connection.LastReportTime = time.Now()
 
-		// Report stats for the completed cycle asynchronously
-		go ts.reportCycleStats(completedCycle, connection.ClientProbeID, connection.AgentID, connection.Addr.String())
+		// Late ACKs keep landing in the completed cycle via PrevReverseCycle.
+		// Finalize (mark stragglers lost) and report once the ACK window passes.
+		probeID := connection.ClientProbeID
+		agentID := connection.AgentID
+		target := connection.Addr.String()
+		time.AfterFunc(TrafficSimTimeout+500*time.Millisecond, func() {
+			finalizeReverseCycle(completedCycle)
+			ts.reportCycleStats(completedCycle, probeID, agentID, target)
+		})
 	}
 }
 
-func (ts *TrafficSim) waitForReverseResponses(connection *AgentConnection) {
-	deadline := time.Now().Add(TrafficSimTimeout + 500*time.Millisecond)
-
-	for time.Now().Before(deadline) {
-		select {
-		case <-ts.stopChan:
-			return
-		case <-time.After(50 * time.Millisecond):
+// finalizeReverseCycle marks every packet that never received an ACK as timed
+// out. Called after the ACK grace window, off the read loop.
+func finalizeReverseCycle(cycle *CycleTracker) {
+	cycle.mu.Lock()
+	defer cycle.mu.Unlock()
+	for _, seq := range cycle.PacketSeqs {
+		if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 && !pt.TimedOut {
+			pt.TimedOut = true
+			cycle.PacketTimes[seq] = pt
+			cycle.consecutiveLoss++
 		}
-
-		allDone := true
-		now := time.Now().UnixMilli()
-
-		connection.ReverseCycle.mu.Lock()
-		receivedCount := 0
-		timedOutCount := 0
-		for _, seq := range connection.ReverseCycle.PacketSeqs {
-			if pt, ok := connection.ReverseCycle.PacketTimes[seq]; ok {
-				if pt.Received > 0 {
-					receivedCount++
-				} else if pt.TimedOut {
-					timedOutCount++
-				}
-			}
-		}
-		if receivedCount > 0 || len(connection.ReverseCycle.PacketSeqs) > 0 {
-			log.Infof("[trafficsim] SERVER waitForReverseResponses: received=%d timedOut=%d total=%d",
-				receivedCount, timedOutCount, len(connection.ReverseCycle.PacketSeqs))
-		}
-		for _, seq := range connection.ReverseCycle.PacketSeqs {
-			if pt, ok := connection.ReverseCycle.PacketTimes[seq]; ok {
-				if pt.Received == 0 && !pt.TimedOut {
-					if now-pt.Sent > int64(TrafficSimTimeout.Milliseconds()) {
-						pt.TimedOut = true
-						connection.ReverseCycle.PacketTimes[seq] = pt
-						// Track burst loss
-						connection.ReverseCycle.consecutiveLoss++
-					} else {
-						allDone = false
-					}
-				}
-			}
-		}
-		connection.ReverseCycle.mu.Unlock()
-
-		if allDone {
-			break
-		}
+	}
+	if cycle.consecutiveLoss > cycle.maxConsecutiveLoss {
+		cycle.maxConsecutiveLoss = cycle.consecutiveLoss
 	}
 }
 
@@ -2143,8 +2119,16 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	seq := data.Seq
 	recvTime := time.Now().UnixMilli()
 
-	// Capture pointer to avoid race if cycle rotates (though handleReverseAck runs in same main loop)
+	// Route by sequence: ReverseSequence is monotonic across cycles, so an ACK
+	// with seq below the current cycle's StartSeq belongs to the previous
+	// (rotated, not yet reported) cycle.
 	cycle := connection.ReverseCycle
+	if cycle == nil {
+		return
+	}
+	if prev := connection.PrevReverseCycle; prev != nil && seq < cycle.StartSeq {
+		cycle = prev
+	}
 	cycle.mu.Lock()
 	defer cycle.mu.Unlock()
 
