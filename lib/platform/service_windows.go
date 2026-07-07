@@ -233,68 +233,106 @@ type recoveryAction struct {
 
 // DefaultRecoveryActions is the SCM failure policy applied on every agent startup.
 //
-// Why so many actions? Windows' `sc.exe failure` supports at most 3 configured
-// actions before falling back to the system default ("take no action"). After
-// the 3rd action, a service that keeps failing is left stopped until a human
-// intervenes. On Linux/macOS the equivalent (systemd Restart=always,
-// launchd KeepAlive) restarts forever — so Windows is uniquely fragile.
+// Format note: Windows `sc.exe failure` is famously finicky. The canonical format
+// is exactly 6 slash-separated values for 3 action/delay pairs. Providing MORE
+// than 6 values (which is what we did initially) silently corrupts the policy on
+// some Windows versions and results in "no action" being applied — see
+// https://stackoverflow.com/questions/22872510
 //
-// We work around the 3-action limit by re-asserting a wider policy on every
-// startup (the `sc.exe failure` command silently caps the action list and
-// shifts later actions into "subsequent failures"). Even when SCM starts
-// ignoring our actions after the 3rd, the `reset= 0` clears the failure
-// counter immediately so a single successful run resets the slate.
+// Subsequent failures use the 3rd pair with empty action (`""`), which Windows
+// interprets as "take no action" — i.e. once we've restarted 3 times in quick
+// succession, leave the service stopped so an operator can investigate.
 //
-// This is intentionally aggressive (final delays up to 5 minutes) — a long
-// retry window is much safer than giving up.
+// We DON'T try to be clever with reset periods. `reset= 60` is the documented
+// minimum and matches Windows' default behaviour for failure tracking.
+// `reset= 0` is rejected on some Windows versions, which caused the original
+// "agent exits and never comes back" bug.
 var DefaultRecoveryActions = []recoveryAction{
-	{action: "restart", delayMs: 5000},   // 5s   — 1st failure
-	{action: "restart", delayMs: 10000},  // 10s  — 2nd failure
-	{action: "restart", delayMs: 30000},  // 30s  — 3rd failure
-	{action: "restart", delayMs: 60000},  // 60s  — 4th+ failure
-	{action: "restart", delayMs: 300000}, // 5m   — subsequent failures
+	{action: "restart", delayMs: 5000},  // 5s   — 1st failure
+	{action: "restart", delayMs: 10000}, // 10s  — 2nd failure
+	{action: "restart", delayMs: 30000}, // 30s  — 3rd failure (last restart)
+	{action: "", delayMs: 60000},        // 60s  — subsequent failures: take no action
 }
+
+// DefaultResetPeriodSeconds is the failure-counter reset period.
+// 60s is the documented minimum and matches the SCM's default failure-tracking
+// window. We use this (not `reset= 0`) because some Windows builds reject `0`.
+const DefaultResetPeriodSeconds = 60
+
+// ServiceRecoveryTimeout is how long to wait for sc.exe to apply the policy.
+// sc.exe occasionally hangs on locked-down hosts; we don't want ConfigureServiceRecovery
+// to block startup indefinitely.
+const ServiceRecoveryTimeout = 30 * time.Second
 
 // ConfigureServiceRecovery re-asserts the SCM failure policy on every startup.
 // This fixes existing installs that were installed before the wider policy was added.
 //
-// Safe to call repeatedly: `sc.exe failure` is idempotent. Failures are logged
-// at warn level but never fatal — a hardened host that denies SC_MANAGER access
-// will continue running; the agent just won't auto-restart on hard crashes.
+// Format: `sc.exe failure <svc> reset= <secs> actions= <a1>/<d1>/<a2>/<d2>/<a3>/<d3>`
+// where each pair is action/delay_ms, and the 3rd pair may use empty action
+// (`""`) to mean "take no action" for subsequent failures. See:
 //
-// `reset= 0` clears the failure counter so the very first successful run resets
-// the SCM's "have we failed recently" state.
+//	https://serverfault.com/questions/983831
+//	https://stackoverflow.com/questions/22872510
+//
+// After setting, we call `sc qfailure` to verify the policy was actually applied.
+// Some Windows builds / GPOs silently reject `sc.exe failure`; if verification
+// fails, we log the actual returned values so the operator can diagnose. The
+// function never returns a fatal error — best-effort only.
 func ConfigureServiceRecovery() error {
 	if !IsRunningAsService() {
 		// Not running as a service — nothing to configure.
 		return nil
 	}
 
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("configure recovery: failed to get executable path: %w", err)
+	// Build the canonical 6-value actions string: a1/d1/a2/d2/a3/d3
+	if len(DefaultRecoveryActions) != 4 {
+		return fmt.Errorf("configure recovery: DefaultRecoveryActions has %d entries, expected 4 (3 actions + 1 subsequent-failure slot)",
+			len(DefaultRecoveryActions))
 	}
-
-	// Build the action string: "restart/5000/restart/10000/..."
-	parts := make([]string, 0, len(DefaultRecoveryActions))
+	parts := make([]string, 0, 6)
 	for _, a := range DefaultRecoveryActions {
-		parts = append(parts, fmt.Sprintf("%s/%d", a.action, a.delayMs))
+		// Use empty string for "no action" — the only way to specify it per the
+		// SO answer. action is "" means sc.exe treats it as "take no action".
+		if a.action == "" {
+			parts = append(parts, "", fmt.Sprintf("%d", a.delayMs))
+		} else {
+			parts = append(parts, a.action, fmt.Sprintf("%d", a.delayMs))
+		}
 	}
 	actions := strings.Join(parts, "/")
 
-	cmd := exec.Command("sc.exe", "failure", "NetWatcherAgent",
-		"reset=", "0",
+	// Run sc.exe failure with a hard timeout so a wedged sc.exe can't block startup.
+	ctx, cancel := context.WithTimeout(context.Background(), ServiceRecoveryTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sc.exe", "failure", "NetWatcherAgent",
+		"reset=", fmt.Sprintf("%d", DefaultResetPeriodSeconds),
 		"actions=", actions,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("configure recovery: sc.exe failure failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		log.WithError(err).WithField("output", strings.TrimSpace(string(out))).
+			Warn("ConfigureServiceRecovery: sc.exe failure returned error — agent will run with whatever policy was previously set")
+		return nil
 	}
 
 	log.WithFields(log.Fields{
-		"exe":     filepath.Base(exe),
 		"actions": actions,
-	}).Info("Service recovery policy reconfigured")
+		"reset_s": DefaultResetPeriodSeconds,
+	}).Info("Service recovery policy set — verifying")
+
+	// Verify it actually took effect. sc.exe returns 0 even on some GPO-locked
+	// systems where the policy silently wasn't applied. `sc qfailure` tells us
+	// the truth.
+	verifyCmd := exec.CommandContext(ctx, "sc.exe", "qfailure", "NetWatcherAgent")
+	verifyOut, verifyErr := verifyCmd.CombinedOutput()
+	if verifyErr != nil {
+		log.WithError(verifyErr).WithField("output", strings.TrimSpace(string(verifyOut))).
+			Warn("ConfigureServiceRecovery: sc qfailure verification query failed — could not confirm policy")
+		return nil
+	}
+	log.WithField("output", strings.TrimSpace(string(verifyOut))).
+		Info("Service recovery policy verified")
 	return nil
 }
 

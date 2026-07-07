@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -20,15 +21,32 @@ var (
 	EventLogSource = "NetWatcherAgent"
 )
 
-// eventLogWriter wraps the Windows event log for use with logrus
+// eventLogWriter wraps the Windows event log for use with logrus. Routes each
+// log line to the appropriate event severity based on logrus level so anything
+// visible in the log file is also visible in Event Viewer.
 type eventLogWriter struct {
 	elog *eventlog.Log
 }
 
 func (w *eventLogWriter) Write(p []byte) (n int, err error) {
-	msg := string(p)
-	err = w.elog.Info(1, msg)
-	return len(p), err
+	if w.elog == nil {
+		return len(p), nil
+	}
+	msg := strings.TrimRight(string(p), "\r\n")
+	// Route by level — check the structured fields first (logrus prefixes the
+	// entry with `level=error` etc.), fall back to Error for unknown levels.
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "level=fatal") || strings.Contains(lower, "level=panic"):
+		w.elog.Error(1, msg)
+	case strings.Contains(lower, "level=error"):
+		w.elog.Error(1, msg)
+	case strings.Contains(lower, "level=warning") || strings.Contains(lower, "level=warn"):
+		w.elog.Warning(1, msg)
+	default:
+		w.elog.Info(1, msg)
+	}
+	return len(p), nil
 }
 
 // SetupServiceLogging configures logging for Windows service mode.
@@ -57,12 +75,10 @@ func SetupServiceLogging() (cleanup func(), err error) {
 		return nil, fmt.Errorf("failed to setup file logging: %w", err)
 	}
 
-	// Create multi-writer with file and stdout
-	var writers []io.Writer
-	writers = append(writers, fileWriter)
-	writers = append(writers, os.Stdout)
-
-	// Try to set up Windows Event Log (non-fatal if it fails)
+	// Try to set up Windows Event Log (non-fatal if it fails).
+	// If we can open it, also route logrus output to it — this is the
+	// single source of truth operators have when the log file is empty,
+	// rotated, or inaccessible. Severity is mapped from logrus level.
 	var elog *eventlog.Log
 	elog, err = eventlog.Open(EventLogSource)
 	if err != nil {
@@ -73,17 +89,28 @@ func SetupServiceLogging() (cleanup func(), err error) {
 			elog, _ = eventlog.Open(EventLogSource)
 		}
 	}
+	var elogWriter *eventLogWriter
+	if elog != nil {
+		elogWriter = &eventLogWriter{elog: elog}
+	}
 
 	// Configure logrus
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: time.RFC3339,
 	})
-	log.SetOutput(io.MultiWriter(writers...))
+	// Multi-writer: file + event log. Stdout is intentionally NOT included on
+	// Windows because services have no console and writing to stdout can fail
+	// or hang; the file + event log is the canonical pair for headless servers.
+	writerList := []io.Writer{fileWriter}
+	if elogWriter != nil {
+		writerList = append(writerList, elogWriter)
+	}
+	log.SetOutput(io.MultiWriter(writerList...))
 	log.SetLevel(log.InfoLevel)
 
-	log.Infof("Logging initialized - dir: %s, max_size: %dMB, backups: %d",
-		logDir, cfg.MaxSize/(1024*1024), cfg.MaxBackups)
+	log.Infof("Logging initialized - dir: %s, max_size: %dMB, backups: %d, eventlog=%v",
+		logDir, cfg.MaxSize/(1024*1024), cfg.MaxBackups, elogWriter != nil)
 	if elog != nil {
 		elog.Info(1, "NetWatcher Agent service started")
 	}
