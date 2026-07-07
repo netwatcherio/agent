@@ -60,3 +60,12 @@ func SetupServiceLogging() (cleanup func(), err error) {
 func LogEvent(eventType uint32, message string) {
 	// No-op: Use standard logging on non-Windows
 }
+
+// SetupEventLogSource is a no-op on non-Windows platforms.
+// Windows-only because the Event Log API doesn't exist on Unix. Returns
+// true on Unix since "the source is installed" is meaningless but harmless.
+func SetupEventLogSource() bool { return true }
+
+// SetVersionString is a no-op on non-Windows platforms.
+// Just for symmetry with the Windows version — Unix has no event log.
+func SetVersionString(v string) {}

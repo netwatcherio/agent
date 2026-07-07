@@ -125,6 +125,54 @@ func SetupServiceLogging() (cleanup func(), err error) {
 	return cleanup, nil
 }
 
+// SetupEventLogSource ensures the NetWatcherAgent Event Log source is
+// registered and writes an immediate "service starting" event. Safe to call
+// BEFORE logrus is configured — this is the only logging path guaranteed to
+// work even if logrus setup fails or the agent panics during init.
+//
+// Tries to open the existing source first; if that fails, attempts to
+// install it (requires admin — LocalSystem has this). On success, an
+// immediate "service starting" event is written so operators can see in
+// Event Viewer that the new binary reached main() at all.
+//
+// Returns true if the source is installed and the heartbeat was written.
+// Subsequent LogEvent calls will reopen the source on demand.
+func SetupEventLogSource() bool {
+	elog, err := eventlog.Open(EventLogSource)
+	if err != nil {
+		if installErr := eventlog.InstallAsEventCreate(EventLogSource, eventlog.Error|eventlog.Warning|eventlog.Info); installErr != nil {
+			fmt.Fprintf(os.Stderr, "SetupEventLogSource: InstallAsEventCreate failed: %v (open err: %v)\n", installErr, err)
+			return false
+		}
+		elog, err = eventlog.Open(EventLogSource)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "SetupEventLogSource: re-open after install failed: %v\n", err)
+			return false
+		}
+	}
+	// Write a heartbeat event so operators can confirm the new binary is
+	// reaching main() at all. If they see THIS in Event Viewer, the binary
+	// launched successfully even if subsequent setup fails.
+	_ = elog.Info(1, fmt.Sprintf("NetWatcher Agent service starting (pid=%d, version=%s)", os.Getpid(), versionString))
+	_ = elog.Close()
+	return true
+}
+
+// versionString is set via SetVersionString from main() so the heartbeat
+// event reflects the actual build version. Default is "unknown" if main()
+// never sets it (defensive — keeps logging_windows.go from depending on the
+// main package).
+var versionString = "unknown"
+
+// SetVersionString allows main() to inject the build-time VERSION before
+// any event-log writes happen.
+func SetVersionString(v string) {
+	if v != "" {
+		versionString = v
+	}
+}
+
+// LogEvent writes a message to the Windows Event Log.
 // LogEvent writes a message to the Windows Event Log.
 func LogEvent(eventType uint32, message string) {
 	elog, err := eventlog.Open(EventLogSource)

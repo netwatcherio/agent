@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 
 	"github.com/netwatcherio/netwatcher-agent/lib/platform"
@@ -80,6 +81,30 @@ func main() {
 
 	fmt.Printf("Starting NetWatcher Agent - Version: %s...\n", VERSION)
 
+	// ---------- Windows Event Log heartbeat ----------
+	// Install the Event Log source FIRST and write a "service starting" event.
+	// This is the one log path guaranteed to be visible in Event Viewer even
+	// if logrus/file-logging setup fails or the agent panics before
+	// SetupServiceLogging completes. If operators see this event, they know
+	// the new binary reached main() at all — critical for diagnosing
+	// "service exits with Incorrect Function but no logs anywhere".
+	platform.SetVersionString(VERSION)
+	platform.SetupEventLogSource()
+
+	// ---------- Panic guard ----------
+	// Catch any panic during init and write it to the Event Log before
+	// exiting. Without this, a panic during startup looks identical to the
+	// service crashing — operators see "Incorrect Function" but no detail.
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			msg := fmt.Sprintf("PANIC during agent startup: %v\n\nStack:\n%s", r, stack)
+			fmt.Fprintln(os.Stderr, msg)
+			platform.LogEvent(1 /*eventlog.Error*/, msg)
+			os.Exit(2)
+		}
+	}()
+
 	// ---------- CLI flags ----------
 	flag.StringVar(&configPath, "config", "./config.conf", "Path to the config file")
 	flag.BoolVar(&disableUpdater, "no-update", false, "Disable auto-updater")
@@ -92,6 +117,9 @@ func main() {
 	cleanup, err := platform.SetupServiceLogging()
 	if err != nil {
 		fmt.Printf("Warning: Failed to setup file logging: %v\n", err)
+		// Mirror to Event Log — this is a "service can't log" failure that
+		// would otherwise be invisible.
+		platform.LogEvent(1, fmt.Sprintf("Failed to setup file logging: %v", err))
 	} else {
 		defer cleanup()
 	}
@@ -100,6 +128,9 @@ func main() {
 	if platform.IsRunningAsService() {
 		log.Info("Running as Windows service")
 		if err := platform.RunService("NetWatcherAgent", runAgent); err != nil {
+			// Service failed to start — write to Event Log so the operator
+			// sees the actual cause, not just "Incorrect Function".
+			platform.LogEvent(1, fmt.Sprintf("Service error: %v", err))
 			log.Fatalf("Service error: %v", err)
 		}
 		return
@@ -119,6 +150,8 @@ func main() {
 	}()
 
 	if err := runAgent(ctx); err != nil {
+		// Console mode: log normally. (Service-mode errors go through the
+		// windowsService.Execute path above.)
 		log.Fatalf("Agent error: %v", err)
 	}
 }
