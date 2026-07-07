@@ -32,6 +32,28 @@ var (
 	disableUpdater bool
 )
 
+// watchdogTimeout reads WATCHDOG_TIMEOUT_MINUTES (default 10). Used by the
+// no-activity watchdog so deployments can tune how aggressively we restart
+// hung agents without recompiling.
+func watchdogTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("WATCHDOG_TIMEOUT_MINUTES"))
+	if raw == "" {
+		return 10 * time.Minute
+	}
+	minutes, err := strconv.Atoi(raw)
+	if err != nil || minutes <= 0 {
+		log.Warnf("Invalid WATCHDOG_TIMEOUT_MINUTES=%q, using default 10", raw)
+		return 10 * time.Minute
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// maxServerErrorSuppression caps how long the watchdog will stay suppressed by
+// server-error mode. Acts as a safety net in case the flag ever gets stuck
+// set due to a future bug — we'd rather restart eventually than stay silent
+// forever. 4 hours matches typical backend recovery timeouts.
+const maxServerErrorSuppression = 4 * time.Hour
+
 // Env helpers
 func getenv(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -114,6 +136,17 @@ func runAgent(ctx context.Context) error {
 	}
 
 	loadConfig(configPath)
+
+	// ---------- Windows Service Recovery ----------
+	// Re-assert the SCM failure policy on every startup. Fixes existing installs
+	// that were installed with the narrower (3-action) policy that left the
+	// service stopped after a few crashes. Idempotent and safe — see
+	// platform.ConfigureServiceRecovery for details.
+	if err := platform.ConfigureServiceRecovery(); err != nil {
+		// Non-fatal: a hardened host that denies SC_MANAGER access just falls
+		// back to default SCM behavior. Log and continue.
+		log.Warnf("Could not reconfigure service recovery policy: %v", err)
+	}
 
 	// ---------- Updater ----------
 	if !disableUpdater {
@@ -254,6 +287,11 @@ func runAgent(ctx context.Context) error {
 		updateActivity()
 	}
 
+	// Pong receipts prove the backend is alive even during quiet periods.
+	// Without this, the watchdog restarts agents that have a healthy but idle
+	// connection (no probe_get/speedtest traffic flowing right now).
+	wsClient.OnActivity = updateActivity
+
 	// If your workers expect a uint agent ID now:
 	workers.SetControllerConfig(cfg.ControllerHost, cfg.SSL, cfg.WorkspaceID, cfg.AgentID, psk)
 
@@ -274,8 +312,18 @@ func runAgent(ctx context.Context) error {
 
 	go wsClient.ConnectWithRetry(agentCtx)
 
-	// Watchdog: restart if no activity for 10 minutes
-	const watchdogTimeout = 10 * time.Minute
+	// Watchdog: restart if no activity for the configured timeout (default 10 min).
+	//
+	// Skipped while we're in server-error retry mode — a backend outage is not
+	// a stuck agent. Restarting just burns Windows SCM restart-throttle budget
+	// for nothing. The retry loop's own alive-but-retrying log line makes it
+	// obvious from the host that the process is alive.
+	//
+	// Safety net: if server-error mode has been on for more than
+	// maxServerErrorSuppression, the watchdog fires anyway. Covers any future
+	// bug that could leave the flag stuck set.
+	wdt := watchdogTimeout()
+	log.Infof("Watchdog: configured timeout = %v", wdt)
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
@@ -288,10 +336,32 @@ func runAgent(ctx context.Context) error {
 				elapsed := time.Since(lastSuccessfulActivity)
 				activityMu.Unlock()
 
-				log.Debugf("Watchdog: last activity %v ago", elapsed.Round(time.Second))
+				srvActive, srvSince := wsClient.IsInServerErrorMode()
 
-				if elapsed > watchdogTimeout {
+				// Skip the watchdog while we're deliberately retrying 5xx,
+				// unless we've been in this state longer than the sanity cap.
+				if srvActive {
+					stuckFor := time.Since(srvSince)
+					if stuckFor < maxServerErrorSuppression {
+						log.Debugf("Watchdog: suppressed (server-error mode, %v since last success, %v in srv-err mode)",
+							elapsed.Round(time.Second), stuckFor.Round(time.Second))
+						continue
+					}
+					log.Warnf("Watchdog: server-error mode held for %v — exceeding sanity cap of %v, forcing restart",
+						stuckFor.Round(time.Second), maxServerErrorSuppression)
+				} else {
+					log.Debugf("Watchdog: last activity %v ago", elapsed.Round(time.Second))
+				}
+
+				if elapsed > wdt {
 					log.Errorf("Watchdog: no successful activity for %v, forcing restart", elapsed.Round(time.Second))
+					// Leave a breadcrumb for whoever finds the host next — the
+					// log file may have rotated, but this file is overwritten
+					// only on exits, so it always shows the most recent reason.
+					platform.WriteLastExitInfo(
+						fmt.Sprintf("watchdog: no activity for %v", elapsed.Round(time.Second)),
+						wsClient.GetLastDialError(),
+					)
 					platform.WatchdogRestart()
 				}
 			}

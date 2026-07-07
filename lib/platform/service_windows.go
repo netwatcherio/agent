@@ -224,6 +224,97 @@ func WatchdogRestart() {
 	os.Exit(1)
 }
 
+// recoveryAction describes a single failure recovery action for the Windows SCM.
+// delayMs is the wait before the action (in milliseconds); action is "restart" / "reboot" / "run".
+type recoveryAction struct {
+	action  string
+	delayMs int
+}
+
+// DefaultRecoveryActions is the SCM failure policy applied on every agent startup.
+//
+// Why so many actions? Windows' `sc.exe failure` supports at most 3 configured
+// actions before falling back to the system default ("take no action"). After
+// the 3rd action, a service that keeps failing is left stopped until a human
+// intervenes. On Linux/macOS the equivalent (systemd Restart=always,
+// launchd KeepAlive) restarts forever — so Windows is uniquely fragile.
+//
+// We work around the 3-action limit by re-asserting a wider policy on every
+// startup (the `sc.exe failure` command silently caps the action list and
+// shifts later actions into "subsequent failures"). Even when SCM starts
+// ignoring our actions after the 3rd, the `reset= 0` clears the failure
+// counter immediately so a single successful run resets the slate.
+//
+// This is intentionally aggressive (final delays up to 5 minutes) — a long
+// retry window is much safer than giving up.
+var DefaultRecoveryActions = []recoveryAction{
+	{action: "restart", delayMs: 5000},   // 5s   — 1st failure
+	{action: "restart", delayMs: 10000},  // 10s  — 2nd failure
+	{action: "restart", delayMs: 30000},  // 30s  — 3rd failure
+	{action: "restart", delayMs: 60000},  // 60s  — 4th+ failure
+	{action: "restart", delayMs: 300000}, // 5m   — subsequent failures
+}
+
+// ConfigureServiceRecovery re-asserts the SCM failure policy on every startup.
+// This fixes existing installs that were installed before the wider policy was added.
+//
+// Safe to call repeatedly: `sc.exe failure` is idempotent. Failures are logged
+// at warn level but never fatal — a hardened host that denies SC_MANAGER access
+// will continue running; the agent just won't auto-restart on hard crashes.
+//
+// `reset= 0` clears the failure counter so the very first successful run resets
+// the SCM's "have we failed recently" state.
+func ConfigureServiceRecovery() error {
+	if !IsRunningAsService() {
+		// Not running as a service — nothing to configure.
+		return nil
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("configure recovery: failed to get executable path: %w", err)
+	}
+
+	// Build the action string: "restart/5000/restart/10000/..."
+	parts := make([]string, 0, len(DefaultRecoveryActions))
+	for _, a := range DefaultRecoveryActions {
+		parts = append(parts, fmt.Sprintf("%s/%d", a.action, a.delayMs))
+	}
+	actions := strings.Join(parts, "/")
+
+	cmd := exec.Command("sc.exe", "failure", "NetWatcherAgent",
+		"reset=", "0",
+		"actions=", actions,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("configure recovery: sc.exe failure failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+
+	log.WithFields(log.Fields{
+		"exe":     filepath.Base(exe),
+		"actions": actions,
+	}).Info("Service recovery policy reconfigured")
+	return nil
+}
+
+// WriteLastExitInfo persists diagnostic info about why the agent is exiting.
+// Used by both graceful exits and the watchdog so post-mortem analysis doesn't
+// require catching the live log. Always overwrites — only the most recent exit
+// reason matters for diagnosing a stuck host.
+func WriteLastExitInfo(reason, lastError string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(filepath.Dir(exe), "last_exit.json")
+	payload := fmt.Sprintf(`{"reason":%q,"last_error":%q,"timestamp":%q}`+"\n",
+		reason, lastError, time.Now().Format(time.RFC3339))
+	if err := os.WriteFile(path, []byte(payload), 0644); err != nil {
+		log.WithError(err).Warn("Failed to write last_exit.json")
+	}
+}
+
 // spawnRestartProcess creates a detached process that will restart the service
 // after the current process exits. This ensures the SCM sees a clean shutdown
 // before the service is restarted.

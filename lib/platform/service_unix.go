@@ -39,3 +39,15 @@ func WatchdogRestart() {
 	// On Unix, we just exit with code 1 and let the init system restart us
 	os.Exit(1)
 }
+
+// ConfigureServiceRecovery is a no-op on Unix.
+// Linux uses systemd Restart=always (unbounded retries) and macOS uses launchd
+// KeepAlive. Neither has the 3-action cap that Windows SCM has, so there's
+// nothing to reconfigure.
+func ConfigureServiceRecovery() error {
+	return nil
+}
+
+// WriteLastExitInfo is a no-op on Unix — Unix init systems have their own
+// journal/console capture; the agent's rotating log file is enough for diagnosis.
+func WriteLastExitInfo(reason, lastError string) {}

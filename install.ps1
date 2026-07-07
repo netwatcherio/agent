@@ -631,8 +631,11 @@ AGENT_PIN=$Pin
         exit 1
     }
 
-    # Configure service recovery options (restart on failure)
-    sc.exe failure $Script:ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+    # Configure service recovery options (restart on failure).
+    # Windows' `sc.exe failure` only honors the first 3 actions before falling
+    # back to "no action". The agent re-asserts this on every startup via
+    # platform.ConfigureServiceRecovery, so this is just the initial baseline.
+    sc.exe failure $Script:ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000/restart/60000/restart/300000 | Out-Null
 
     # Configure Windows Firewall rules
     Configure-Firewall -AgentPath $binaryPath

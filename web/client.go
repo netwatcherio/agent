@@ -281,18 +281,49 @@ type WSClient struct {
 	// Callback called on successful (re)connection - use for retry queue flushing
 	OnReconnect func()
 
+	// Callback called whenever we observe liveness from the backend (pong receipt,
+	// successful round-trip). The watchdog uses this to know the connection is
+	// healthy even when no business messages are flowing.
+	OnActivity func()
+
 	// Connection state management (protected by mu)
-	mu              sync.Mutex
-	currentClient   *neffos.Client     // Current active client for cleanup
-	isConnecting    bool               // Prevents overlapping reconnection attempts
-	isReconnecting  bool               // True when we're intentionally reconnecting (prevents OnDisconnect loops)
-	isStable        bool               // True when connection is fully established and usable
-	deactivated     bool               // True when agent has been deactivated — prevents all reconnection attempts
-	heartbeatCancel context.CancelFunc // Cancels the heartbeat goroutine
+	mu               sync.Mutex
+	currentClient    *neffos.Client     // Current active client for cleanup
+	isConnecting     bool               // Prevents overlapping reconnection attempts
+	isReconnecting   bool               // True when we're intentionally reconnecting (prevents OnDisconnect loops)
+	isStable         bool               // True when connection is fully established and usable
+	deactivated      bool               // True when agent has been deactivated — prevents all reconnection attempts
+	heartbeatCancel  context.CancelFunc // Cancels the heartbeat goroutine
+	serverErrorMode  bool               // True while we're retrying transient backend errors (5xx) — tells the watchdog not to restart us
+	serverErrorSince time.Time          // When serverErrorMode flipped to true (used for sanity-timeout)
+
+	// Last dial error (best-effort, for diagnostics + last_exit.json)
+	lastDialError string
 
 	// Failure tracking for auto-reconnect
 	probeGetFailures    int
 	maxProbeGetFailures int // Max consecutive failures before reconnect (default 5)
+}
+
+// IsInServerErrorMode returns true when the agent is currently retrying transient
+// backend errors (5xx, network blips). The watchdog uses this to avoid
+// restarting the agent during a backend outage — restarts just accelerate the
+// Windows SCM failure throttle without giving us anything.
+//
+// `since` is the time the flag flipped to true (zero value if not in this mode).
+// Used by the watchdog to enforce a sanity timeout: even if the flag gets
+// stuck for any reason, a restart will eventually fire.
+func (c *WSClient) IsInServerErrorMode() (active bool, since time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.serverErrorMode, c.serverErrorSince
+}
+
+// GetLastDialError returns the most recent dial error string (empty if none).
+func (c *WSClient) GetLastDialError() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastDialError
 }
 
 // IsConnected returns true if the WebSocket connection is fully established and stable.
@@ -403,7 +434,16 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			},
 
 			neffos.OnNamespaceDisconnect: func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Infof("WS: disconnected from namespace [%s]", msg.Namespace)
+				// Capture whatever the close reason looks like for post-mortem.
+				// neffos embeds the close info in msg.Body for both normal and
+				// abnormal closures; we log it unconditionally so stuck agents
+				// leave a trail of WHY they disconnected.
+				reason := strings.TrimSpace(string(msg.Body))
+				if reason != "" {
+					log.Infof("WS: disconnected from namespace [%s] — reason: %s", msg.Namespace, reason)
+				} else {
+					log.Infof("WS: disconnected from namespace [%s]", msg.Namespace)
+				}
 
 				// Mark connection as not stable immediately
 				c.mu.Lock()
@@ -543,6 +583,12 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			// Pong handler - received from controller in response to heartbeat ping
 			"pong": func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Debug("WS: heartbeat pong received")
+				// A pong receipt is the strongest "backend is alive" signal we have.
+				// Fire OnActivity so the watchdog doesn't restart us just because no
+				// business messages happen to be flowing right now.
+				if c.OnActivity != nil {
+					c.OnActivity()
+				}
 				return nil
 			},
 
@@ -598,18 +644,31 @@ func isDialError410(err error) bool {
 
 // isDialErrorAuthRejected checks if a WebSocket dial error indicates authentication was rejected.
 // This happens when the PSK was invalidated (e.g., agent regenerated or credentials rotated).
+//
+// Conservative by design: we only treat it as an auth rejection when the server
+// explicitly says so. Ambiguous errors fall through to the "keep retrying" path
+// — better to retry forever than to deactivate a healthy agent because the
+// error message happened to contain the word "unauthorized" somewhere.
+//
+// The previous version substring-matched "unauthorized" generically, which
+// misclassified transient 5xx errors whose wrapped messages happened to leak
+// that word (e.g. an HTTP server echoing back a stale "Unauthorized" header).
 func isDialErrorAuthRejected(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := strings.ToLower(err.Error())
-	// Only match genuine auth rejection — NOT server errors
+	// Never count a known server-side problem as auth rejection.
 	if isDialErrorServerError(err) {
 		return false
 	}
-	return strings.Contains(errStr, "unauthorized") ||
-		strings.Contains(errStr, "invalid psk") ||
-		strings.Contains(errStr, "401")
+	errStr := strings.ToLower(err.Error())
+
+	// Exact-match signatures the controller emits from ws.go OnConnect.
+	// Anything else is too ambiguous to deactivate on.
+	return strings.Contains(errStr, "invalid psk") ||
+		strings.Contains(errStr, "401 unauthorized") ||
+		strings.HasSuffix(errStr, "401") ||
+		strings.HasPrefix(errStr, "401 ")
 }
 
 // isDialErrorServerError checks if a WebSocket dial error indicates a transient server-side problem.
@@ -626,6 +685,26 @@ func isDialErrorServerError(err error) bool {
 		strings.Contains(errStr, "504") ||
 		strings.Contains(errStr, "server_error") ||
 		strings.Contains(errStr, "service unavailable")
+}
+
+// setServerErrorMode flips the watchdog-suppression flag.
+// Exported via IsInServerErrorMode for the watchdog in main.go.
+func (c *WSClient) setServerErrorMode(v bool) {
+	c.mu.Lock()
+	was := c.serverErrorMode
+	if v && !was {
+		c.serverErrorSince = time.Now()
+	} else if !v {
+		c.serverErrorSince = time.Time{}
+	}
+	c.serverErrorMode = v
+	c.mu.Unlock()
+
+	if v && !was {
+		log.Info("WS: entering server-error retry mode — watchdog will skip restart checks")
+	} else if !v && was {
+		log.Info("WS: exiting server-error retry mode — backend responding normally")
+	}
 }
 
 func (c *WSClient) ConnectWithRetry(parent context.Context) {
@@ -677,6 +756,12 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 	consecutiveAuthFailures := 0
 	const maxAuthFailuresBeforeDeactivate = 10 // Increased from 3 — more runway for transient issues
 
+	// Periodic "alive but retrying" heartbeat — makes it obvious in the log
+	// (and to operators ssh'ing into a stuck host) that the agent process is
+	// alive and intentionally retrying, rather than crashed.
+	aliveTicker := time.NewTicker(60 * time.Second)
+	defer aliveTicker.Stop()
+
 	for {
 		// Check deactivation flag before each attempt
 		c.mu.Lock()
@@ -691,6 +776,18 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		case <-parent.Done():
 			log.Info("WS: ConnectWithRetry exiting - parent context cancelled")
 			return
+		case <-aliveTicker.C:
+			// Periodic liveness signal — log + echo the most recent error so
+			// post-mortem on a stuck host shows the agent was alive and trying.
+			c.mu.Lock()
+			lastErr := c.lastDialError
+			srvErr := c.serverErrorMode
+			c.mu.Unlock()
+			if lastErr != "" {
+				log.Infof("WS: alive and retrying (server_error_mode=%v, last_error=%q)", srvErr, lastErr)
+			} else {
+				log.Debugf("WS: alive and retrying (server_error_mode=%v)", srvErr)
+			}
 		default:
 		}
 
@@ -701,6 +798,11 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		client, err := c.dialOnce(ctx)
 		cancel()
 		if err != nil {
+			// Capture last error for diagnostics
+			c.mu.Lock()
+			c.lastDialError = err.Error()
+			c.mu.Unlock()
+
 			// Check for 410 Gone — agent was deleted from the controller
 			if isDialError410(err) {
 				log.Warnf("WS: Controller returned 410 Gone — agent has been deleted")
@@ -709,11 +811,13 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 			}
 
 			// Check for server errors (503, 500, etc.) — backend is having issues
-			// but our credentials are NOT necessarily invalid. Retry with backoff.
+			// but our credentials are NOT necessarily invalid. Retry with backoff
+			// AND signal the watchdog to leave us alone.
 			if isDialErrorServerError(err) {
 				log.Warnf("WS: Server error (backend may be unavailable): %v (retry in %s)", err, delay)
 				// Do NOT count toward auth failures — this is a transient server issue
 				consecutiveAuthFailures = 0
+				c.setServerErrorMode(true)
 				time.Sleep(delay)
 				if delay < maxDelay {
 					delay *= 2
@@ -790,12 +894,13 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 				return
 			}
 
+			// Dial succeeded (TCP+TLS+HTTP handshake all worked) — that's real
+			// progress even if the namespace join failed. Reset backoff so we
+			// retry quickly instead of waiting 2s, 4s, 8s...
 			log.Errorf("WS join namespace error: %v (retry in %s)", err, delay)
 			client.Close()
 			time.Sleep(delay)
-			if delay < maxDelay {
-				delay *= 2
-			}
+			delay = 1 * time.Second
 			continue
 		}
 
@@ -804,12 +909,17 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 		c.WsConn = ns
 		c.currentClient = client
 		c.isConnecting = false  // Mark as connected, not connecting
+		c.lastDialError = ""    // Clear stale error on successful dial
 		delay = 1 * time.Second // reset backoff
 
 		// Start heartbeat goroutine
 		heartbeatCtx, heartbeatCancelFunc := context.WithCancel(context.Background())
 		c.heartbeatCancel = heartbeatCancelFunc
 		c.mu.Unlock()
+
+		// We've successfully reached the backend — clear any "server-error mode"
+		// flag so the watchdog resumes normal restart-on-no-activity behavior.
+		c.setServerErrorMode(false)
 
 		go c.startHeartbeat(heartbeatCtx, ns)
 
