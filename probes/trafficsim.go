@@ -75,10 +75,35 @@ type TrafficSimData struct {
 // -------------------- Packet Tracking --------------------
 
 type PacketTime struct {
-	Sent     int64
-	Received int64
+	Sent     int64 // wall-clock send time in Unix ms; goes on the wire and is echoed back
+	Received int64 // wall-clock receive time in Unix ms; 0 = not received
 	TimedOut bool
 	Size     int
+
+	sentAt time.Time // monotonic send time (local only)
+	rttMs  float64   // measured round trip in fractional ms (monotonic clock)
+}
+
+// newPacketTime records a send at now.
+func newPacketTime(now time.Time) PacketTime {
+	return PacketTime{Sent: now.UnixMilli(), sentAt: now}
+}
+
+// RTT returns the round trip in milliseconds. It prefers the monotonic
+// measurement and falls back to the wall-clock ms fields.
+func (pt PacketTime) RTT() float64 {
+	if pt.rttMs > 0 || !pt.sentAt.IsZero() {
+		return pt.rttMs
+	}
+	return float64(pt.Received - pt.Sent)
+}
+
+// age returns how long ago the packet was sent.
+func (pt PacketTime) age(now time.Time) time.Duration {
+	if !pt.sentAt.IsZero() {
+		return now.Sub(pt.sentAt)
+	}
+	return time.Duration(now.UnixMilli()-pt.Sent) * time.Millisecond
 }
 
 // CycleTracker tracks packets for a reporting cycle
@@ -99,11 +124,75 @@ type CycleTracker struct {
 	maxConsecutiveLoss int // Maximum burst loss encountered
 	totalBursts        int // Number of distinct burst loss events
 
-	// RFC 3550 jitter calculation
-	lastTransit     int64   // Last transit time (R - S) for RFC 3550 jitter
-	lastArrivalTime int64   // Last packet arrival time (R)
-	lastSentTime    int64   // Last packet sent time (S)
-	rfc3550Jitter   float64 // Smoothed jitter in microseconds
+	// RFC 3550 jitter calculation (monotonic clock)
+	haveLastAck   bool
+	lastArrivalAt time.Time // Last packet arrival time (R)
+	lastSentAt    time.Time // Last packet sent time (S)
+	rfc3550Jitter float64   // Smoothed jitter in milliseconds
+
+	// staleAcks counts ACKs whose echoed send time doesn't match the packet we
+	// sent with that seq — i.e. late ACKs from an earlier cycle that reused
+	// the sequence number. They are ignored rather than counted as received.
+	staleAcks int
+	// localSendErrors counts packets that never left this host (socket
+	// write failed). They are still counted as lost.
+	localSendErrors int
+}
+
+// recordAck applies an ACK for seq to the cycle. echoedSent is the peer's
+// echo of our send timestamp (Unix ms, 0 if unknown). Caller must hold c.mu.
+// Returns the RTT in ms and whether the ACK was applied to a pending packet.
+func (c *CycleTracker) recordAck(seq int, echoedSent int64, now time.Time) (float64, bool) {
+	pt, ok := c.PacketTimes[seq]
+	if ok && echoedSent != 0 && echoedSent != pt.Sent {
+		c.staleAcks++
+		return 0, false
+	}
+
+	c.receivedSeqs[seq]++
+	if c.receivedSeqs[seq] > 1 {
+		c.duplicates++
+	} else {
+		if c.lastReceivedSeq > 0 && seq < c.lastReceivedSeq {
+			c.outOfOrder++
+		}
+		c.lastReceivedSeq = seq
+	}
+	// Any receipt ends a loss burst.
+	if c.consecutiveLoss > 0 {
+		if c.consecutiveLoss > c.maxConsecutiveLoss {
+			c.maxConsecutiveLoss = c.consecutiveLoss
+		}
+		c.totalBursts++
+		c.consecutiveLoss = 0
+	}
+
+	if !ok || pt.Received != 0 {
+		return 0, false
+	}
+
+	pt.Received = now.UnixMilli()
+	if !pt.sentAt.IsZero() {
+		pt.rttMs = float64(now.Sub(pt.sentAt).Microseconds()) / 1000.0
+	} else {
+		pt.rttMs = float64(pt.Received - pt.Sent)
+	}
+	c.PacketTimes[seq] = pt
+
+	// RFC 3550: J += (|D(i-1,i)| - J) / 16, where D is the difference between
+	// inter-arrival and inter-send spacing.
+	if !pt.sentAt.IsZero() {
+		if c.haveLastAck {
+			interArrival := now.Sub(c.lastArrivalAt)
+			interTransit := pt.sentAt.Sub(c.lastSentAt)
+			D := math.Abs(float64((interArrival - interTransit).Microseconds()) / 1000.0)
+			c.rfc3550Jitter += (D - c.rfc3550Jitter) / 16.0
+		}
+		c.haveLastAck = true
+		c.lastArrivalAt = now
+		c.lastSentAt = pt.sentAt
+	}
+	return pt.rttMs, true
 }
 
 // ClientStats tracks client-side statistics
@@ -204,8 +293,8 @@ type AgentConnection struct {
 	// ClientProbeID is the ID of the client's TrafficSim probe targeting this agent
 	// When bidirectional=true, server reports reverse stats using ClientProbeID (same probe ID)
 	// but with SrcAgent = this server's ID to indicate reverse direction
-	ClientProbeID   uint
-	ReverseCycle    *CycleTracker
+	ClientProbeID uint
+	ReverseCycle  *CycleTracker
 	// PrevReverseCycle holds the most recently completed cycle so ACKs that
 	// arrive after rotation still land in the right cycle (routed by seq).
 	PrevReverseCycle *CycleTracker
@@ -673,6 +762,37 @@ func (ts *TrafficSim) RefreshBidirectional() {
 // 1. Target agent has a server (client mode) - looks for client probe
 // 2. Owner agent has a server (bidirectional mode with bidirectional_receiver marker)
 // Returns the probe if found, nil otherwise
+// ReverseSnapshot reports the server-side reverse-path state for a connected
+// client agent: the probe ID reverse stats are attributed to (0 = reverse
+// disabled) and how many reverse packets were sent/ACKed in the current and
+// previous cycle. ok is false if the agent has no connection. Diagnostic use.
+func (ts *TrafficSim) ReverseSnapshot(agentID uint) (clientProbeID uint, sent, acked int, ok bool) {
+	ts.connectionsMu.RLock()
+	conn, exists := ts.connections[agentID]
+	if !exists {
+		ts.connectionsMu.RUnlock()
+		return 0, 0, 0, false
+	}
+	clientProbeID = conn.ClientProbeID
+	cycles := []*CycleTracker{conn.PrevReverseCycle, conn.ReverseCycle}
+	ts.connectionsMu.RUnlock()
+
+	for _, c := range cycles {
+		if c == nil {
+			continue
+		}
+		c.mu.RLock()
+		sent += len(c.PacketSeqs)
+		for _, pt := range c.PacketTimes {
+			if pt.Received != 0 {
+				acked++
+			}
+		}
+		c.mu.RUnlock()
+	}
+	return clientProbeID, sent, acked, true
+}
+
 func (ts *TrafficSim) GetClientProbeForAgent(targetAgentID uint) *Probe {
 	// First try using dynamic probe retrieval if available (preferred for freshest data)
 	var probesToCheck []Probe
@@ -1064,14 +1184,25 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 			ts.setConnectionValid(false)
 		}
 
+		// Pace sends with a ticker so the spacing is the configured interval,
+		// not interval + per-packet processing time (which skews jitter at
+		// 20ms VoIP spacing).
+		sendInterval := time.Duration(ts.Options.IntervalMs) * time.Millisecond
+		if sendInterval <= 0 {
+			sendInterval = time.Duration(TrafficSimDataInterval) * time.Millisecond
+		}
+		pacer := time.NewTicker(sendInterval)
+
 		// Send packets in a loop, checking both packet count (legacy) and time (VoIP)
 		packetsSent := 0
 		for (useTimeBasedReporting && time.Since(cycleStartTime) < reportInterval) ||
 			(!useTimeBasedReporting && packetsSent < TrafficSimReportSeq) {
 			select {
 			case <-ctx.Done():
+				pacer.Stop()
 				return
 			case <-ts.stopChan:
+				pacer.Stop()
 				return
 			default:
 			}
@@ -1087,18 +1218,25 @@ func (ts *TrafficSim) runTestCycles(ctx context.Context, mtrProbe *Probe) {
 				}
 			}
 
-			ts.sendDataPacket(cycle)
+			if !ts.sendDataPacket(cycle) {
+				cycle.mu.Lock()
+				cycle.localSendErrors++
+				cycle.mu.Unlock()
+			}
 			packetsSent++
 
-			// Wait for interval (use configurable interval in milliseconds)
+			// Wait for the next send slot
 			select {
-			case <-time.After(time.Duration(ts.Options.IntervalMs) * time.Millisecond):
+			case <-pacer.C:
 			case <-ctx.Done():
+				pacer.Stop()
 				return
 			case <-ts.stopChan:
+				pacer.Stop()
 				return
 			}
 		}
+		pacer.Stop()
 
 		log.Infof("[trafficsim] VoIP cycle complete: sent=%d packets over %v",
 			packetsSent, time.Since(cycleStartTime).Round(time.Second))
@@ -1145,18 +1283,20 @@ func (ts *TrafficSim) startCycle() *CycleTracker {
 
 func (ts *TrafficSim) sendDataPacket(cycle *CycleTracker) bool {
 	seq := ts.nextSequence()
-	sentTime := time.Now().UnixMilli()
+	sentAt := time.Now()
+	pt := newPacketTime(sentAt)
+	sentTime := pt.Sent
 
 	// Track in cycle
 	cycle.mu.Lock()
 	cycle.PacketSeqs = append(cycle.PacketSeqs, seq)
-	cycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	cycle.PacketTimes[seq] = pt
 	log.Debugf("[trafficsim] CLIENT sent seq=%d", seq)
 	cycle.mu.Unlock()
 
 	// Also track in client stats
 	ts.clientStats.mu.Lock()
-	ts.clientStats.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	ts.clientStats.PacketTimes[seq] = pt
 	ts.clientStats.mu.Unlock()
 
 	msg, err := ts.buildMessage(MsgData, TrafficSimData{
@@ -1255,71 +1395,17 @@ func (ts *TrafficSim) receiveLoop(ctx context.Context) {
 
 func (ts *TrafficSim) handleAck(data TrafficSimData) {
 	seq := data.Seq
-	recvTime := time.Now().UnixMilli()
+	now := time.Now()
+	recvTime := now.UnixMilli()
 
 	// Update cycle tracker
 	ts.cycleMu.RLock()
 	if ts.currentCycle != nil {
 		ts.currentCycle.mu.Lock()
-
-		// Track duplicate detection: increment receive count for this seq
-		ts.currentCycle.receivedSeqs[seq]++
-		receiveCount := ts.currentCycle.receivedSeqs[seq]
-
-		if receiveCount > 1 {
-			// This is a duplicate packet
-			ts.currentCycle.duplicates++
-			// Reset consecutive loss counter when we receive a packet (even duplicate)
-			if ts.currentCycle.consecutiveLoss > 0 {
-				if ts.currentCycle.consecutiveLoss > ts.currentCycle.maxConsecutiveLoss {
-					ts.currentCycle.maxConsecutiveLoss = ts.currentCycle.consecutiveLoss
-				}
-				ts.currentCycle.totalBursts++
-				ts.currentCycle.consecutiveLoss = 0
-			}
+		if rtt, ok := ts.currentCycle.recordAck(seq, data.Sent, now); ok {
+			log.Debugf("[trafficsim] CLIENT handleAck seq=%d rtt=%.3fms jitter=%.3f", seq, rtt, ts.currentCycle.rfc3550Jitter)
 		} else {
-			// First time receiving this seq - check for out-of-order
-			if ts.currentCycle.lastReceivedSeq > 0 && seq < ts.currentCycle.lastReceivedSeq {
-				// Packet arrived out of order (lower seq after higher seq)
-				ts.currentCycle.outOfOrder++
-			}
-			ts.currentCycle.lastReceivedSeq = seq
-			// Reset consecutive loss counter on successful receipt
-			if ts.currentCycle.consecutiveLoss > 0 {
-				if ts.currentCycle.consecutiveLoss > ts.currentCycle.maxConsecutiveLoss {
-					ts.currentCycle.maxConsecutiveLoss = ts.currentCycle.consecutiveLoss
-				}
-				ts.currentCycle.totalBursts++
-				ts.currentCycle.consecutiveLoss = 0
-			}
-		}
-
-		// Update packet timing (only first receipt)
-		if pt, ok := ts.currentCycle.PacketTimes[seq]; ok && pt.Received == 0 {
-			pt.Received = recvTime
-			ts.currentCycle.PacketTimes[seq] = pt
-
-			// RFC 3550 jitter calculation
-			// J(i) = J(i-1) + (|D(i,i-1)| - J(i-1))/16
-			// D(i,j) = (Rj - Ri) - (Sj - Si) = difference between inter-arrival and inter-transit time
-			if ts.currentCycle.lastTransit > 0 {
-				interArrival := float64(recvTime - ts.currentCycle.lastArrivalTime)
-				interTransit := float64(pt.Sent - ts.currentCycle.lastSentTime)
-				D := math.Abs(interArrival - interTransit)
-				// Update smoothed jitter using RFC 3550 formula
-				ts.currentCycle.rfc3550Jitter = ts.currentCycle.rfc3550Jitter + (D-ts.currentCycle.rfc3550Jitter)/16.0
-			}
-			// Update last transit time for next calculation
-			transit := recvTime - pt.Sent
-			ts.currentCycle.lastTransit = transit
-			ts.currentCycle.lastArrivalTime = recvTime
-			ts.currentCycle.lastSentTime = pt.Sent
-
-			log.Debugf("[trafficsim] CLIENT handleAck seq=%d rtt=%d jitter=%.2f", seq, recvTime-pt.Sent, ts.currentCycle.rfc3550Jitter)
-		} else if _, ok := ts.currentCycle.PacketTimes[seq]; ok {
-			log.Debugf("[trafficsim] CLIENT handleAck seq=%d ALREADY RECEIVED", seq)
-		} else {
-			log.Debugf("[trafficsim] CLIENT handleAck seq=%d NOT FOUND", seq)
+			log.Debugf("[trafficsim] CLIENT handleAck seq=%d ignored (duplicate, stale or unknown)", seq)
 		}
 		ts.currentCycle.mu.Unlock()
 	}
@@ -1350,7 +1436,7 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, cycle *CycleTracker)
 
 		// Check if all packets are complete
 		allDone := true
-		now := time.Now().UnixMilli()
+		now := time.Now()
 
 		cycle.mu.Lock()
 		receivedCount := 0
@@ -1371,7 +1457,7 @@ func (ts *TrafficSim) waitForResponses(ctx context.Context, cycle *CycleTracker)
 		for _, seq := range cycle.PacketSeqs {
 			if pt, ok := cycle.PacketTimes[seq]; ok {
 				if pt.Received == 0 && !pt.TimedOut {
-					if now-pt.Sent > int64(TrafficSimTimeout.Milliseconds()) {
+					if pt.age(now) > TrafficSimTimeout {
 						pt.TimedOut = true
 						cycle.PacketTimes[seq] = pt
 						// Track burst loss
@@ -1417,7 +1503,8 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	defer cycle.mu.RUnlock()
 
 	var rtts []float64
-	var totalRTT, minRTT, maxRTT int64
+	var totalRTT, minRTT, maxRTT float64
+	haveRTT := false
 	lost := 0
 	total := len(cycle.PacketSeqs)
 
@@ -1427,22 +1514,23 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 				lost++
 				continue
 			}
-			rtt := pt.Received - pt.Sent
-			rtts = append(rtts, float64(rtt))
+			rtt := pt.RTT()
+			rtts = append(rtts, rtt)
 			totalRTT += rtt
-			if minRTT == 0 || rtt < minRTT {
+			if !haveRTT || rtt < minRTT {
 				minRTT = rtt
 			}
-			if rtt > maxRTT {
+			if !haveRTT || rtt > maxRTT {
 				maxRTT = rtt
 			}
+			haveRTT = true
 		}
 	}
 
 	avgRTT := float64(0)
 	stdDev := float64(0)
 	if len(rtts) > 0 {
-		avgRTT = float64(totalRTT) / float64(len(rtts))
+		avgRTT = totalRTT / float64(len(rtts))
 		for _, rtt := range rtts {
 			stdDev += math.Pow(rtt-avgRTT, 2)
 		}
@@ -1656,9 +1744,11 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 		"medianRTT":  medianRTT,
 		"p95RTT":     p95RTT,
 		"p99RTT":     p99RTT,
-		"minRTT":     minRTT,
-		"maxRTT":     maxRTT,
-		"stdDevRTT":  stdDev,
+		// The controller decodes min/max as integers; keep them whole ms.
+		// Fractional precision is carried by average/median/p95/p99.
+		"minRTT":    int64(math.Round(minRTT)),
+		"maxRTT":    int64(math.Round(maxRTT)),
+		"stdDevRTT": stdDev,
 
 		// Jitter metrics (ms)
 		"jitterAvg":    jitterAvg,
@@ -1683,6 +1773,12 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 	// Add RFC 3550 jitter (computed for all traffic, useful for network characterization)
 	if cycle.rfc3550Jitter > 0 {
 		stats["rfc3550Jitter"] = cycle.rfc3550Jitter
+	}
+	if cycle.staleAcks > 0 {
+		stats["staleAcks"] = cycle.staleAcks
+	}
+	if cycle.localSendErrors > 0 {
+		stats["localSendErrors"] = cycle.localSendErrors
 	}
 
 	// Add VoIP-specific metrics when in VoIP mode
@@ -2015,14 +2111,15 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 	log.Debugf("[trafficsim] REVERSE sendReverseDataPacket ENTRY: AgentID=%d ReverseSequence=%d", connection.AgentID, connection.ReverseSequence)
 	connection.ReverseSequence++
 	seq := connection.ReverseSequence
-	sentTime := time.Now().UnixMilli()
+	pt := newPacketTime(time.Now())
+	sentTime := pt.Sent
 
 	log.Debugf("[trafficsim] REVERSE sendReverseDataPacket: assigned seq=%d", seq)
 
 	// Track in reverse cycle
 	connection.ReverseCycle.mu.Lock()
 	connection.ReverseCycle.PacketSeqs = append(connection.ReverseCycle.PacketSeqs, seq)
-	connection.ReverseCycle.PacketTimes[seq] = PacketTime{Sent: sentTime}
+	connection.ReverseCycle.PacketTimes[seq] = pt
 	log.Debugf("[trafficsim] REVERSE sent seq=%d cyclePacketCount=%d", seq, len(connection.ReverseCycle.PacketSeqs))
 	connection.ReverseCycle.mu.Unlock()
 
@@ -2055,6 +2152,9 @@ func (ts *TrafficSim) sendReverseDataPacket(conn *net.UDPConn, addr *net.UDPAddr
 
 	if _, err := conn.WriteToUDP(msgBytes, addr); err != nil {
 		log.Infof("[trafficsim] Failed to send reverse DATA to agent %d: %v", connection.AgentID, err)
+		connection.ReverseCycle.mu.Lock()
+		connection.ReverseCycle.localSendErrors++
+		connection.ReverseCycle.mu.Unlock()
 	}
 
 	connection.PacketsSent++
@@ -2117,7 +2217,7 @@ func finalizeReverseCycle(cycle *CycleTracker) {
 // handleReverseAck processes ACK from client for server's reverse DATA packet
 func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data TrafficSimData) {
 	seq := data.Seq
-	recvTime := time.Now().UnixMilli()
+	now := time.Now()
 
 	// Route by sequence: ReverseSequence is monotonic across cycles, so an ACK
 	// with seq below the current cycle's StartSeq belongs to the previous
@@ -2132,49 +2232,10 @@ func (ts *TrafficSim) handleReverseAck(connection *AgentConnection, data Traffic
 	cycle.mu.Lock()
 	defer cycle.mu.Unlock()
 
-	log.Debugf("[trafficsim] REVERSE handleReverseAck START: seq=%d", seq)
-
-	// Track duplicate/out-of-order and burst loss
-	cycle.receivedSeqs[seq]++
-	receiveCount := cycle.receivedSeqs[seq]
-
-	if receiveCount > 1 {
-		cycle.duplicates++
-		// Reset consecutive loss counter when we receive a packet (even duplicate)
-		if cycle.consecutiveLoss > 0 {
-			if cycle.consecutiveLoss > cycle.maxConsecutiveLoss {
-				cycle.maxConsecutiveLoss = cycle.consecutiveLoss
-			}
-			cycle.totalBursts++
-			cycle.consecutiveLoss = 0
-		}
-	} else if cycle.lastReceivedSeq > 0 && seq < cycle.lastReceivedSeq {
-		cycle.outOfOrder++
-	}
-	cycle.lastReceivedSeq = seq
-
-	// Update packet timing and RFC 3550 jitter
-	if pt, ok := cycle.PacketTimes[seq]; ok && pt.Received == 0 {
-		pt.Received = recvTime
-		cycle.PacketTimes[seq] = pt
-
-		// RFC 3550 jitter calculation for reverse direction
-		if cycle.lastTransit > 0 {
-			interArrival := float64(recvTime - cycle.lastArrivalTime)
-			interTransit := float64(pt.Sent - cycle.lastSentTime)
-			D := math.Abs(interArrival - interTransit)
-			cycle.rfc3550Jitter = cycle.rfc3550Jitter + (D-cycle.rfc3550Jitter)/16.0
-		}
-		transit := recvTime - pt.Sent
-		cycle.lastTransit = transit
-		cycle.lastArrivalTime = recvTime
-		cycle.lastSentTime = pt.Sent
-
-		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%dms jitter=%.2f", seq, recvTime-pt.Sent, cycle.rfc3550Jitter)
-	} else if _, ok := cycle.PacketTimes[seq]; ok {
-		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d ALREADY RECEIVED", seq)
-	} else {
-		log.Infof("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d) - may be from rotated cycle", seq, len(cycle.PacketTimes))
+	if rtt, ok := cycle.recordAck(seq, data.Sent, now); ok {
+		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d rtt=%.3fms jitter=%.3f", seq, rtt, cycle.rfc3550Jitter)
+	} else if _, known := cycle.PacketTimes[seq]; !known {
+		log.Debugf("[trafficsim] REVERSE handleReverseAck seq=%d NOT FOUND in PacketTimes (current size=%d) - may be from rotated cycle", seq, len(cycle.PacketTimes))
 	}
 }
 

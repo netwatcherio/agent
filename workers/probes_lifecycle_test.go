@@ -187,3 +187,27 @@ func TestWaitOrStopReturnsOnCancel(t *testing.T) {
 		t.Fatalf("waitOrStop did not return promptly")
 	}
 }
+
+func TestNextWaitKeepsFixedPeriod(t *testing.T) {
+	if got := nextWait(120*time.Second, 45*time.Second); got != 75*time.Second {
+		t.Fatalf("nextWait = %v, want 75s", got)
+	}
+	if got := nextWait(60*time.Second, 90*time.Second); got != minProbeWait {
+		t.Fatalf("overrun nextWait = %v, want %v", got, minProbeWait)
+	}
+}
+
+func TestStartupJitterBounds(t *testing.T) {
+	for _, iv := range []int{0, 5, 60, 3600} {
+		p := probes.Probe{IntervalSec: iv}
+		for i := 0; i < 200; i++ {
+			j := startupJitter(p)
+			if j < 0 || j >= maxStartupJitter {
+				t.Fatalf("interval %d: jitter %v out of range", iv, j)
+			}
+			if iv > 0 && iv < 30 && j >= time.Duration(iv)*time.Second {
+				t.Fatalf("interval %d: jitter %v exceeds interval", iv, j)
+			}
+		}
+	}
+}

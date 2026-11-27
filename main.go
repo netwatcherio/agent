@@ -413,10 +413,8 @@ func runAgent(ctx context.Context) error {
 			default:
 				time.Sleep(time.Minute * 1)
 				log.Debug("Getting probes again...")
-				if ws.IsConnected() {
-					if ok := ws.Emit("probe_get", []byte("please")); ok {
-						updateActivity()
-					}
+				if ws.IsConnected() && ws.RequestProbes() {
+					updateActivity()
 				}
 			}
 		}

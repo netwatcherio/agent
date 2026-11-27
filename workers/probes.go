@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -877,6 +878,36 @@ func probeNeedsTarget(t probes.ProbeType) bool {
 	return false
 }
 
+// minProbeWait is the shortest gap between two runs of the same probe.
+const minProbeWait = time.Second
+
+// maxStartupJitter caps the random delay before a worker's first run.
+const maxStartupJitter = 30 * time.Second
+
+// startupJitter spreads first runs so an agent with many probes doesn't fire
+// them all at once on startup or reconnect (bursty raw-socket and MTR load
+// skews the very measurements we take).
+func startupJitter(probe probes.Probe) time.Duration {
+	limit := time.Duration(probe.IntervalSec) * time.Second
+	if limit > maxStartupJitter {
+		limit = maxStartupJitter
+	}
+	if limit < time.Second {
+		limit = time.Second
+	}
+	return time.Duration(rand.Int64N(int64(limit)))
+}
+
+// nextWait converts a handler's "interval" into the remaining wait so runs
+// start every interval, rather than every run-time + interval.
+func nextWait(interval, elapsed time.Duration) time.Duration {
+	wait := interval - elapsed
+	if wait < minProbeWait {
+		wait = minProbeWait
+	}
+	return wait
+}
+
 // waitOrStop sleeps for d, returning false early if the worker is stopped.
 func waitOrStop(worker ProbeWorkerS, d time.Duration) bool {
 	if d <= 0 {
@@ -963,6 +994,12 @@ func startCheckWorker(worker ProbeWorkerS, dataChan chan probes.ProbeData, thisA
 			defer worker.WaitGroup.Done()
 		}
 
+		if probe.Type != probes.ProbeType_TRAFFICSIM {
+			if !waitOrStop(worker, startupJitter(probe)) {
+				return
+			}
+		}
+
 		for {
 			select {
 			case <-worker.Ctx.Done():
@@ -1007,7 +1044,8 @@ func startCheckWorker(worker ProbeWorkerS, dataChan chan probes.ProbeData, thisA
 				return
 			}
 
-			wait := runProbeOnce(worker.Ctx, current, dC)
+			runStart := time.Now()
+			wait := nextWait(runProbeOnce(worker.Ctx, current, dC), time.Since(runStart))
 			if !waitOrStop(worker, wait) {
 				log.Infof("Worker for probe %d (type: %s) stopped", probe.ID, probe.Type)
 				return

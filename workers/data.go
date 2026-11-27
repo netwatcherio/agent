@@ -26,7 +26,12 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 
 	go func(cn *web.WSClient, c chan probes.ProbeData) {
 		for p := range ch {
-			p.CreatedAt = time.Now()
+			// CreatedAt is the measurement time set by the probe. Only fill it
+			// in if missing — overwriting it with the send time would shift
+			// every point by the queueing delay (minutes, after an outage).
+			if p.CreatedAt.IsZero() {
+				p.CreatedAt = time.Now()
+			}
 			marshal, err := json.Marshal(p)
 			if err != nil {
 				log.Errorf("ProbeDataWorker: failed to marshal probe data: %v", err)

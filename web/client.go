@@ -308,6 +308,9 @@ type WSClient struct {
 	// Failure tracking for auto-reconnect
 	probeGetFailures    int
 	maxProbeGetFailures int // Max consecutive failures before reconnect (default 5)
+
+	// lag tracks how far behind the controller is on this connection.
+	lag lagTracker
 }
 
 // IsInServerErrorMode returns true when the agent is currently retrying transient
@@ -478,6 +481,8 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			neffos.OnNamespaceConnected: func(ns *neffos.NSConn, msg neffos.Message) error {
 				log.Infof("WS: connected to namespace [%s]", msg.Namespace)
 				// Ask server for probes; your server replies with "bing bong" currently.
+				c.lag.reset()
+				c.lag.beginProbeGet(time.Now())
 				if ok := ns.Emit("probe_get", []byte("hello")); !ok {
 					log.Warn("WS: emit probe_get returned false")
 				}
@@ -565,6 +570,7 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			},
 
 			"probe_get": func(ns *neffos.NSConn, msg neffos.Message) error {
+				c.lag.endProbeGet()
 				var p []probes.Probe
 
 				// Set default max failures if not configured
@@ -661,7 +667,10 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 			},
 			// Pong handler - received from controller in response to heartbeat ping
 			"pong": func(ns *neffos.NSConn, msg neffos.Message) error {
-				log.Debug("WS: heartbeat pong received")
+				if lag, ok := c.lag.pongReceived(time.Now()); ok {
+					log.Debugf("WS: heartbeat pong received (round trip %v)", lag.Round(time.Millisecond))
+					c.checkLag(lag, "slow pong")
+				}
 				// A pong receipt is the strongest "backend is alive" signal we have.
 				// Fire OnActivity so the watchdog doesn't restart us just because no
 				// business messages happen to be flowing right now.
@@ -1032,7 +1041,13 @@ func (c *WSClient) startHeartbeat(ctx context.Context, ns *neffos.NSConn) {
 				log.Debug("WS: heartbeat skipped - no connection")
 				continue
 			}
-			if ok := ns.Emit("ping", []byte(`{"ts":"`+time.Now().Format(time.RFC3339)+`"}`)); !ok {
+			// A ping left unanswered this long means the controller is that far
+			// behind on this connection, even if pongs still trickle in.
+			c.checkLag(c.lag.oldestUnanswered(time.Now()), "unanswered ping")
+
+			sentAt := time.Now()
+			c.lag.pingSent(sentAt)
+			if ok := ns.Emit("ping", []byte(`{"ts":"`+sentAt.Format(time.RFC3339)+`"}`)); !ok {
 				log.Warn("WS: heartbeat ping failed, connection may be stale")
 				// Don't trigger reconnection here - let the connection timeout naturally
 				// The OnNamespaceDisconnect handler will handle reconnection

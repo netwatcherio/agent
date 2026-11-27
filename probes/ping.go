@@ -138,6 +138,7 @@ func PingContext(ctx context.Context, ac *Probe, pingChan chan ProbeData, mtrPro
 		cD := ProbeData{
 			ProbeID:         ac.ID,
 			Type:            ProbeType_PING,
+			CreatedAt:       time.Now(),
 			Payload:         bytes,
 			Target:          target,
 			SourceIP:        sourceIP,
