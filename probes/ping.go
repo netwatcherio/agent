@@ -1,6 +1,7 @@
 package probes
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"runtime"
@@ -25,6 +26,13 @@ type PingPayload struct {
 }
 
 func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
+	return PingContext(context.Background(), ac, pingChan, mtrProbe)
+}
+
+// PingContext runs a ping probe and stops early (without reporting a partial
+// result) when ctx is cancelled, so a removed probe doesn't keep pinging for
+// up to Count seconds.
+func PingContext(ctx context.Context, ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 	if len(ac.Targets) == 0 || ac.Targets[0].Target == "" {
 		return fmt.Errorf("ping: no target provided")
 	}
@@ -135,12 +143,21 @@ func Ping(ac *Probe, pingChan chan ProbeData, mtrProbe Probe) error {
 			SourceIP:        sourceIP,
 			SourceInterface: sourceIface,
 		}
-		pingChan <- cD
+		if ctx.Err() != nil {
+			return // probe was stopped mid-run; don't report a truncated sample
+		}
+		select {
+		case pingChan <- cD:
+		case <-ctx.Done():
+		}
 
 		// Optional: trigger follow-up probes based on loss here.
 	}
 
-	if err := pinger.Run(); err != nil {
+	if err := pinger.RunWithContext(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		// per issues, timeout doesn’t return an error; other errors should be surfaced
 		log.WithError(err).Error("ping: failed")
 		return err

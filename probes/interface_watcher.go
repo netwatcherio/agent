@@ -33,7 +33,8 @@ type InterfaceChangeHandler func(event InterfaceChangeEvent)
 // This enables proactive socket invalidation when Windows silently switches interfaces
 // (e.g., Wi-Fi→Ethernet, VPN connect/disconnect) without producing explicit socket errors.
 type InterfaceWatcher struct {
-	handlers     []InterfaceChangeHandler
+	handlers     map[uint64]InterfaceChangeHandler
+	nextHandler  uint64
 	handlersMu   sync.RWMutex
 	lastSnapshot *InterfaceSnapshot
 	snapshotMu   sync.RWMutex
@@ -48,14 +49,39 @@ func NewInterfaceWatcher(interval time.Duration) *InterfaceWatcher {
 	return &InterfaceWatcher{
 		interval: interval,
 		stopChan: make(chan struct{}),
+		handlers: make(map[uint64]InterfaceChangeHandler),
 	}
 }
 
 // OnChange registers a handler to be called when network interfaces change.
-func (w *InterfaceWatcher) OnChange(handler InterfaceChangeHandler) {
+// It returns a function that unregisters the handler; callers whose lifetime is
+// shorter than the watcher's (e.g. a TrafficSim instance) must call it, or the
+// handler — and everything it captures — stays alive and keeps firing.
+func (w *InterfaceWatcher) OnChange(handler InterfaceChangeHandler) (unregister func()) {
 	w.handlersMu.Lock()
 	defer w.handlersMu.Unlock()
-	w.handlers = append(w.handlers, handler)
+	if w.handlers == nil {
+		w.handlers = make(map[uint64]InterfaceChangeHandler)
+	}
+	w.nextHandler++
+	id := w.nextHandler
+	w.handlers[id] = handler
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			w.handlersMu.Lock()
+			delete(w.handlers, id)
+			w.handlersMu.Unlock()
+		})
+	}
+}
+
+// HandlerCount returns the number of registered change handlers.
+func (w *InterfaceWatcher) HandlerCount() int {
+	w.handlersMu.RLock()
+	defer w.handlersMu.RUnlock()
+	return len(w.handlers)
 }
 
 // GetSnapshot returns the current interface snapshot (thread-safe).
@@ -194,8 +220,10 @@ func (w *InterfaceWatcher) check() {
 	}
 
 	w.handlersMu.RLock()
-	handlers := make([]InterfaceChangeHandler, len(w.handlers))
-	copy(handlers, w.handlers)
+	handlers := make([]InterfaceChangeHandler, 0, len(w.handlers))
+	for _, h := range w.handlers {
+		handlers = append(handlers, h)
+	}
 	w.handlersMu.RUnlock()
 
 	for _, handler := range handlers {

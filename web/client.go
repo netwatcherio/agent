@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/exec"
@@ -275,8 +276,12 @@ type WSClient struct {
 	SpeedtestQueueCh chan []probes.SpeedtestQueueItem
 	DeactivateCh     chan string        // Receives reason when agent should deactivate
 	CancelFunc       context.CancelFunc // Cancels the agent's main context on deactivation
-	WsConn           *neffos.NSConn
+	WsConn           *neffos.NSConn     // written under mu; read it via Conn()/Emit()
 	AgentVersion     string
+
+	// Ctx bounds the lifetime of background reconnect attempts. If nil,
+	// context.Background() is used.
+	Ctx context.Context
 
 	// Callback called on successful (re)connection - use for retry queue flushing
 	OnReconnect func()
@@ -332,6 +337,89 @@ func (c *WSClient) IsConnected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.WsConn != nil && c.isStable && !c.isConnecting && !c.deactivated
+}
+
+// Conn returns the current namespace connection (may be nil), read under lock.
+func (c *WSClient) Conn() *neffos.NSConn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.WsConn
+}
+
+// Emit sends an event on the current connection. It returns false if there is
+// no connection or the send failed. Safe to call concurrently with reconnects.
+func (c *WSClient) Emit(event string, body []byte) bool {
+	conn := c.Conn()
+	if conn == nil {
+		return false
+	}
+	return conn.Emit(event, body)
+}
+
+func (c *WSClient) lifetimeCtx() context.Context {
+	if c.Ctx != nil {
+		return c.Ctx
+	}
+	return context.Background()
+}
+
+// TriggerReconnect starts ConnectWithRetry in the background after delay.
+// It is a no-op if the client's lifetime context is already done, and
+// ConnectWithRetry itself refuses to overlap with an attempt in progress.
+func (c *WSClient) TriggerReconnect(delay time.Duration) {
+	go func() {
+		ctx := c.lifetimeCtx()
+		if !sleepCtx(ctx, delay) {
+			return
+		}
+		c.ConnectWithRetry(ctx)
+	}()
+}
+
+// sleepCtx waits for d or until ctx is done. Returns false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// withJitter spreads d by ±25% so a fleet of agents doesn't reconnect in
+// lockstep after a controller restart.
+func withJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	quarter := int64(d) / 4
+	if quarter <= 0 {
+		return d
+	}
+	return d - time.Duration(quarter) + time.Duration(rand.Int64N(2*quarter+1))
+}
+
+// deliverLatestProbes hands a probe list to the reconciler without blocking
+// the websocket read loop. ch should have capacity 1; if an older list is
+// still waiting, it is replaced, because only the newest list matters.
+func deliverLatestProbes(ch chan []probes.Probe, p []probes.Probe) {
+	for i := 0; i < 2; i++ {
+		select {
+		case ch <- p:
+			return
+		default:
+		}
+		select {
+		case <-ch: // drop the stale, unconsumed list
+		default:
+		}
+	}
+	log.Warn("WS: probe reconciler busy, dropping probe list (next probe_get will retry)")
 }
 
 // IsDeactivated returns true if the agent has been deactivated.
@@ -472,10 +560,7 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 
 				// Delay before triggering reconnection to prevent rapid reconnect cycles
 				// This helps when the backend is replacing connections (e.g., agent restart)
-				go func() {
-					time.Sleep(1 * time.Second)
-					c.ConnectWithRetry(context.Background())
-				}()
+				c.TriggerReconnect(1 * time.Second)
 				return nil
 			},
 
@@ -501,10 +586,7 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 						if shouldReconnect {
 							log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
 							c.probeGetFailures = 0
-							go func() {
-								time.Sleep(2 * time.Second) // Brief pause before reconnecting
-								c.ConnectWithRetry(context.Background())
-							}()
+							c.TriggerReconnect(2 * time.Second)
 						}
 					}
 					return nil
@@ -523,10 +605,7 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 						if shouldReconnect {
 							log.Warnf("WS: too many probe_get failures (%d), triggering reconnection", c.probeGetFailures)
 							c.probeGetFailures = 0
-							go func() {
-								time.Sleep(2 * time.Second)
-								c.ConnectWithRetry(context.Background())
-							}()
+							c.TriggerReconnect(2 * time.Second)
 						}
 					}
 					return nil
@@ -553,7 +632,7 @@ func (c *WSClient) namespaces() neffos.Namespaces {
 							probe.ID, probe.Type, probe.Server, targetStr)
 					}
 
-					c.ProbeGetCh <- p
+					deliverLatestProbes(c.ProbeGetCh, p)
 				} else {
 					log.Debugf("WS: received empty probe list")
 				}
@@ -818,7 +897,9 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 				// Do NOT count toward auth failures — this is a transient server issue
 				consecutiveAuthFailures = 0
 				c.setServerErrorMode(true)
-				time.Sleep(delay)
+				if !sleepCtx(parent, withJitter(delay)) {
+					return
+				}
 				if delay < maxDelay {
 					delay *= 2
 				}
@@ -872,7 +953,9 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 			}
 
 			log.Errorf("WS dial error: %v (retry in %s)", err, delay)
-			time.Sleep(delay)
+			if !sleepCtx(parent, withJitter(delay)) {
+				return
+			}
 			if delay < maxDelay {
 				delay *= 2
 			}
@@ -899,7 +982,9 @@ func (c *WSClient) ConnectWithRetry(parent context.Context) {
 			// retry quickly instead of waiting 2s, 4s, 8s...
 			log.Errorf("WS join namespace error: %v (retry in %s)", err, delay)
 			client.Close()
-			time.Sleep(delay)
+			if !sleepCtx(parent, withJitter(delay)) {
+				return
+			}
 			delay = 1 * time.Second
 			continue
 		}

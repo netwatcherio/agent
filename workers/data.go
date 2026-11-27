@@ -1,7 +1,6 @@
 package workers
 
 import (
-	"context"
 	"encoding/json"
 	"time"
 
@@ -35,27 +34,27 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 			}
 
 			// Check if connection is available
-			if wsH.WsConn == nil || !wsH.IsConnected() {
+			if !wsH.IsConnected() {
 				log.Debug("ProbeDataWorker: no connection, queuing probe data")
 				probeRetryQueue.Enqueue(p)
 				sendFailures++
 				if sendFailures >= maxSendFailures {
 					log.Warnf("ProbeDataWorker: %d consecutive send failures (no connection), triggering reconnection", sendFailures)
 					sendFailures = 0
-					go wsH.ConnectWithRetry(context.Background())
+					wsH.TriggerReconnect(0)
 				}
 				continue
 			}
 
 			// Try to send
-			if !wsH.WsConn.Emit("probe_post", marshal) {
+			if !wsH.Emit("probe_post", marshal) {
 				log.Warn("ProbeDataWorker: emit failed, queuing probe data for retry")
 				probeRetryQueue.Enqueue(p)
 				sendFailures++
 				if sendFailures >= maxSendFailures {
 					log.Warnf("ProbeDataWorker: %d consecutive emit failures, triggering reconnection", sendFailures)
 					sendFailures = 0
-					go wsH.ConnectWithRetry(context.Background())
+					wsH.TriggerReconnect(0)
 				}
 			} else {
 				log.Debug("ProbeDataWorker: probe data sent successfully")
@@ -68,9 +67,9 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 // FlushRetryQueue attempts to send all queued probe data.
 // Call this after reconnection to flush any buffered data.
 func FlushRetryQueue(wsH *web.WSClient) int {
-	if wsH.WsConn == nil {
+	if wsH.Conn() == nil {
 		log.Warn("FlushRetryQueue: no connection available")
 		return 0
 	}
-	return probeRetryQueue.Flush(wsH.WsConn)
+	return probeRetryQueue.Flush(wsH)
 }

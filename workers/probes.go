@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -668,23 +669,7 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 							time.Sleep(500 * time.Millisecond)
 
 							// Create new worker
-							ctx, cancel := context.WithCancel(context.Background())
-							stopChan := make(chan struct{})
-							stopOnce := &sync.Once{}
-							wg := &sync.WaitGroup{}
-
-							newWorker := ProbeWorkerS{
-								Probe:      probe,
-								ToRemove:   false,
-								StopChan:   stopChan,
-								StopOnce:   stopOnce,
-								WaitGroup:  wg,
-								Ctx:        ctx,
-								CancelFunc: cancel,
-							}
-
-							checkWorkers.Store(probeKey, newWorker)
-							startCheckWorker(probe, probeDataChan, thisAgent)
+							startCheckWorker(newProbeWorker(probe), probeDataChan, thisAgent)
 						} else {
 							// TrafficSim config unchanged - just update probe data and key
 							log.Debugf("TrafficSim probe %v unchanged, updating reference", probe.ID)
@@ -698,10 +683,14 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 							}
 						}
 					} else {
-						// Non-TrafficSim - update probe data and key
-						oldWorker.Probe = probe
+						// Non-TrafficSim config changed (interval, count, extra
+						// targets, ...). The running goroutine is bound to its old
+						// key, so just moving the map entry would orphan it and the
+						// probe would silently stop forever. Restart it instead.
+						log.Infof("Probe %v (type: %s) config changed, restarting worker", probe.ID, probe.Type)
+						signalStopProbeWorker(oldWorker)
 						checkWorkers.Delete(oldKey)
-						checkWorkers.Store(probeKey, *oldWorker)
+						startCheckWorker(newProbeWorker(probe), probeDataChan, thisAgent)
 					}
 
 					newKeys = append(newKeys, probeKey)
@@ -709,47 +698,26 @@ func FetchProbesWorker(probeGetChan chan []probes.Probe, probeDataChan chan prob
 					// Truly new probe - create worker
 					log.Debugf("Starting NEW worker for probe %v (type: %s)", probe.ID, probe.Type)
 
-					ctx, cancel := context.WithCancel(context.Background())
-					stopChan := make(chan struct{})
-					stopOnce := &sync.Once{}
-					wg := &sync.WaitGroup{}
-
-					worker := ProbeWorkerS{
-						Probe:      probe,
-						ToRemove:   false,
-						StopChan:   stopChan,
-						StopOnce:   stopOnce,
-						WaitGroup:  wg,
-						Ctx:        ctx,
-						CancelFunc: cancel,
-					}
-
-					checkWorkers.Store(probeKey, worker)
-					startCheckWorker(probe, probeDataChan, thisAgent)
+					startCheckWorker(newProbeWorker(probe), probeDataChan, thisAgent)
 
 					newKeys = append(newKeys, probeKey)
 				}
 			}
 
 			// Remove probes that are no longer in the configuration
-			// Compare by Type+Target (continuity key) to avoid false removals when IDs change
+			// Compare by Type+Target (continuity key) to avoid false removals when IDs change.
+			//
+			// Stops run in the background: waiting here (up to 5s per worker)
+			// would block this loop, which in turn blocks the websocket read
+			// handler that feeds it.
 			checkWorkers.Range(func(key any, value any) bool {
 				probeWorker := value.(ProbeWorkerS)
 				continuityKey := makeContinuityKey(probeWorker.Probe)
 
 				if !newProbeContinuity[continuityKey] {
 					log.Warnf("Probe %v (type: %s) marked for removal (no longer in config)", probeWorker.Probe.ID, probeWorker.Probe.Type)
-
-					// Stop the worker
-					stopProbeWorker(&probeWorker)
-
-					// Stop TrafficSim if applicable
-					if probeWorker.Probe.Type == probes.ProbeType_TRAFFICSIM {
-						//stopTrafficSim(probeWorker.Probe.ID, probeWorker.probe.Server)
-					}
-
-					// Remove from map
 					checkWorkers.Delete(key)
+					go stopProbeWorker(&probeWorker)
 				}
 				return true
 			})
@@ -876,26 +844,125 @@ func contains(ids []primitive.ObjectID, id primitive.ObjectID) bool {
 	return false
 }
 
-func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID) {
-	go func(probe probes.Probe, dC chan probes.ProbeData) {
-		probeKey := makeProbeKey(probe)
+// Back-off waits used when a probe run fails before doing useful work, so a
+// persistent error (bad target, DNS failure, panic) can't turn into a tight
+// retry loop.
+const (
+	probeErrorBackoff = 30 * time.Second
+	probePanicBackoff = 60 * time.Second
+	noTargetBackoff   = 60 * time.Second
+)
 
-		// Get the worker
-		workerInterface, exists := checkWorkers.Load(probeKey)
-		if !exists {
-			log.Warnf("Probe %d (type: %s) not found when starting worker", probe.ID, probe.Type)
-			return
+// newProbeWorker builds the bookkeeping for a worker. The goroutine itself is
+// started by startCheckWorker after the entry is stored in checkWorkers.
+func newProbeWorker(probe probes.Probe) ProbeWorkerS {
+	ctx, cancel := context.WithCancel(context.Background())
+	return ProbeWorkerS{
+		Probe:      probe,
+		StopChan:   make(chan struct{}),
+		StopOnce:   &sync.Once{},
+		WaitGroup:  &sync.WaitGroup{},
+		Ctx:        ctx,
+		CancelFunc: cancel,
+	}
+}
+
+// probeNeedsTarget reports whether a probe type dereferences Targets[0].
+func probeNeedsTarget(t probes.ProbeType) bool {
+	switch t {
+	case probes.ProbeType_MTR, probes.ProbeType_PING, probes.ProbeType_DNS,
+		probes.ProbeType_HTTP, probes.ProbeType_TLS, probes.ProbeType_SNMP:
+		return true
+	}
+	return false
+}
+
+// waitOrStop sleeps for d, returning false early if the worker is stopped.
+func waitOrStop(worker ProbeWorkerS, d time.Duration) bool {
+	if d <= 0 {
+		d = time.Second
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-worker.Ctx.Done():
+		return false
+	case <-worker.StopChan:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// logProbePanic logs a recovered panic from a probe run with its stack.
+// recover() itself must be called directly in the deferred function.
+func logProbePanic(probe probes.Probe, r interface{}) {
+	log.Errorf("Probe %d (type: %s) panicked: %v\n%s", probe.ID, probe.Type, r, debug.Stack())
+}
+
+// runProbeOnce executes a single run of a periodic probe and returns how long
+// to wait before the next run. It never panics.
+func runProbeOnce(ctx context.Context, probe probes.Probe, dC chan probes.ProbeData) (wait time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			logProbePanic(probe, r)
+			wait = probePanicBackoff
 		}
+	}()
 
-		worker := workerInterface.(ProbeWorkerS)
+	if probeNeedsTarget(probe.Type) && (len(probe.Targets) == 0 || probe.Targets[0].Target == "") {
+		log.Warnf("Probe %d (type: %s) has no target, skipping run", probe.ID, probe.Type)
+		return noTargetBackoff
+	}
 
-		// Track this goroutine
+	switch probe.Type {
+	case probes.ProbeType_SYSTEMINFO:
+		return handleSystemInfoProbe(probe, dC)
+	case probes.ProbeType_MTR:
+		return handleMTRProbe(probe, dC)
+	case probes.ProbeType_SPEEDTEST:
+		return handleSpeedTestProbe(probe, dC)
+	case probes.ProbeType_SPEEDTEST_SERVERS:
+		return handleSpeedTestServersProbe(probe, dC)
+	case probes.ProbeType_PING:
+		return handlePingProbe(ctx, probe, dC)
+	case probes.ProbeType_NETWORKINFO:
+		return handleNetworkInfoProbe(ctx, probe, dC)
+	case probes.ProbeType_DNS:
+		return handleDNSProbe(probe, dC)
+	case probes.ProbeType_HTTP:
+		return handleHTTPProbe(probe, dC)
+	case probes.ProbeType_TLS:
+		return handleTLSProbe(probe, dC)
+	case probes.ProbeType_SNMP:
+		return handleSNMPProbe(probe, dC)
+	case "AGENT":
+		// Agent probe type - skip for now as it's likely metadata
+		log.Debugf("Skipping AGENT probe type for probe %d", probe.ID)
+		return 30 * time.Second
+	default:
+		log.Warnf("Unknown probe type: %s", probe.Type)
+		return 10 * time.Second
+	}
+}
+
+// startCheckWorker registers worker under its probe key and starts its
+// goroutine. The WaitGroup is incremented before the entry becomes visible, so
+// anyone who finds the worker in checkWorkers and stops it will wait for it.
+func startCheckWorker(worker ProbeWorkerS, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID) {
+	probe := worker.Probe
+	probeKey := makeProbeKey(probe)
+
+	if worker.WaitGroup != nil {
+		worker.WaitGroup.Add(1)
+	}
+	checkWorkers.Store(probeKey, worker)
+
+	go func(dC chan probes.ProbeData) {
 		if worker.WaitGroup != nil {
-			worker.WaitGroup.Add(1)
 			defer worker.WaitGroup.Done()
 		}
 
-		// Main worker loop
 		for {
 			select {
 			case <-worker.Ctx.Done():
@@ -905,69 +972,48 @@ func startCheckWorker(probe probes.Probe, dataChan chan probes.ProbeData, thisAg
 				log.Infof("Worker for probe %d (type: %s) stopped by StopChan", probe.ID, probe.Type)
 				return
 			default:
-				// Get current probe data
-				workerInterface, exists := checkWorkers.Load(probeKey)
-				if !exists {
-					log.Warnf("Probe %d (type: %s) no longer exists", probe.ID, probe.Type)
-					return
-				}
+			}
 
-				currentWorker := workerInterface.(ProbeWorkerS)
-				if currentWorker.ToRemove {
-					log.Infof("Probe %d (type: %s) marked for removal", probe.ID, probe.Type)
-					return
-				}
+			// Re-read the latest probe data (the reconciler updates it in place
+			// when only non-key fields change).
+			workerInterface, exists := checkWorkers.Load(probeKey)
+			if !exists {
+				log.Warnf("Probe %d (type: %s) no longer exists", probe.ID, probe.Type)
+				return
+			}
+			currentWorker := workerInterface.(ProbeWorkerS)
+			// The key may now belong to a replacement worker (probe removed and
+			// re-added with identical config). Never run two workers for one key.
+			if currentWorker.StopChan != worker.StopChan {
+				log.Infof("Probe %d (type: %s) superseded by a newer worker", probe.ID, probe.Type)
+				return
+			}
+			if currentWorker.ToRemove {
+				log.Infof("Probe %d (type: %s) marked for removal", probe.ID, probe.Type)
+				return
+			}
+			current := currentWorker.Probe
 
-				probe := currentWorker.Probe
+			if current.Type == probes.ProbeType_TRAFFICSIM {
+				// TrafficSim runs continuously until stopped.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logProbePanic(current, r)
+						}
+					}()
+					handleTrafficSimProbe(current, getCurrentProbes(), dC, thisAgent, worker.Ctx, worker.StopChan)
+				}()
+				return
+			}
 
-				// Handle different probe types
-				switch probe.Type {
-				case probes.ProbeType_TRAFFICSIM:
-					handleTrafficSimProbe(probe, getCurrentProbes(), dC, thisAgent, worker.Ctx, worker.StopChan)
-					return // TrafficSim runs continuously
-
-				case probes.ProbeType_SYSTEMINFO:
-					handleSystemInfoProbe(probe, dC)
-
-				case probes.ProbeType_MTR:
-					handleMTRProbe(probe, dC)
-
-				case probes.ProbeType_SPEEDTEST:
-					handleSpeedTestProbe(probe, dC)
-
-				case probes.ProbeType_SPEEDTEST_SERVERS:
-					handleSpeedTestServersProbe(probe, dC)
-
-				case probes.ProbeType_PING:
-					handlePingProbe(probe, dC)
-
-				case probes.ProbeType_NETWORKINFO:
-					handleNetworkInfoProbe(probe, dC)
-
-				case probes.ProbeType_DNS:
-					handleDNSProbe(probe, dC)
-
-				case probes.ProbeType_HTTP:
-					handleHTTPProbe(probe, dC)
-
-				case probes.ProbeType_TLS:
-					handleTLSProbe(probe, dC)
-
-				case probes.ProbeType_SNMP:
-					handleSNMPProbe(probe, dC)
-
-				case "AGENT":
-					// Agent probe type - skip for now as it's likely metadata
-					log.Debugf("Skipping AGENT probe type for probe %d", probe.ID)
-					time.Sleep(30 * time.Second)
-
-				default:
-					log.Warnf("Unknown probe type: %s", probe.Type)
-					time.Sleep(10 * time.Second)
-				}
+			wait := runProbeOnce(worker.Ctx, current, dC)
+			if !waitOrStop(worker, wait) {
+				log.Infof("Worker for probe %d (type: %s) stopped", probe.ID, probe.Type)
+				return
 			}
 		}
-	}(probe, dataChan)
+	}(dataChan)
 }
 
 func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataChan chan probes.ProbeData, thisAgent primitive.ObjectID, ctx context.Context, stopChan chan struct{}) {
@@ -1003,19 +1049,26 @@ func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataCha
 	// marks this TrafficSim's connection as invalid so the next cycle reconnects
 	// instead of waiting for 60s of 100% loss to trigger the reactive fix.
 	if watcher := GetInterfaceWatcher(); watcher != nil {
-		watcher.OnChange(func(event probes.InterfaceChangeEvent) {
+		unregister := watcher.OnChange(func(event probes.InterfaceChangeEvent) {
 			if ts.IsRunning() {
 				log.Warnf("[trafficsim] probe=%d: network change (%s), invalidating socket",
 					probe.ID, event.Reason)
 				ts.InvalidateConnection()
 			}
 		})
+		// Without this every restart of this probe leaks a handler that keeps
+		// the old TrafficSim alive and fires on every network change.
+		defer unregister()
 	}
 
 	// Find matching MTR probe for triggered diagnostics
-	mtrProbe, err := findMatchingMTRProbe(probe)
-	if err != nil {
+	// A nil pointer disables loss-triggered MTR; passing a pointer to an empty
+	// Probe would make the triggered MTR run against no target.
+	var mtrProbePtr *probes.Probe
+	if mtrProbe, err := findMatchingMTRProbe(probe); err != nil {
 		log.Debugf("[trafficsim] No matching MTR probe found: %v", err)
+	} else {
+		mtrProbePtr = &mtrProbe
 	}
 
 	// For server mode, enable dynamic probe retrieval for bidirectional detection
@@ -1035,7 +1088,14 @@ func handleTrafficSimProbe(probe probes.Probe, allProbes []probes.Probe, dataCha
 		probe.ID, probe.Server, ts.IPAddress, ts.Port)
 
 	// Start TrafficSim in goroutine
-	go ts.Start(&mtrProbe)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logProbePanic(probe, r)
+			}
+		}()
+		ts.Start(mtrProbePtr)
+	}()
 
 	// Wait for stop signal
 	<-stopChan
@@ -1209,27 +1269,25 @@ func handleTrafficSimClient(probe probes.Probe, thisAgent primitive.ObjectID, ip
 		stopTrafficSim(probe.ID, false)
 	}
 */
-func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	log.Info("SystemInfo: Running system hardware usage test")
 
 	interval := probe.IntervalSec
 	if interval < 60 {
 		interval = 120
 	}
-
-	// Ensure we always sleep to prevent tight loops on any error path
-	defer time.Sleep(time.Duration(interval) * time.Second)
+	wait := time.Duration(interval) * time.Second
 
 	data, err := probes.SystemInfo()
 	if err != nil {
 		log.Errorf("SystemInfo error: %v", err)
-		return
+		return wait
 	}
 
 	marshal, err := json.Marshal(data)
 	if err != nil {
 		log.Errorf("SystemInfo marshal error: %v", err)
-		return
+		return wait
 	}
 
 	dataChan <- probes.ProbeData{
@@ -1238,27 +1296,26 @@ func handleSystemInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		ProbeID:   probe.ID,
 		CreatedAt: time.Now(),
 	}
+	return wait
 }
 
-func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	interval := probe.IntervalSec
 	if interval < 120 {
 		interval = 120
 	}
-
-	// Ensure we always sleep to prevent tight loops on any error path
-	defer time.Sleep(time.Duration(interval) * time.Second)
+	wait := time.Duration(interval) * time.Second
 
 	data, err := probes.Mtr(&probe, false)
 	if err != nil {
 		log.Errorf("MTR error: %v", err)
-		return
+		return wait
 	}
 
 	payload, err := json.Marshal(data)
 	if err != nil {
 		log.Errorf("MTR marshal error: %v", err)
-		return
+		return wait
 	}
 
 	dataChan <- probes.ProbeData{
@@ -1267,69 +1324,43 @@ func handleMTRProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		ProbeID:   probe.ID,
 		CreatedAt: time.Now(),
 	}
+	return wait
 }
 
-func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	// Calculate interval first for consistent sleep timing
+func handleSpeedTestProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
+	// Speedtest probes are now handled via the queue system (speedtest_queue_get).
+	// This scheduled handler is kept as a no-op so old probe configs don't spin.
 	interval := probe.IntervalSec
 	if interval < 60 {
 		interval = 300 // Default 5 minutes for speedtest
 	}
 
 	speedTestMutex.Lock()
-
-	// CRITICAL: If speedtest is already running, sleep to prevent tight loop
 	if speedTestRunning {
 		speedTestMutex.Unlock()
-		log.Debug("SpeedTest: Already running, sleeping to prevent busy wait")
-		time.Sleep(time.Duration(interval) * time.Second)
-		return
+		log.Debug("SpeedTest: Already running, skipping this run")
+		return time.Duration(interval) * time.Second
 	}
-
 	speedTestRunning = true
 	speedTestMutex.Unlock()
 
-	// Ensure speedTestRunning is reset and we sleep on any exit path
 	defer func() {
 		speedTestMutex.Lock()
 		speedTestRunning = false
 		speedTestMutex.Unlock()
-		time.Sleep(time.Duration(interval) * time.Second)
 	}()
-
-	// SpeedTest functionality is currently disabled
-	// When re-enabled, the actual speedtest logic would go here:
-	// data, err := probes.SpeedTest(&probe)
-	// if err != nil {
-	//     log.Errorf("SpeedTest error: %v", err)
-	//     return
-	// }
-	// dataChan <- probes.ProbeData{ProbeID: probe.ID, Payload: data}
 
 	speedTestRetryCount = 0
 	log.Debug("SpeedTest: Probe handler completed (functionality disabled)")
+	return time.Duration(interval) * time.Second
 }
 
-func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
-	//speedtestClient := speedtest.New()
-	/*serverList, err := speedtestClient.FetchServers()
-	if err != nil {
-		log.Errorf("SpeedTest servers error: %v", err)
-		return
-	}
-
-	dataChan <- probes.ProbeData{
-		ProbeID: probe.ID,
-		Payload:    serverList,
-	}
-
-	time.Sleep(12 * time.Hour)*/
-
-	// Sleep to prevent tight loop when function is disabled
-	time.Sleep(1 * time.Hour)
+func handleSpeedTestServersProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
+	// Speedtest servers are sent on connect (see web client); nothing to do here.
+	return 1 * time.Hour
 }
 
-func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handlePingProbe(ctx context.Context, probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	log.Infof("Ping: Running test for %s", probe.Targets[0].Target)
 
 	mtrProbe, err := findMatchingMTRProbe(probe)
@@ -1337,35 +1368,35 @@ func handlePingProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		log.Debugf("No matching MTR probe for %s (loss-triggered MTR disabled for this target)", probe.Targets[0].Target)
 	}
 
-	if err := probes.Ping(&probe, dataChan, mtrProbe); err != nil {
-		log.Errorf("Ping error: %v", err)
+	if err := probes.PingContext(ctx, &probe, dataChan, mtrProbe); err != nil {
+		// Errors here happen before any packets are sent (DNS failure, bad
+		// bind interface, no raw-socket permission). Retrying every second
+		// just floods the log, so back off.
+		log.Errorf("Ping error for probe %d (%s): %v (retry in %v)", probe.ID, probe.Targets[0].Target, err, probeErrorBackoff)
+		return probeErrorBackoff
 	}
 
-	// PING runs continuously back-to-back. The upload cadence is determined
-	// by packet count (e.g., count=60 = ~60s per run at 1 pkt/sec).
-	// IntervalSec is NOT used for PING scheduling — the gap between runs is always 0.
-	// Small safety sleep prevents tight loops if Ping() errors out instantly.
-	time.Sleep(1 * time.Second)
+	// Ping runs back-to-back: each run already takes ~Count seconds.
+	return 1 * time.Second
 }
 
-func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handleNetworkInfoProbe(ctx context.Context, probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	log.Info("NetInfo: Checking networking information...")
 
-	// Ensure we always sleep to prevent tight loops on any error path
-	defer time.Sleep(10 * time.Minute)
+	const wait = 10 * time.Minute
 
-	// Use controller config if available for public IP discovery
+	// Use controller-based IP detection if config is available
 	cfg := getControllerConfig()
-	data, err := probes.NetworkInfoWithController(context.Background(), cfg)
+	data, err := probes.NetworkInfoWithController(ctx, cfg)
 	if err != nil {
 		log.Errorf("NetworkInfo error: %v", err)
-		return
+		return wait
 	}
 
 	marshal, err := json.Marshal(data)
 	if err != nil {
 		log.Errorf("NetworkInfo marshal error: %v", err)
-		return
+		return wait
 	}
 
 	dataChan <- probes.ProbeData{
@@ -1374,9 +1405,10 @@ func handleNetworkInfoProbe(probe probes.Probe, dataChan chan probes.ProbeData) 
 		ProbeID:   probe.ID,
 		CreatedAt: time.Now(),
 	}
+	return wait
 }
 
-func handleDNSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handleDNSProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	log.Infof("DNS: Running query for %s", probe.Targets[0].Target)
 
 	interval := probe.IntervalSec
@@ -1384,27 +1416,25 @@ func handleDNSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		interval = 300 // Default: 5 minutes
 	}
 
-	// Ensure we always sleep to prevent tight loops on any error path
-	defer time.Sleep(time.Duration(interval) * time.Second)
-
-	// Run DNS query for each target
+	// Query each target (DNS servers to query)
 	for _, target := range probe.Targets {
 		if target.Target == "" {
 			continue
 		}
 
-		// Create a copy of the probe with just this target
+		// Create a single-target probe for each DNS server
 		singleTargetProbe := probe
 		singleTargetProbe.Targets = []probes.ProbeTarget{target}
 
 		if err := probes.DNSQuery(&singleTargetProbe, dataChan); err != nil {
 			log.Errorf("DNS error for %s: %v", target.Target, err)
-			// Error payloads are already emitted by DNSQuery, so just log
+			// Continue with other targets even if one fails
 		}
 	}
+	return time.Duration(interval) * time.Second
 }
 
-func handleHTTPProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handleHTTPProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	log.Infof("HTTP: Running probe for %s", probe.Targets[0].Target)
 
 	interval := probe.IntervalSec
@@ -1412,14 +1442,13 @@ func handleHTTPProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		interval = 60
 	}
 
-	defer time.Sleep(time.Duration(interval) * time.Second)
-
 	if err := probes.HTTPProbe(&probe, dataChan); err != nil {
 		log.Errorf("HTTP error: %v", err)
 	}
+	return time.Duration(interval) * time.Second
 }
 
-func handleTLSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handleTLSProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	log.Infof("TLS: Running probe for %s", probe.Targets[0].Target)
 
 	interval := probe.IntervalSec
@@ -1427,14 +1456,13 @@ func handleTLSProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		interval = 300
 	}
 
-	defer time.Sleep(time.Duration(interval) * time.Second)
-
 	if err := probes.TLSProbe(&probe, dataChan); err != nil {
 		log.Errorf("TLS error: %v", err)
 	}
+	return time.Duration(interval) * time.Second
 }
 
-func handleSNMPProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
+func handleSNMPProbe(probe probes.Probe, dataChan chan probes.ProbeData) time.Duration {
 	log.Infof("SNMP: Running probe for %s", probe.Targets[0].Target)
 
 	interval := probe.IntervalSec
@@ -1442,11 +1470,10 @@ func handleSNMPProbe(probe probes.Probe, dataChan chan probes.ProbeData) {
 		interval = 300
 	}
 
-	defer time.Sleep(time.Duration(interval) * time.Second)
-
 	if err := probes.SNMPProbe(&probe, dataChan); err != nil {
 		log.Errorf("SNMP error: %v", err)
 	}
+	return time.Duration(interval) * time.Second
 }
 
 /*func updateAllowedAgents(server *probes.TrafficSim, newAllowedAgents []primitive.ObjectID) {

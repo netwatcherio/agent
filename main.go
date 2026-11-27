@@ -196,7 +196,10 @@ func runAgent(ctx context.Context) error {
 	}
 
 	// ---------- Wire websocket handler ----------
-	probeGetCh := make(chan []probes.Probe)
+	// Capacity 1 + latest-wins delivery in the WS client: the reconciler can
+	// take a while (stopping TrafficSim workers), and it must never stall the
+	// websocket read loop.
+	probeGetCh := make(chan []probes.Probe, 1)
 	probeDataCh := make(chan probes.ProbeData, 2048)
 	speedtestQueueCh := make(chan []probes.SpeedtestQueueItem)
 
@@ -297,6 +300,7 @@ func runAgent(ctx context.Context) error {
 		DeactivateCh:     deactivateCh, // For receiving deactivation signals
 		CancelFunc:       agentCancel,  // Cancel agent context on deactivation
 		AgentVersion:     VERSION,
+		Ctx:              agentCtx,
 	}
 
 	// Set reconnect callback after wsClient is created (avoids closure reference issue)
@@ -410,7 +414,7 @@ func runAgent(ctx context.Context) error {
 				time.Sleep(time.Minute * 1)
 				log.Debug("Getting probes again...")
 				if ws.IsConnected() {
-					if ok := ws.WsConn.Emit("probe_get", []byte("please")); ok {
+					if ok := ws.Emit("probe_get", []byte("please")); ok {
 						updateActivity()
 					}
 				}
@@ -432,7 +436,7 @@ func runAgent(ctx context.Context) error {
 				// Poll for new speedtest queue items
 				if ws.IsConnected() {
 					log.Debug("Polling for speedtest queue...")
-					if ok := ws.WsConn.Emit("speedtest_queue_get", []byte("{}")); ok {
+					if ok := ws.Emit("speedtest_queue_get", []byte("{}")); ok {
 						updateActivity()
 					}
 				}
@@ -447,7 +451,7 @@ func runAgent(ctx context.Context) error {
 					// Send result back to controller
 					if ws.IsConnected() {
 						data, _ := json.Marshal(result)
-						if ok := ws.WsConn.Emit("speedtest_result", data); !ok {
+						if ok := ws.Emit("speedtest_result", data); !ok {
 							log.Warn("WS: emit speedtest_result returned false")
 						} else {
 							log.Infof("Sent speedtest result for queue item %d", item.ID)
