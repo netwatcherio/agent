@@ -118,7 +118,7 @@ func SystemInfo() (CompleteSystemInfo, error) {
 
 	n.CPUTimes = cpuTimeInfo
 
-	n.Timestamp = time.Now()
+	n.Timestamp = Now()
 	n.HostInfo.BootTime = n.HostInfo.BootTime
 
 	return n, nil

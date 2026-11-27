@@ -349,6 +349,23 @@ func runAgent(ctx context.Context) error {
 
 	go wsClient.ConnectWithRetry(agentCtx)
 
+	// Re-measure the clock offset periodically, not just at (re)connect, so a
+	// host clock that changes while the agent runs is corrected promptly.
+	go func(ctx context.Context) {
+		ticker := time.NewTicker(web.ClockResyncInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := web.SyncTime(ctx, cfg.APIURL, cfg.WorkspaceID, cfg.AgentID, psk); err != nil {
+					log.Warnf("Periodic time sync failed: %v (keeping offset %v)", err, web.GetTimeOffset())
+				}
+			}
+		}
+	}(agentCtx)
+
 	// Watchdog: restart if no activity for the configured timeout (default 10 min).
 	//
 	// Skipped while we're in server-error retry mode — a backend outage is not

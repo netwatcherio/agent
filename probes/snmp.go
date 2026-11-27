@@ -398,6 +398,10 @@ func isPrintable(data []byte) bool {
 }
 
 func emitSNMPResult(probe *Probe, dataChan chan ProbeData, result SNMPPayload) {
+	// Report times corrected to the controller clock, in UTC. Durations
+	// above were computed from the local monotonic clock and are unaffected.
+	result.StartTimestamp = ReportTime(result.StartTimestamp)
+	result.StopTimestamp = ReportTime(result.StopTimestamp)
 	raw, err := json.Marshal(result)
 	if err != nil {
 		log.Errorf("[snmp] marshal error: %v", err)

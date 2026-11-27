@@ -2,7 +2,6 @@ package workers
 
 import (
 	"encoding/json"
-	"time"
 
 	"github.com/netwatcherio/netwatcher-agent/probes"
 	"github.com/netwatcherio/netwatcher-agent/web"
@@ -29,8 +28,13 @@ func ProbeDataWorker(wsH *web.WSClient, ch chan probes.ProbeData) {
 			// CreatedAt is the measurement time set by the probe. Only fill it
 			// in if missing — overwriting it with the send time would shift
 			// every point by the queueing delay (minutes, after an outage).
+			// Correct for this host's clock error against the controller
+			// (measured at connect), so a wrong local clock doesn't put data
+			// in the future or past. Done once, before any retry queuing.
 			if p.CreatedAt.IsZero() {
-				p.CreatedAt = time.Now()
+				p.CreatedAt = probes.Now()
+			} else {
+				p.CreatedAt = probes.ReportTime(p.CreatedAt)
 			}
 			marshal, err := json.Marshal(p)
 			if err != nil {

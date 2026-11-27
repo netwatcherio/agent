@@ -134,6 +134,9 @@ func Mtr(cd *Probe, triggered bool) (MtrPayload, error) {
 	// Transform NTrace result to MtrPayload format
 	mtrResult.Report.Hops = transformHops(result, numMeasurements)
 	mtrResult.StopTimestamp = time.Now()
+	// Report times corrected to the controller clock, in UTC.
+	mtrResult.StartTimestamp = ReportTime(mtrResult.StartTimestamp)
+	mtrResult.StopTimestamp = ReportTime(mtrResult.StopTimestamp)
 
 	log.WithFields(log.Fields{
 		"target": target,

@@ -300,6 +300,10 @@ func contentMatches(body, expected, matchType string) bool {
 }
 
 func emitHTTPResult(probe *Probe, dataChan chan ProbeData, result HTTPPayload) {
+	// Report times corrected to the controller clock, in UTC. Durations
+	// above were computed from the local monotonic clock and are unaffected.
+	result.StartTimestamp = ReportTime(result.StartTimestamp)
+	result.StopTimestamp = ReportTime(result.StopTimestamp)
 	raw, err := json.Marshal(result)
 	if err != nil {
 		log.Errorf("[http] marshal error: %v", err)

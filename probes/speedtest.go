@@ -112,7 +112,7 @@ func SpeedTest(cd *Probe) (SpeedTestPayload, error) {
 
 	result := SpeedTestPayload{
 		TestData:  s1,
-		Timestamp: time.Now(),
+		Timestamp: Now(),
 	}
 
 	marshal, err := json.Marshal(result)

@@ -1767,7 +1767,7 @@ func (ts *TrafficSim) calculateStats(cycle *CycleTracker) map[string]interface{}
 		"cycleDurationMs":  cycleDurationMs,
 		"packetsPerSecond": packetsPerSecond,
 
-		"timestamp": time.Now(),
+		"timestamp": Now(),
 	}
 
 	// Add RFC 3550 jitter (computed for all traffic, useful for network characterization)

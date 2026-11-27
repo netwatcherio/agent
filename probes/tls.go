@@ -207,6 +207,10 @@ func isSelfSigned(cert *x509.Certificate) bool {
 }
 
 func emitTLSResult(probe *Probe, dataChan chan ProbeData, result TLSPayload) {
+	// Report times corrected to the controller clock, in UTC. Durations
+	// above were computed from the local monotonic clock and are unaffected.
+	result.StartTimestamp = ReportTime(result.StartTimestamp)
+	result.StopTimestamp = ReportTime(result.StopTimestamp)
 	raw, err := json.Marshal(result)
 	if err != nil {
 		log.Errorf("[tls] marshal error: %v", err)

@@ -112,8 +112,8 @@ func PingContext(ctx context.Context, ac *Probe, pingChan chan ProbeData, mtrPro
 	pinger.OnFinish = func(stats *probing.Statistics) {
 		// NOTE: stats.* RTT fields are already time.Duration per pro-bing
 		pingR := PingPayload{
-			StartTimestamp:        startTime,
-			StopTimestamp:         time.Now(),
+			StartTimestamp:        ReportTime(startTime),
+			StopTimestamp:         Now(),
 			PacketsRecv:           stats.PacketsRecv,
 			PacketsSent:           stats.PacketsSent,
 			PacketsRecvDuplicates: stats.PacketsRecvDuplicates,
